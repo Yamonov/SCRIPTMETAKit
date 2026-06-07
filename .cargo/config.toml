@@ -1,0 +1,3 @@
+[alias]
+check-all = "clippy --all-targets --all-features -- -D warnings"
+test-all = "test --all-targets --all-features"
