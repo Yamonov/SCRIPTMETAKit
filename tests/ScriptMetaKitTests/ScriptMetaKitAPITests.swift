@@ -4,7 +4,7 @@ import ScriptMetaKit
 final class ScriptMetaKitAPITests: XCTestCase {
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.0")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.2")
     }
 
     func testFolderScanFindsScriptMetadata() async throws {

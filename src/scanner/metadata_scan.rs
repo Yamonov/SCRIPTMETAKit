@@ -951,10 +951,7 @@ fn read_text_prefix_source(
 }
 
 fn compiled_osa_error_allows_text_fallback(kind: CompiledOsaErrorKind) -> bool {
-    matches!(
-        kind,
-        CompiledOsaErrorKind::NotOsaScript | CompiledOsaErrorKind::UnsupportedPlatform
-    )
+    matches!(kind, CompiledOsaErrorKind::NotOsaScript)
 }
 
 fn compiled_osa_timeout_for_state(state: &MetadataWalkState<'_>) -> Duration {

@@ -6,8 +6,8 @@ The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.0.0`
-- Rust FFI crate: `scriptmetakit_ffi` `1.0.0`
+- Rust crate: `scriptmetakit` `1.0.2`
+- Rust FFI crate: `scriptmetakit_ffi` `1.0.2`
 - Swift package product: `ScriptMetaKit`
 
 ## License

@@ -449,6 +449,12 @@ fn file_write_state(path: &Path) -> FileWriteState {
     }
 }
 
+#[cfg(windows)]
+fn parent_directory_is_read_only(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
 fn parent_directory_is_read_only(path: &Path) -> bool {
     let parent = path
         .parent()

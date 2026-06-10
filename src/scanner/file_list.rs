@@ -340,11 +340,11 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
     if let Some(error) = root_error {
         root.status = RootStatus::Unreadable;
         root.error = Some(error);
+    } else if cancelled {
+        root.status = RootStatus::Cancelled;
+        root.error = Some(cancelled_root_error());
     } else {
-        root.status = if cancelled {
-            root.error = Some(cancelled_root_error());
-            RootStatus::Cancelled
-        } else if timed_out {
+        root.status = if timed_out {
             RootStatus::TimedOut
         } else {
             RootStatus::Ready
@@ -460,11 +460,11 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
     if let Some(error) = root_error {
         root.status = RootStatus::Unreadable;
         root.error = Some(error);
+    } else if cancelled {
+        root.status = RootStatus::Cancelled;
+        root.error = Some(cancelled_root_error());
     } else {
-        root.status = if cancelled {
-            root.error = Some(cancelled_root_error());
-            RootStatus::Cancelled
-        } else if timed_out {
+        root.status = if timed_out {
             RootStatus::TimedOut
         } else {
             RootStatus::Ready
@@ -775,12 +775,31 @@ fn should_stop(depth: usize, state: &mut FileListWalkState<'_>) -> bool {
 }
 
 fn should_skip_path(path: &Path, options: &ScannerOptions) -> bool {
-    let name = display_name(path);
-    if options.skip_hidden && name.starts_with('.') {
+    if options.skip_hidden && is_hidden_path(path) {
         return true;
     }
 
     options.skip_packages && is_package_path(path)
+}
+
+fn is_hidden_path(path: &Path) -> bool {
+    display_name(path).starts_with('.') || platform_path_is_hidden(path)
+}
+
+#[cfg(windows)]
+fn platform_path_is_hidden(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn platform_path_is_hidden(_path: &Path) -> bool {
+    false
 }
 
 fn should_include_resolution_error(resolved: &ResolvedPath) -> bool {
@@ -1257,16 +1276,22 @@ fn detect_script_info_for_file_list(path: &Path) -> FileListScriptInfo {
         };
     }
 
-    let Ok(mut file) = File::open(path) else {
+    let Ok(file) = File::open(path) else {
         return FileListScriptInfo {
             script: detect_script_file(path, None),
             capability: scriptmeta_edit_capability_from_file_list_probe(path, None),
         };
     };
 
-    let mut buffer = vec![0; script_header_probe_byte_limit(path)];
-    let read_count = file.read(&mut buffer).unwrap_or(0);
-    let prefix_bytes = &buffer[..read_count];
+    let mut buffer = Vec::with_capacity(script_header_probe_byte_limit(path));
+    if file
+        .take(script_header_probe_byte_limit(path) as u64)
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
+        buffer.clear();
+    }
+    let prefix_bytes = buffer.as_slice();
     FileListScriptInfo {
         script: detect_script_file_from_bytes(path, Some(prefix_bytes)),
         capability: scriptmeta_edit_capability_from_file_list_probe(path, Some(prefix_bytes)),
