@@ -1616,6 +1616,94 @@ pub unsafe extern "C" fn smk_engine_check_update_item_with_progress(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `engine` must be a live engine handle. `items_ptr` must point to
+/// `item_count` readable `SmkScriptItem` values whose string slices contain
+/// valid UTF-8 for the duration of the call, unless `item_count` is zero.
+/// `out_result` must be a valid, writable pointer. A non-null result must be
+/// released with `smk_scan_result_free`.
+pub unsafe extern "C" fn smk_engine_check_updates_for_items(
+    engine: *mut SmkEngine,
+    items_ptr: *const SmkScriptItem,
+    item_count: usize,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let items = script_items_from_raw(items_ptr, item_count)?;
+
+        match pollster::block_on(engine.engine.check_updates_for_items(&items)) {
+            Ok(result) => {
+                *out_result =
+                    Box::into_raw(Box::new(SmkScanResult::from_update_result(result.as_ref())));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// Same as `smk_engine_check_updates_for_items`, with a synchronous progress
+/// callback during the update check. Strings in `SmkUpdateProgress` are valid
+/// only for the duration of that callback.
+pub unsafe extern "C" fn smk_engine_check_updates_for_items_with_progress(
+    engine: *mut SmkEngine,
+    items_ptr: *const SmkScriptItem,
+    item_count: usize,
+    progress_callback: SmkUpdateProgressCallback,
+    progress_context: *mut c_void,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let items = script_items_from_raw(items_ptr, item_count)?;
+
+        match pollster::block_on(
+            engine
+                .engine
+                .check_updates_for_items_with_progress(&items, |progress| {
+                    emit_update_progress(progress_callback, progress_context, &progress)
+                }),
+        ) {
+            Ok(result) => {
+                *out_result =
+                    Box::into_raw(Box::new(SmkScanResult::from_update_result(result.as_ref())));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `items_ptr` must point to `item_count` readable
 /// `SmkScriptIdUniquenessItem` values for the duration of the call, unless
 /// `item_count` is zero. `out_result` must be writable. A non-null result must
@@ -1886,7 +1974,45 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan(
         *out_result = ptr::null_mut();
         engine.clear_error();
 
-        match poll_watcher_scan(engine) {
+        match poll_watcher_scan(engine, false) {
+            Ok(Some(result)) => {
+                *out_changed = 1;
+                *out_result = Box::into_raw(Box::new(result));
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(message) => {
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// Same as `smk_engine_poll_watcher_scan`, but file-list snapshots in the
+/// returned result are limited to roots affected by the watcher batch.
+pub unsafe extern "C" fn smk_engine_poll_watcher_scan_dirty_only(
+    engine: *mut SmkEngine,
+    out_changed: *mut u8,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_changed = out_mut(out_changed)?;
+        let out_result = out_mut(out_result)?;
+        *out_changed = 0;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        match poll_watcher_scan(engine, true) {
             Ok(Some(result)) => {
                 *out_changed = 1;
                 *out_result = Box::into_raw(Box::new(result));
@@ -3109,7 +3235,10 @@ fn stop_watching_engine(engine: &mut SmkEngine) {
 fn stop_watching_engine(_engine: &mut SmkEngine) {}
 
 #[cfg(feature = "native-watch")]
-fn poll_watcher_scan(engine: &mut SmkEngine) -> Result<Option<SmkScanResult>, String> {
+fn poll_watcher_scan(
+    engine: &mut SmkEngine,
+    dirty_only: bool,
+) -> Result<Option<SmkScanResult>, String> {
     let Some(watcher) = engine.watcher.as_ref() else {
         return Err("watcher is not running".to_string());
     };
@@ -3135,18 +3264,31 @@ fn poll_watcher_scan(engine: &mut SmkEngine) -> Result<Option<SmkScanResult>, St
     let Some(change_batch) = change_batch else {
         return Ok(None);
     };
+    let affected_root_ids = change_batch
+        .affected_roots
+        .iter()
+        .map(|change| change.root_id.clone())
+        .collect::<BTreeSet<_>>();
     let mut scan_result = engine
         .engine
         .refresh_dirty_roots(RefreshRequest {
             mode: ScanMode::FileListAndMetadata,
         })
         .map_err(|error| error.to_string())?;
+    if dirty_only {
+        scan_result
+            .file_list_snapshots
+            .retain(|snapshot| affected_root_ids.contains(&snapshot.root.root_id));
+    }
     scan_result.watch_change_batch = Some(change_batch);
     Ok(Some(SmkScanResult::from_scan_result(scan_result, None)))
 }
 
 #[cfg(not(feature = "native-watch"))]
-fn poll_watcher_scan(_engine: &mut SmkEngine) -> Result<Option<SmkScanResult>, String> {
+fn poll_watcher_scan(
+    _engine: &mut SmkEngine,
+    _dirty_only: bool,
+) -> Result<Option<SmkScanResult>, String> {
     Err("native-watch feature is not enabled".to_string())
 }
 
@@ -4595,6 +4737,25 @@ fn script_items_for_uniqueness_from_raw(
     items
         .iter()
         .map(script_item_for_uniqueness_from_ffi)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn script_items_from_raw(
+    ptr: *const SmkScriptItem,
+    len: usize,
+) -> Result<Vec<Arc<ScriptMetaItem>>, (SmkStatus, String)> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err((SmkStatus::NullArgument, "item slice is null".to_string()));
+    }
+    // SAFETY: the caller promises `ptr` points to `len` readable script items.
+    let items = unsafe { slice::from_raw_parts(ptr, len) };
+    items
+        .iter()
+        .map(script_item_from_ffi)
+        .map(|result| result.map(Arc::new))
         .collect::<Result<Vec<_>, _>>()
 }
 

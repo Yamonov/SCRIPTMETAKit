@@ -16,8 +16,9 @@ use scriptmetakit_ffi::{
     SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_edit_result_backup_generations,
     smk_edit_result_backup_record, smk_edit_result_file_write_result, smk_edit_result_free,
     smk_edit_result_metadata_edit_preview_result, smk_edit_result_text,
-    smk_engine_cancel_current_operation, smk_engine_check_update_item, smk_engine_create_default,
-    smk_engine_free, smk_engine_generate_edit_password_sha256, smk_engine_last_error,
+    smk_engine_cancel_current_operation, smk_engine_check_update_item,
+    smk_engine_check_updates_for_items, smk_engine_create_default, smk_engine_free,
+    smk_engine_generate_edit_password_sha256, smk_engine_last_error,
     smk_engine_read_script_metadata_edit_preview_file, smk_engine_render_distribution_metadata,
     smk_engine_restore_scriptmeta_backup, smk_engine_scan_folder, smk_engine_scan_folders,
     smk_engine_scan_folders_with_progress, smk_engine_scan_registered_roots, smk_engine_scan_roots,
@@ -32,8 +33,8 @@ use scriptmetakit_ffi::{
 };
 #[cfg(feature = "native-watch")]
 use scriptmetakit_ffi::{
-    smk_engine_poll_watcher_scan, smk_engine_start_watching,
-    smk_engine_start_watching_with_callback, smk_engine_stop_watching,
+    smk_engine_poll_watcher_scan, smk_engine_poll_watcher_scan_dirty_only,
+    smk_engine_start_watching, smk_engine_start_watching_with_callback, smk_engine_stop_watching,
 };
 
 #[test]
@@ -489,7 +490,10 @@ fn keeps_file_list_direct_children_contiguous() {
     let alpha_children =
         &file_entries[alpha.first_child_index..alpha.first_child_index + alpha.child_count];
     assert_eq!(alpha_children.len(), 1);
-    assert!(utf8(alpha_children[0].display_path).ends_with("Alpha/Nested"));
+    assert!(
+        std::path::Path::new(&utf8(alpha_children[0].display_path))
+            .ends_with(std::path::Path::new("Alpha").join("Nested"))
+    );
 
     // SAFETY: both handles were returned by this FFI crate and have not been freed.
     unsafe {
@@ -796,6 +800,40 @@ SCRIPTMETA-DIST-END
     // SAFETY: all handles were returned by this FFI crate and have not been freed.
     unsafe {
         smk_scan_result_free(update_result);
+    }
+
+    let mut batch_update_result: *mut SmkScanResult = ptr::null_mut();
+    // SAFETY: `items.ptr` points to one item borrowed from a live scan result and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_check_updates_for_items(
+                engine,
+                items.ptr,
+                items.len,
+                &mut batch_update_result,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert!(!batch_update_result.is_null());
+
+    let mut batch_statuses = SmkUpdateStatusEntrySlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    // SAFETY: `batch_update_result` is live and `batch_statuses` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_scan_result_update_statuses(batch_update_result, &mut batch_statuses) },
+        SmkStatus::Ok
+    );
+    assert_eq!(batch_statuses.len, 1);
+    // SAFETY: `batch_statuses` is borrowed from `batch_update_result` and the result is still alive.
+    let batch_statuses = unsafe { slice::from_raw_parts(batch_statuses.ptr, batch_statuses.len) };
+    assert_eq!(utf8(batch_statuses[0].status), "update_available");
+
+    // SAFETY: all handles were returned by this FFI crate and have not been freed.
+    unsafe {
+        smk_scan_result_free(batch_update_result);
         smk_scan_result_free(scan_result);
         smk_engine_free(engine);
     }
@@ -1165,7 +1203,9 @@ fn notifies_when_native_watcher_receives_change() {
     while changed == 0 && Instant::now() < deadline {
         // SAFETY: `engine` is live and output pointers are writable.
         assert_eq!(
-            unsafe { smk_engine_poll_watcher_scan(engine, &mut changed, &mut changed_result) },
+            unsafe {
+                smk_engine_poll_watcher_scan_dirty_only(engine, &mut changed, &mut changed_result)
+            },
             SmkStatus::Ok
         );
         if changed == 0 {
