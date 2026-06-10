@@ -167,6 +167,7 @@ enum NativeFsEvent {
         path: PathBuf,
         may_change_directory_tree: bool,
         identifies_folder: bool,
+        removes_path: bool,
     },
     Overflow,
 }
@@ -182,11 +183,13 @@ fn append_event_to_pending(
             path,
             may_change_directory_tree,
             identifies_folder,
+            removes_path,
         } => {
             if !should_keep_event_path(
                 &path,
                 may_change_directory_tree,
                 identifies_folder,
+                removes_path,
                 filter.watch_roots,
                 filter.supported_extensions,
                 filter.skip_hidden_paths,
@@ -226,6 +229,7 @@ fn should_keep_event_path(
     path: &Path,
     may_change_directory_tree: bool,
     identifies_folder: bool,
+    removes_path: bool,
     watch_roots: &[PathBuf],
     supported_extensions: &ExtensionPolicy,
     skip_hidden_paths: bool,
@@ -245,6 +249,10 @@ fn should_keep_event_path(
 
     if !may_change_directory_tree {
         return false;
+    }
+
+    if removes_path {
+        return true;
     }
 
     identifies_folder || path_is_existing_directory(path) || path.extension().is_none()
@@ -664,6 +672,7 @@ mod platform {
             path,
             may_change_directory_tree,
             identifies_folder,
+            removes_path: false,
         }
     }
 }
@@ -681,25 +690,30 @@ mod platform {
     };
 
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0},
+        Foundation::{
+            CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_FAILED, WAIT_OBJECT_0,
+        },
         Storage::FileSystem::{
             CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
             FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
             FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
             FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
             FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
-            FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING, ReadDirectoryChangesW,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            ReadDirectoryChangesW,
         },
         System::{
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
-            Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects},
+            Threading::{
+                CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+            },
         },
     };
 
     use super::{NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
 
     const BUFFER_SIZE: usize = 64 * 1024;
+    const RETRY_OPEN_DELAY_MILLIS: u32 = 1_000;
 
     pub struct PlatformWatcher {
         stop_events: Vec<isize>,
@@ -820,7 +834,11 @@ mod platform {
         stop_event: HANDLE,
         sender: mpsc::Sender<NativeFsEvent>,
     ) {
+        let mut directory = Some(directory);
         loop {
+            let Some(directory_handle) = directory else {
+                break;
+            };
             let mut buffer = [0u8; BUFFER_SIZE];
             let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
             let read_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
@@ -833,7 +851,7 @@ mod platform {
             let mut bytes_returned = 0u32;
             let read_started = unsafe {
                 ReadDirectoryChangesW(
-                    directory,
+                    directory_handle,
                     buffer.as_mut_ptr() as *mut c_void,
                     buffer.len() as u32,
                     TRUE,
@@ -855,30 +873,50 @@ mod platform {
                     CloseHandle(read_event);
                 }
                 let _ = sender.send(NativeFsEvent::Overflow);
-                break;
+                directory =
+                    reopen_directory_after_error(&root, directory.take().unwrap(), stop_event);
+                if directory.is_none() {
+                    break;
+                }
+                continue;
             }
 
             let wait_handles = [stop_event, read_event];
             let wait_result =
                 unsafe { WaitForMultipleObjects(2, wait_handles.as_ptr(), FALSE, INFINITE) };
             if wait_result == WAIT_OBJECT_0 {
-                unsafe {
-                    CancelIoEx(directory, &overlapped);
-                    CloseHandle(read_event);
-                }
+                cancel_pending_read(directory_handle, &overlapped);
+                unsafe { CloseHandle(read_event) };
                 break;
+            }
+            if wait_result == WAIT_FAILED || wait_result != WAIT_OBJECT_0 + 1 {
+                cancel_pending_read(directory_handle, &overlapped);
+                unsafe { CloseHandle(read_event) };
+                let _ = sender.send(NativeFsEvent::Overflow);
+                directory =
+                    reopen_directory_after_error(&root, directory.take().unwrap(), stop_event);
+                if directory.is_none() {
+                    break;
+                }
+                continue;
             }
 
             let mut transferred = 0u32;
-            let completed =
-                unsafe { GetOverlappedResult(directory, &overlapped, &mut transferred, FALSE) };
+            let completed = unsafe {
+                GetOverlappedResult(directory_handle, &overlapped, &mut transferred, FALSE)
+            };
             unsafe {
                 CloseHandle(read_event);
             }
 
             if completed == 0 {
                 let _ = sender.send(NativeFsEvent::Overflow);
-                break;
+                directory =
+                    reopen_directory_after_error(&root, directory.take().unwrap(), stop_event);
+                if directory.is_none() {
+                    break;
+                }
+                continue;
             }
 
             if transferred == 0 {
@@ -889,22 +927,75 @@ mod platform {
             parse_change_buffer(&root, &buffer[..transferred as usize], &sender);
         }
 
+        if let Some(directory) = directory {
+            unsafe {
+                CloseHandle(directory);
+            }
+        }
+    }
+
+    fn reopen_directory_after_error(
+        root: &Path,
+        directory: HANDLE,
+        stop_event: HANDLE,
+    ) -> Option<HANDLE> {
         unsafe {
             CloseHandle(directory);
+        }
+
+        loop {
+            let wait_result = unsafe { WaitForSingleObject(stop_event, RETRY_OPEN_DELAY_MILLIS) };
+            if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_FAILED {
+                return None;
+            }
+            if let Ok(directory) = open_directory(root) {
+                return Some(directory);
+            }
+        }
+    }
+
+    fn cancel_pending_read(directory: HANDLE, overlapped: &OVERLAPPED) {
+        unsafe {
+            CancelIoEx(directory, overlapped);
+            let mut transferred = 0u32;
+            let _ = GetOverlappedResult(directory, overlapped, &mut transferred, TRUE);
         }
     }
 
     fn parse_change_buffer(root: &Path, buffer: &[u8], sender: &mpsc::Sender<NativeFsEvent>) {
+        const FILE_NOTIFY_INFORMATION_HEADER_SIZE: usize = 12;
+
         let mut offset = 0usize;
         while offset < buffer.len() {
-            let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
-            let entry = unsafe { ptr::read_unaligned(entry_ptr as *const FILE_NOTIFY_INFORMATION) };
-            let name_offset = offset + mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName);
-            let name_len = entry.FileNameLength as usize / 2;
-            if name_offset + name_len * 2 > buffer.len() {
+            if buffer.len() - offset < FILE_NOTIFY_INFORMATION_HEADER_SIZE {
                 let _ = sender.send(NativeFsEvent::Overflow);
                 break;
             }
+            let next_entry_offset = u32::from_ne_bytes(
+                buffer[offset..offset + 4]
+                    .try_into()
+                    .expect("FILE_NOTIFY_INFORMATION next offset bytes"),
+            );
+            let action = u32::from_ne_bytes(
+                buffer[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("FILE_NOTIFY_INFORMATION action bytes"),
+            );
+            let file_name_byte_len = u32::from_ne_bytes(
+                buffer[offset + 8..offset + 12]
+                    .try_into()
+                    .expect("FILE_NOTIFY_INFORMATION file name length bytes"),
+            ) as usize;
+            if file_name_byte_len % 2 != 0 {
+                let _ = sender.send(NativeFsEvent::Overflow);
+                break;
+            }
+            let name_offset = offset + FILE_NOTIFY_INFORMATION_HEADER_SIZE;
+            if name_offset + file_name_byte_len > buffer.len() {
+                let _ = sender.send(NativeFsEvent::Overflow);
+                break;
+            }
+            let name_len = file_name_byte_len / 2;
 
             let name = unsafe {
                 OsString::from_wide(slice::from_raw_parts(
@@ -914,23 +1005,30 @@ mod platform {
             };
             let path = root.join(PathBuf::from(name));
             let may_change_directory_tree = matches!(
-                entry.Action,
+                action,
                 FILE_ACTION_ADDED
                     | FILE_ACTION_REMOVED
                     | FILE_ACTION_RENAMED_OLD_NAME
                     | FILE_ACTION_RENAMED_NEW_NAME
             );
+            let removes_path = matches!(action, FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME);
 
             let _ = sender.send(NativeFsEvent::Changed {
                 path,
                 may_change_directory_tree,
                 identifies_folder: false,
+                removes_path,
             });
 
-            if entry.NextEntryOffset == 0 {
+            if next_entry_offset == 0 {
                 break;
             }
-            offset += entry.NextEntryOffset as usize;
+            let next_offset = offset + next_entry_offset as usize;
+            if next_offset <= offset || next_offset > buffer.len() {
+                let _ = sender.send(NativeFsEvent::Overflow);
+                break;
+            }
+            offset = next_offset;
         }
     }
 }

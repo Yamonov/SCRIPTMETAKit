@@ -19,6 +19,7 @@ if [[ "${PROFILE}" != "release" ]]; then
 fi
 
 export PATH="${HOME}/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${ROOT}=. --remap-path-prefix=${HOME}=~"
 
 CARGO_BIN="$(command -v cargo || true)"
 if [[ -z "${CARGO_BIN}" ]]; then
@@ -55,6 +56,7 @@ lipo -create \
   "${ROOT}/target/x86_64-apple-darwin/release/libscriptmetakit_ffi.dylib" \
   -output "${UNIVERSAL_DYLIB}"
 install_name_tool -id "@rpath/libscriptmetakit_ffi.dylib" "${UNIVERSAL_DYLIB}"
+strip -S -x "${UNIVERSAL_DYLIB}"
 
 xcodebuild -create-xcframework \
   -library "${UNIVERSAL_DYLIB}" \

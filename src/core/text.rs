@@ -75,8 +75,7 @@ pub fn decode_script_text_with_encoding(bytes: &[u8]) -> Option<DecodedScriptTex
         });
     }
 
-    decode_with_encoding(EUC_JP, bytes, ScriptTextEncoding::EucJp)
-        .or_else(|| decode_with_encoding(SHIFT_JIS, bytes, ScriptTextEncoding::ShiftJis))
+    decode_legacy_japanese_text(bytes)
         .or_else(|| decode_with_encoding(UTF_16LE, bytes, ScriptTextEncoding::Utf16LittleEndian))
         .or_else(|| decode_with_encoding(UTF_16BE, bytes, ScriptTextEncoding::Utf16BigEndian))
 }
@@ -112,6 +111,57 @@ fn decode_with_encoding(
     })
 }
 
+fn decode_legacy_japanese_text(bytes: &[u8]) -> Option<DecodedScriptText> {
+    let euc_jp = decode_with_encoding(EUC_JP, bytes, ScriptTextEncoding::EucJp);
+    let shift_jis = decode_with_encoding(SHIFT_JIS, bytes, ScriptTextEncoding::ShiftJis);
+    match (euc_jp, shift_jis) {
+        (Some(euc_jp), Some(shift_jis)) => {
+            let euc_score = decoded_japanese_score(&euc_jp.text);
+            let shift_jis_score = decoded_japanese_score(&shift_jis.text);
+            if shift_jis_score > euc_score {
+                Some(shift_jis)
+            } else if euc_score > shift_jis_score {
+                Some(euc_jp)
+            } else {
+                preferred_legacy_japanese_text(euc_jp, shift_jis)
+            }
+        }
+        (Some(euc_jp), None) => Some(euc_jp),
+        (None, Some(shift_jis)) => Some(shift_jis),
+        (None, None) => None,
+    }
+}
+
+fn decoded_japanese_score(text: &str) -> i32 {
+    text.chars()
+        .map(|character| match character {
+            '\t' | '\n' | '\r' => 1,
+            character if character.is_control() => -20,
+            '\u{ff61}'..='\u{ff9f}' => 4,
+            '\u{3040}'..='\u{30ff}' => 3,
+            '\u{4e00}'..='\u{9fff}' => 1,
+            character if character.is_ascii() => 1,
+            _ => 0,
+        })
+        .sum()
+}
+
+#[cfg(windows)]
+fn preferred_legacy_japanese_text(
+    _euc_jp: DecodedScriptText,
+    shift_jis: DecodedScriptText,
+) -> Option<DecodedScriptText> {
+    Some(shift_jis)
+}
+
+#[cfg(not(windows))]
+fn preferred_legacy_japanese_text(
+    euc_jp: DecodedScriptText,
+    _shift_jis: DecodedScriptText,
+) -> Option<DecodedScriptText> {
+    Some(euc_jp)
+}
+
 fn encode_with_encoding(encoding: &'static encoding_rs::Encoding, text: &str) -> Option<Vec<u8>> {
     let (bytes, _encoding_used, had_errors) = encoding.encode(text);
     (!had_errors).then(|| bytes.into_owned())
@@ -139,7 +189,10 @@ fn encode_utf16(text: &str, big_endian: bool, with_bom: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cow, decode_script_text, decode_script_text_strict};
+    use super::{
+        Cow, ScriptTextEncoding, decode_script_text, decode_script_text_strict,
+        decode_script_text_with_encoding,
+    };
 
     #[test]
     fn decodes_shift_jis_script_text() {
@@ -148,6 +201,16 @@ mod tests {
         ];
 
         assert_eq!(decode_script_text(&bytes), "// スクリプト");
+    }
+
+    #[test]
+    fn prefers_shift_jis_for_half_width_katakana_ambiguity() {
+        let bytes = [0xb6, 0xc0, 0xb6, 0xc5];
+
+        let decoded = decode_script_text_with_encoding(&bytes).expect("decode");
+
+        assert_eq!(decoded.encoding, ScriptTextEncoding::ShiftJis);
+        assert_eq!(decoded.text, "ｶﾀｶﾅ");
     }
 
     #[test]

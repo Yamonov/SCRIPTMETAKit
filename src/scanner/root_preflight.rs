@@ -175,15 +175,35 @@ fn scan_entries(
 }
 
 fn should_skip_preflight_path(path: &Path, options: &ScannerOptions) -> bool {
-    let Some(name) = path.file_name() else {
-        return false;
-    };
-    if options.skip_hidden && name.as_encoded_bytes().starts_with(b".") {
+    if options.skip_hidden && is_hidden_path(path) {
         return true;
     }
     options.skip_packages && is_package_path(path)
 }
 
+fn is_hidden_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
+        || platform_path_is_hidden(path)
+}
+
+#[cfg(windows)]
+fn platform_path_is_hidden(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn platform_path_is_hidden(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
 fn is_restricted_registered_root(root_path: &Path) -> bool {
     let normalized_root = normalize_path(root_path);
     let mut restricted_paths = vec![
@@ -205,8 +225,81 @@ fn is_restricted_registered_root(root_path: &Path) -> bool {
         .any(|path| normalize_path(&path) == normalized_root)
 }
 
+#[cfg(windows)]
+fn is_restricted_registered_root(root_path: &Path) -> bool {
+    let normalized_root = normalize_path(root_path);
+    if is_windows_drive_root(&normalized_root) {
+        return true;
+    }
+
+    let mut restricted_paths = Vec::new();
+    for variable in [
+        "SystemRoot",
+        "WINDIR",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+        "USERPROFILE",
+    ] {
+        if let Some(path) = env::var_os(variable) {
+            restricted_paths.push(PathBuf::from(path));
+        }
+    }
+    if let Some(system_drive) = env::var_os("SystemDrive") {
+        restricted_paths.push(PathBuf::from(format!(
+            r"{}\Users",
+            trim_windows_root_separator(&system_drive.to_string_lossy())
+        )));
+    }
+    if let (Some(home_drive), Some(home_path)) = (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH"))
+    {
+        let home_drive = home_drive.to_string_lossy();
+        let home_path = home_path.to_string_lossy();
+        let separator = if home_path.starts_with(['\\', '/']) {
+            ""
+        } else {
+            r"\"
+        };
+        restricted_paths.push(PathBuf::from(format!(
+            "{}{}{}",
+            trim_windows_root_separator(&home_drive),
+            separator,
+            home_path
+        )));
+    }
+
+    restricted_paths
+        .into_iter()
+        .any(|path| normalize_path(&path) == normalized_root)
+}
+
+#[cfg(windows)]
+fn trim_windows_root_separator(path: &str) -> &str {
+    path.trim_end_matches(|character| character == '\\' || character == '/')
+}
+
+#[cfg(windows)]
+fn is_windows_drive_root(path: &Path) -> bool {
+    use std::path::Component;
+
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Prefix(_)))
+        && matches!(components.next(), Some(Component::RootDir))
+        && components.next().is_none()
+}
+
 fn is_trash_path(root_path: &Path) -> bool {
     let normalized_root = normalize_path(root_path);
+    #[cfg(windows)]
+    if normalized_root.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("$Recycle.Bin")
+    }) {
+        return true;
+    }
+
     if normalized_root
         .components()
         .any(|component| component.as_os_str() == ".Trashes")

@@ -485,6 +485,20 @@ typedef struct SmkScriptMetadataEditReadResult {
     SmkUtf8Slice source_fingerprint;
 } SmkScriptMetadataEditReadResult;
 
+typedef struct SmkScriptMetadataEditPreviewResult {
+    SmkUtf8Slice file_path;
+    SmkUtf8Slice preview_text;
+    size_t preview_byte_count;
+    uint64_t file_size;
+    uint8_t has_file_size;
+    SmkUtf8Slice comment_style;
+    SmkUtf8Slice line_ending;
+    uint8_t has_scriptmeta_marker_in_preview;
+    uint8_t is_truncated;
+    uint8_t requires_full_read;
+    SmkUtf8Slice file_state_fingerprint;
+} SmkScriptMetadataEditPreviewResult;
+
 typedef struct SmkScriptMetaBackupGeneration {
     SmkUtf8Slice id;
     size_t sequence_number;
@@ -505,6 +519,9 @@ void smk_engine_free(SmkEngine *engine);
 
 SmkStatus smk_supported_script_extensions(SmkUtf8Slice *out_extensions);
 
+// String slices inside out_inspection remain valid until the next
+// smk_inspect_script_file_path call on the same thread. Copy them immediately
+// if the caller needs to keep them longer or cross thread boundaries.
 SmkStatus smk_inspect_script_file_path(
     SmkUtf8Slice path,
     SmkScriptFileInspection *out_inspection
@@ -841,6 +858,13 @@ SmkStatus smk_engine_read_script_metadata_draft_file(
     SmkEditResult **out_result
 );
 
+SmkStatus smk_engine_read_script_metadata_edit_preview_file(
+    SmkEngine *engine,
+    SmkUtf8Slice file_path,
+    size_t max_bytes,
+    SmkEditResult **out_result
+);
+
 SmkStatus smk_engine_render_distribution_metadata(
     SmkEngine *engine,
     const SmkDistributionMetadataDraft *records_ptr,
@@ -910,6 +934,11 @@ SmkStatus smk_edit_result_file_write_result(
 SmkStatus smk_edit_result_metadata_edit_read_result(
     const SmkEditResult *result,
     SmkScriptMetadataEditReadResult *out_info
+);
+
+SmkStatus smk_edit_result_metadata_edit_preview_result(
+    const SmkEditResult *result,
+    SmkScriptMetadataEditPreviewResult *out_info
 );
 
 SmkStatus smk_edit_result_existing_lines(

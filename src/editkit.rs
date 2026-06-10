@@ -735,11 +735,7 @@ fn write_script_metadata_to_text_file(
 }
 
 fn compiled_osa_error_allows_text_fallback(kind: compiled_osa::CompiledOsaErrorKind) -> bool {
-    matches!(
-        kind,
-        compiled_osa::CompiledOsaErrorKind::NotOsaScript
-            | compiled_osa::CompiledOsaErrorKind::UnsupportedPlatform
-    )
+    matches!(kind, compiled_osa::CompiledOsaErrorKind::NotOsaScript)
 }
 
 pub fn render_distribution_metadata_block(
@@ -1104,7 +1100,7 @@ fn parse_block_elements(content: &str) -> Vec<ScriptMetaBlockElement> {
             continue;
         }
 
-        if let Some(separator_index) = line.find('=') {
+        if let Some(separator_index) = script_metadata_separator_index(line) {
             let key = line[..separator_index].trim();
             let value = line[separator_index + 1..].trim();
             elements.push(ScriptMetaBlockElement::Key {
@@ -1117,6 +1113,15 @@ fn parse_block_elements(content: &str) -> Vec<ScriptMetaBlockElement> {
         index += 1;
     }
     elements
+}
+
+fn script_metadata_separator_index(line: &str) -> Option<usize> {
+    match (line.find(':'), line.find('=')) {
+        (Some(colon), Some(equals)) => Some(colon.min(equals)),
+        (Some(colon), None) => Some(colon),
+        (None, Some(equals)) => Some(equals),
+        (None, None) => None,
+    }
 }
 
 fn draft_from_block_elements(elements: &[ScriptMetaBlockElement]) -> ScriptMetadataDraft {
@@ -1239,9 +1244,10 @@ fn first_scriptmeta_tagged_block(
 ) -> Option<ScriptMetaTaggedBlock> {
     let mut search_start = 0usize;
     while search_start < text.len() {
-        let begin_start = search_start + text[search_start..].find(SCRIPT_BEGIN)?;
+        let begin_start =
+            search_start + find_ascii_case_insensitive(&text[search_start..], SCRIPT_BEGIN)?;
         let begin_end = begin_start + SCRIPT_BEGIN.len();
-        let end_start = begin_end + text[begin_end..].find(SCRIPT_END)?;
+        let end_start = begin_end + find_ascii_case_insensitive(&text[begin_end..], SCRIPT_END)?;
         let end_end = end_start + SCRIPT_END.len();
         if is_tagged_range_inside_block_comment(text, begin_start, end_end, style)
             || is_standalone_tagged_range(text, begin_start, end_end)
@@ -1254,6 +1260,13 @@ fn first_scriptmeta_tagged_block(
         search_start = begin_end;
     }
     None
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn is_tagged_range_inside_block_comment(
@@ -2125,6 +2138,28 @@ mod tests {
         assert!(updated.contains("Name=New Name\n"));
         assert!(updated.contains("Unknown-Key=keep\n"));
         assert!(!updated.contains("Script-ID=com.example.old\n"));
+    }
+
+    #[test]
+    fn replaces_case_insensitive_colon_script_metadata() {
+        let draft = ScriptMetadataDraft {
+            script_id: "com.example.new".to_string(),
+            name: Some("New Name".to_string()),
+            ..ScriptMetadataDraft::default()
+        };
+
+        let updated = append_script_metadata_to_text(
+            "/*\nscriptmeta-begin\nscript-id: com.example.old\nUnknown-Key: keep\nscriptmeta-end\n*/\n",
+            Path::new("example.jsx"),
+            &draft,
+        )
+        .expect("replace");
+
+        assert!(updated.contains("Script-ID=com.example.new\n"));
+        assert!(updated.contains("Name=New Name\n"));
+        assert!(updated.contains("Unknown-Key=keep\n"));
+        assert!(!updated.contains("script-id: com.example.old\n"));
+        assert!(parse_script_metadata(&updated).is_ok());
     }
 
     #[test]
