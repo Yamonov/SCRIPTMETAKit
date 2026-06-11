@@ -4,7 +4,7 @@ import ScriptMetaKit
 final class ScriptMetaKitAPITests: XCTestCase {
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.2")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.4")
     }
 
     func testFolderScanFindsScriptMetadata() async throws {
@@ -132,6 +132,50 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
         XCTAssertEqual(updateResult.statusesByItemID[item.filePath], "update_available")
         XCTAssertEqual(updateResult.statusesByItemID.count, 1)
+    }
+
+    func testBatchUpdateCheckReturnsSelectedStatuses() async throws {
+        let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.batch.first")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dist = root.appendingPathComponent("SCRIPTMETA.txt")
+        try """
+        SCRIPTMETA-DIST-BEGIN
+        Script-ID: com.example.swiftapi.batch.first
+        Latest-Version: 2.0.0
+
+        Script-ID: com.example.swiftapi.batch.second
+        Latest-Version: 1.0.0
+        SCRIPTMETA-DIST-END
+        """.write(to: dist, atomically: true, encoding: .utf8)
+        let secondScript = root.appendingPathComponent("second.jsx")
+        try """
+        // SCRIPTMETA-BEGIN
+        // Script-ID: com.example.swiftapi.batch.second
+        // Version: 1.0.0
+        // Name: Swift API Batch Second
+        // Meta-URL: \(dist.absoluteString)
+        // SCRIPTMETA-END
+        alert("test");
+        """.write(to: secondScript, atomically: true, encoding: .utf8)
+        let firstScript = root.appendingPathComponent("sample.jsx")
+        try """
+        // SCRIPTMETA-BEGIN
+        // Script-ID: com.example.swiftapi.batch.first
+        // Version: 1.0.0
+        // Name: Swift API Batch First
+        // Meta-URL: \(dist.absoluteString)
+        // SCRIPTMETA-END
+        alert("test");
+        """.write(to: firstScript, atomically: true, encoding: .utf8)
+
+        let engine = ScriptMetaKitEngine()
+        let scanResult = try await engine.scan(folderURL: root, checkUpdates: false)
+        let items = scanResult.fileItems.sorted { $0.scriptID < $1.scriptID }
+        let updateResult = try await engine.checkUpdates(items: items)
+
+        XCTAssertEqual(updateResult.statusesByItemID[firstScript.path], "update_available")
+        XCTAssertEqual(updateResult.statusesByItemID[secondScript.path], "up_to_date")
+        XCTAssertEqual(updateResult.statusesByItemID.count, 2)
     }
 
     func testScanWithUpdatesKeepsDuplicateScriptIDFileStatuses() async throws {
@@ -282,6 +326,100 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(entry.scriptMetaEditState, "obfuscated")
         XCTAssertFalse(entry.canEditScriptMeta)
         XCTAssertFalse(entry.canAppendScriptMeta)
+    }
+
+    func testDirtyOnlyWatchPollReturnsAffectedRootSnapshot() async throws {
+        let firstRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.watch.first")
+        let secondRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.watch.second")
+        defer {
+            try? FileManager.default.removeItem(at: firstRoot)
+            try? FileManager.default.removeItem(at: secondRoot)
+        }
+
+        let workspace = ScriptMetaKitWorkspace(configuration: ScriptMetaKitWorkspaceConfiguration(
+            nativeEventLatencyMillis: 50
+        ))
+        let roots = [
+            ScriptMetaKitRoot(
+                rootID: "first",
+                url: firstRoot,
+                purpose: .fileListAndMetadata,
+                watchPolicy: .allRegistered,
+                refreshPolicy: .onFileEvent
+            ),
+            ScriptMetaKitRoot(
+                rootID: "second",
+                url: secondRoot,
+                purpose: .fileListAndMetadata,
+                watchPolicy: .allRegistered,
+                refreshPolicy: .onFileEvent
+            )
+        ]
+
+        _ = try await workspace.scanRoots(
+            roots,
+            replacingGroup: "test.watch",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListAndMetadata
+        )
+        try await workspace.startWatching(
+            roots: roots,
+            replacingGroup: "test.watch",
+            onChange: {}
+        )
+        defer {
+            Task {
+                await workspace.stopWatching()
+            }
+        }
+        try await drainWatchChanges(workspace: workspace, dirtyOnly: true)
+
+        let addedScript = firstRoot.appendingPathComponent("added.jsx")
+        try """
+        // SCRIPTMETA-BEGIN
+        // Script-ID: com.example.swiftapi.watch.added
+        // Version: 1.0.0
+        // SCRIPTMETA-END
+        alert("test");
+        """.write(to: addedScript, atomically: true, encoding: .utf8)
+
+        let result = try await waitForWatchChange(workspace: workspace, dirtyOnly: true)
+        await workspace.stopWatching()
+
+        XCTAssertEqual(result.fileListSnapshots.map(\.root.rootID), ["first"])
+        XCTAssertTrue(result.fileListSnapshots.first?.children?.contains { $0.name == "added.jsx" } ?? false)
+    }
+
+    private func waitForWatchChange(
+        workspace: ScriptMetaKitWorkspace,
+        dirtyOnly: Bool,
+        attempts: Int = 40
+    ) async throws -> ScriptMetaScanResult {
+        for _ in 0..<attempts {
+            if let result = try await workspace.pollWatchChanges(dirtyOnly: dirtyOnly) {
+                return result
+            }
+            try await Task.sleep(nanoseconds: 150_000_000)
+        }
+        XCTFail("watch change was not observed")
+        throw CancellationError()
+    }
+
+    private func drainWatchChanges(
+        workspace: ScriptMetaKitWorkspace,
+        dirtyOnly: Bool
+    ) async throws {
+        try await Task.sleep(nanoseconds: 300_000_000)
+        var idlePolls = 0
+        for _ in 0..<20 {
+            if try await workspace.pollWatchChanges(dirtyOnly: dirtyOnly) == nil {
+                idlePolls += 1
+                if idlePolls >= 3 { return }
+            } else {
+                idlePolls = 0
+            }
+            try await Task.sleep(nanoseconds: 150_000_000)
+        }
     }
 
     private func makeTemporaryScriptRoot(scriptID: String = "com.example.swiftapi.scan") throws -> URL {

@@ -278,9 +278,12 @@ public actor ScriptMetaKitWorkspace {
         try await engine.startWatching(onChange: onChange)
     }
 
-    public func pollWatchChanges(cacheScope: ScriptMetaCacheScope? = nil) async throws -> ScriptMetaScanResult? {
+    public func pollWatchChanges(
+        dirtyOnly: Bool = false,
+        cacheScope: ScriptMetaCacheScope? = nil
+    ) async throws -> ScriptMetaScanResult? {
         try await configureEngineIfNeeded()
-        let result = try await engine.pollWatchChanges()
+        let result = try await engine.pollWatchChanges(dirtyOnly: dirtyOnly)
         if result != nil, let cacheScope {
             await savePersistentCache(scope: cacheScope)
         }
@@ -306,6 +309,19 @@ public actor ScriptMetaKitWorkspace {
     ) async throws -> UpdateCheckResult {
         try await configureEngineIfNeeded()
         let result = try await engine.checkUpdate(item: item, onProgress: onProgress)
+        if let cacheScope {
+            await savePersistentCache(scope: cacheScope)
+        }
+        return result
+    }
+
+    public func checkUpdates(
+        items: [ScriptMetaItem],
+        cacheScope: ScriptMetaCacheScope? = .catalog,
+        onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
+    ) async throws -> UpdateCheckResult {
+        try await configureEngineIfNeeded()
+        let result = try await engine.checkUpdates(items: items, onProgress: onProgress)
         if let cacheScope {
             await savePersistentCache(scope: cacheScope)
         }

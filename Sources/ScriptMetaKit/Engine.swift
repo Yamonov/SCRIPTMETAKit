@@ -61,6 +61,15 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         }.value
     }
 
+    public func checkUpdates(
+        items: [ScriptMetaItem],
+        onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
+    ) async throws -> UpdateCheckResult {
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.checkUpdates(items: items, onProgress: onProgress)
+        }.value
+    }
+
     public func setRoots(_ roots: [ScriptMetaKitRoot]) async throws {
         try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.setRoots(roots)
@@ -296,9 +305,9 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         try Self.validateScriptIDUniqueness(in: items)
     }
 
-    public func pollWatchChanges() async throws -> ScriptMetaScanResult? {
+    public func pollWatchChanges(dirtyOnly: Bool = false) async throws -> ScriptMetaScanResult? {
         try await Task.detached(priority: Self.operationPriority) { [engineBox] in
-            try engineBox.pollWatchChanges()
+            try engineBox.pollWatchChanges(dirtyOnly: dirtyOnly)
         }.value
     }
 }
@@ -1226,6 +1235,24 @@ private nonisolated func smk_engine_check_update_item_with_progress(
     _ outResult: UnsafeMutablePointer<OpaquePointer?>
 ) -> Int32
 
+@_silgen_name("smk_engine_check_updates_for_items")
+private nonisolated func smk_engine_check_updates_for_items(
+    _ engine: OpaquePointer?,
+    _ items: UnsafePointer<SmkScriptItem>?,
+    _ itemCount: Int,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
+@_silgen_name("smk_engine_check_updates_for_items_with_progress")
+private nonisolated func smk_engine_check_updates_for_items_with_progress(
+    _ engine: OpaquePointer?,
+    _ items: UnsafePointer<SmkScriptItem>?,
+    _ itemCount: Int,
+    _ progressCallback: SmkUpdateProgressCallback?,
+    _ progressContext: UnsafeMutableRawPointer?,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
 @_silgen_name("smk_validate_script_id_uniqueness")
 private nonisolated func smk_validate_script_id_uniqueness(
     _ items: UnsafePointer<SmkScriptIdUniquenessItem>?,
@@ -1288,6 +1315,13 @@ private nonisolated func smk_engine_stop_watching(_ engine: OpaquePointer?) -> I
 
 @_silgen_name("smk_engine_poll_watcher_scan")
 private nonisolated func smk_engine_poll_watcher_scan(
+    _ engine: OpaquePointer?,
+    _ outChanged: UnsafeMutablePointer<UInt8>,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
+@_silgen_name("smk_engine_poll_watcher_scan_dirty_only")
+private nonisolated func smk_engine_poll_watcher_scan_dirty_only(
     _ engine: OpaquePointer?,
     _ outChanged: UnsafeMutablePointer<UInt8>,
     _ outResult: UnsafeMutablePointer<OpaquePointer?>
@@ -1571,6 +1605,15 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         return try ensureEngineLocked().checkUpdate(item: item, onProgress: onProgress)
     }
 
+    public func checkUpdates(
+        items: [ScriptMetaItem],
+        onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
+    ) throws -> UpdateCheckResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try ensureEngineLocked().checkUpdates(items: items, onProgress: onProgress)
+    }
+
     public func setRoots(_ roots: [ScriptMetaKitRoot]) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -1825,11 +1868,11 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         )
     }
 
-    public func pollWatchChanges() throws -> ScriptMetaScanResult? {
+    public func pollWatchChanges(dirtyOnly: Bool = false) throws -> ScriptMetaScanResult? {
         lock.lock()
         defer { lock.unlock() }
         guard let engine else { return nil }
-        return try engine.pollWatchChanges()
+        return try engine.pollWatchChanges(dirtyOnly: dirtyOnly)
     }
 }
 
@@ -2156,6 +2199,50 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
                         )
                     } else {
                         smk_engine_check_update_item(handle, itemPointer, &result)
+                    }
+                }
+            }
+        }
+        guard status == smkStatusOK, let result else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+        defer {
+            smk_scan_result_free(result)
+        }
+        guard let updateResult = try updateResult(from: result) else {
+            throw ScriptMetaKitError.operationFailed(4, "update check result was not returned")
+        }
+        return updateResult
+    }
+
+    public func checkUpdates(
+        items: [ScriptMetaItem],
+        onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
+    ) throws -> UpdateCheckResult {
+        let arena = SmkInputStringArena()
+        let ffiItems = items.map { smkScriptItem(from: $0, arena: arena) }
+        let progressSink = onProgress.map { ScriptMetaKitProgressSink(onProgress: $0) }
+        let progressContext = progressSink.map { Unmanaged.passUnretained($0).toOpaque() }
+        var result: OpaquePointer?
+        let status = withExtendedLifetime(arena) {
+            withExtendedLifetime(progressSink) {
+                ffiItems.withUnsafeBufferPointer { buffer in
+                    if progressSink != nil {
+                        smk_engine_check_updates_for_items_with_progress(
+                            handle,
+                            buffer.baseAddress,
+                            buffer.count,
+                            updateProgressCallback,
+                            progressContext,
+                            &result
+                        )
+                    } else {
+                        smk_engine_check_updates_for_items(
+                            handle,
+                            buffer.baseAddress,
+                            buffer.count,
+                            &result
+                        )
                     }
                 }
             }
@@ -2513,10 +2600,14 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         _ = smk_engine_stop_watching(handle)
     }
 
-    public func pollWatchChanges() throws -> ScriptMetaScanResult? {
+    public func pollWatchChanges(dirtyOnly: Bool = false) throws -> ScriptMetaScanResult? {
         var changed: UInt8 = 0
         var result: OpaquePointer?
-        let status = smk_engine_poll_watcher_scan(handle, &changed, &result)
+        let status = if dirtyOnly {
+            smk_engine_poll_watcher_scan_dirty_only(handle, &changed, &result)
+        } else {
+            smk_engine_poll_watcher_scan(handle, &changed, &result)
+        }
         guard status == smkStatusOK else {
             throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
         }

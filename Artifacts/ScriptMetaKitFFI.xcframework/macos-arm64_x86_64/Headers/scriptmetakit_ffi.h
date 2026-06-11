@@ -676,6 +676,22 @@ SmkStatus smk_engine_check_update_item_with_progress(
     SmkScanResult **out_result
 );
 
+SmkStatus smk_engine_check_updates_for_items(
+    SmkEngine *engine,
+    const SmkScriptItem *items_ptr,
+    size_t item_count,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_check_updates_for_items_with_progress(
+    SmkEngine *engine,
+    const SmkScriptItem *items_ptr,
+    size_t item_count,
+    SmkUpdateProgressCallback progress_callback,
+    void *progress_context,
+    SmkScanResult **out_result
+);
+
 SmkStatus smk_validate_script_id_uniqueness(
     const SmkScriptIdUniquenessItem *items_ptr,
     size_t item_count,
@@ -724,6 +740,12 @@ SmkStatus smk_engine_start_watching_with_callback(
 SmkStatus smk_engine_stop_watching(SmkEngine *engine);
 
 SmkStatus smk_engine_poll_watcher_scan(
+    SmkEngine *engine,
+    uint8_t *out_changed,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_poll_watcher_scan_dirty_only(
     SmkEngine *engine,
     uint8_t *out_changed,
     SmkScanResult **out_result
