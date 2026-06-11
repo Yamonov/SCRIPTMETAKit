@@ -2688,38 +2688,26 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
     let changeSummary = try scanChangeSummary(from: result)
     let operationInfo = try operationInfo(from: result)
     let fileIssues = try fileIssues(from: result)
-    let now = UInt64(Date().timeIntervalSince1970 * 1000)
     let catalogInfo = try catalogInfo(from: result)
     let hasCatalog = catalogInfo.hasCatalog != 0
-    let sourceRevision: String
-    let schemaVersion: UInt32
-    let cacheBuiltAt: UInt64
-    let registeredRoots: [RegisteredRootSignature]
+    let catalog: ScriptMetaCatalogSnapshot?
     if hasCatalog {
-        sourceRevision = string(catalogInfo.sourceRevision)
-        schemaVersion = catalogInfo.candidateCacheSchemaVersion
-        cacheBuiltAt = catalogInfo.candidateCacheBuiltAt
-        registeredRoots = try registeredRootSignatures(from: result)
+        catalog = ScriptMetaCatalogSnapshot(
+            sourceRevision: string(catalogInfo.sourceRevision),
+            roots: roots,
+            allItems: allItems,
+            fileItems: fileItems,
+            candidateCache: CandidateCache(
+                schemaVersion: catalogInfo.candidateCacheSchemaVersion,
+                builtAt: catalogInfo.candidateCacheBuiltAt,
+                registeredRoots: try registeredRootSignatures(from: result),
+                records: try candidateRecords(from: result)
+            ),
+            updateCheckResult: updateCheckResult
+        )
     } else {
-        sourceRevision = UUID().uuidString
-        schemaVersion = 5
-        cacheBuiltAt = updateCheckResult?.checkedAt ?? roots.compactMap(\.lastLoadedAt).max() ?? now
-        registeredRoots = []
+        catalog = nil
     }
-    let candidateRecords = try candidateRecords(from: result)
-    let catalog = ScriptMetaCatalogSnapshot(
-        sourceRevision: sourceRevision,
-        roots: roots,
-        allItems: allItems,
-        fileItems: fileItems,
-        candidateCache: CandidateCache(
-            schemaVersion: schemaVersion,
-            builtAt: cacheBuiltAt,
-            registeredRoots: registeredRoots,
-            records: candidateRecords
-        ),
-        updateCheckResult: updateCheckResult
-    )
 
     return ScriptMetaScanResult(
         roots: roots,

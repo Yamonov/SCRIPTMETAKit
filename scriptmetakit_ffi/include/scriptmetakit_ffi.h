@@ -745,6 +745,8 @@ SmkStatus smk_engine_poll_watcher_scan(
     SmkScanResult **out_result
 );
 
+/* Returns only root-scoped data affected by the watcher batch. Catalog and
+ * update-check snapshots are omitted because they describe the full root set. */
 SmkStatus smk_engine_poll_watcher_scan_dirty_only(
     SmkEngine *engine,
     uint8_t *out_changed,

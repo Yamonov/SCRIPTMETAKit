@@ -1997,8 +1997,10 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
-/// Same as `smk_engine_poll_watcher_scan`, but file-list snapshots in the
-/// returned result are limited to roots affected by the watcher batch.
+/// Same as `smk_engine_poll_watcher_scan`, but root snapshots, file-list
+/// snapshots, file issues, and change-summary entries in the returned result
+/// are limited to roots affected by the watcher batch. Catalog and update-check
+/// snapshots are omitted because they describe the full registered set.
 pub unsafe extern "C" fn smk_engine_poll_watcher_scan_dirty_only(
     engine: *mut SmkEngine,
     out_changed: *mut u8,
@@ -3276,12 +3278,45 @@ fn poll_watcher_scan(
         })
         .map_err(|error| error.to_string())?;
     if dirty_only {
-        scan_result
-            .file_list_snapshots
-            .retain(|snapshot| affected_root_ids.contains(&snapshot.root.root_id));
+        filter_dirty_scan_result(&mut scan_result, &affected_root_ids);
     }
     scan_result.watch_change_batch = Some(change_batch);
     Ok(Some(SmkScanResult::from_scan_result(scan_result, None)))
+}
+
+#[cfg(feature = "native-watch")]
+fn filter_dirty_scan_result(scan_result: &mut ScanResult, affected_root_ids: &BTreeSet<RootId>) {
+    scan_result
+        .roots
+        .retain(|root| affected_root_ids.contains(&root.root_id));
+    scan_result
+        .file_list_snapshots
+        .retain(|snapshot| affected_root_ids.contains(&snapshot.root.root_id));
+    scan_result.file_issues.retain(|issue| {
+        issue
+            .root_id
+            .as_ref()
+            .is_none_or(|root_id| affected_root_ids.contains(root_id.as_str()))
+    });
+    scan_result.catalog_snapshot = None;
+    scan_result.update_check_result = None;
+
+    if let Some(summary) = scan_result.change_summary.take() {
+        let mut filtered = ScanChangeSummary::default();
+        for change in summary
+            .changes
+            .into_iter()
+            .filter(|change| affected_root_ids.contains(&change.root_id))
+        {
+            match change.kind {
+                FileEntryChangeKind::Added => filtered.added_count += 1,
+                FileEntryChangeKind::Removed => filtered.removed_count += 1,
+                FileEntryChangeKind::Modified => filtered.modified_count += 1,
+            }
+            filtered.changes.push(change);
+        }
+        scan_result.change_summary = Some(filtered);
+    }
 }
 
 #[cfg(not(feature = "native-watch"))]

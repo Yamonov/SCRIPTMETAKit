@@ -268,6 +268,8 @@ public actor ScriptMetaKitWorkspace {
         roots: [ScriptMetaKitRoot],
         replacingGroup groupID: String,
         cacheScope: ScriptMetaCacheScope? = nil,
+        drainsInitialChanges: Bool = false,
+        initialDrainDirtyOnly: Bool = false,
         onChange: @escaping @Sendable () -> Void
     ) async throws {
         try await configureEngineIfNeeded()
@@ -276,6 +278,9 @@ public actor ScriptMetaKitWorkspace {
             await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: roots.map(\.rootID))
         }
         try await engine.startWatching(onChange: onChange)
+        if drainsInitialChanges {
+            try await drainWatchChanges(dirtyOnly: initialDrainDirtyOnly)
+        }
     }
 
     public func pollWatchChanges(
@@ -288,6 +293,35 @@ public actor ScriptMetaKitWorkspace {
             await savePersistentCache(scope: cacheScope)
         }
         return result
+    }
+
+    public func drainWatchChanges(
+        dirtyOnly: Bool = false,
+        initialDelayMillis: UInt64 = 300,
+        pollingIntervalMillis: UInt64 = 150,
+        idlePollCount: Int = 3,
+        maxPollCount: Int = 20
+    ) async throws {
+        if initialDelayMillis > 0 {
+            try await Task.sleep(nanoseconds: initialDelayMillis * 1_000_000)
+        }
+
+        let requiredIdlePolls = max(1, idlePollCount)
+        let allowedPolls = max(requiredIdlePolls, maxPollCount)
+        var idlePolls = 0
+        for _ in 0..<allowedPolls {
+            if try await pollWatchChanges(dirtyOnly: dirtyOnly) == nil {
+                idlePolls += 1
+                if idlePolls >= requiredIdlePolls {
+                    return
+                }
+            } else {
+                idlePolls = 0
+            }
+            if pollingIntervalMillis > 0 {
+                try await Task.sleep(nanoseconds: pollingIntervalMillis * 1_000_000)
+            }
+        }
     }
 
     public func stopWatching() async {
@@ -304,7 +338,7 @@ public actor ScriptMetaKitWorkspace {
 
     public func checkUpdate(
         item: ScriptMetaItem,
-        cacheScope: ScriptMetaCacheScope? = .catalog,
+        cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
         try await configureEngineIfNeeded()
@@ -317,7 +351,7 @@ public actor ScriptMetaKitWorkspace {
 
     public func checkUpdates(
         items: [ScriptMetaItem],
-        cacheScope: ScriptMetaCacheScope? = .catalog,
+        cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
         try await configureEngineIfNeeded()

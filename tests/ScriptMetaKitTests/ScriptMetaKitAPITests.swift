@@ -339,22 +339,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
         let workspace = ScriptMetaKitWorkspace(configuration: ScriptMetaKitWorkspaceConfiguration(
             nativeEventLatencyMillis: 50
         ))
-        let roots = [
-            ScriptMetaKitRoot(
-                rootID: "first",
-                url: firstRoot,
-                purpose: .fileListAndMetadata,
-                watchPolicy: .allRegistered,
-                refreshPolicy: .onFileEvent
-            ),
-            ScriptMetaKitRoot(
-                rootID: "second",
-                url: secondRoot,
-                purpose: .fileListAndMetadata,
-                watchPolicy: .allRegistered,
-                refreshPolicy: .onFileEvent
-            )
-        ]
+        let roots = makeWatchRoots(firstRoot: firstRoot, secondRoot: secondRoot)
 
         _ = try await workspace.scanRoots(
             roots,
@@ -365,6 +350,8 @@ final class ScriptMetaKitAPITests: XCTestCase {
         try await workspace.startWatching(
             roots: roots,
             replacingGroup: "test.watch",
+            drainsInitialChanges: true,
+            initialDrainDirtyOnly: true,
             onChange: {}
         )
         defer {
@@ -372,7 +359,6 @@ final class ScriptMetaKitAPITests: XCTestCase {
                 await workspace.stopWatching()
             }
         }
-        try await drainWatchChanges(workspace: workspace, dirtyOnly: true)
 
         let addedScript = firstRoot.appendingPathComponent("added.jsx")
         try """
@@ -387,7 +373,103 @@ final class ScriptMetaKitAPITests: XCTestCase {
         await workspace.stopWatching()
 
         XCTAssertEqual(result.fileListSnapshots.map(\.root.rootID), ["first"])
+        XCTAssertEqual(result.roots.map(\.rootID), ["first"])
+        XCTAssertNil(result.catalogSnapshot)
+        XCTAssertNil(result.updateCheckResult)
         XCTAssertTrue(result.fileListSnapshots.first?.children?.contains { $0.name == "added.jsx" } ?? false)
+    }
+
+    func testDirtyOnlyWatchPollHandlesDeletedFile() async throws {
+        let firstRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.watch.delete.first")
+        let secondRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.watch.delete.second")
+        defer {
+            try? FileManager.default.removeItem(at: firstRoot)
+            try? FileManager.default.removeItem(at: secondRoot)
+        }
+
+        let workspace = ScriptMetaKitWorkspace(configuration: ScriptMetaKitWorkspaceConfiguration(
+            nativeEventLatencyMillis: 50
+        ))
+        let roots = makeWatchRoots(firstRoot: firstRoot, secondRoot: secondRoot)
+
+        _ = try await workspace.scanRoots(
+            roots,
+            replacingGroup: "test.watch",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListAndMetadata
+        )
+        try await workspace.startWatching(
+            roots: roots,
+            replacingGroup: "test.watch",
+            drainsInitialChanges: true,
+            initialDrainDirtyOnly: true,
+            onChange: {}
+        )
+        defer {
+            Task {
+                await workspace.stopWatching()
+            }
+        }
+
+        try FileManager.default.removeItem(at: firstRoot.appendingPathComponent("sample.jsx"))
+
+        let result = try await waitForWatchChange(workspace: workspace, dirtyOnly: true)
+        await workspace.stopWatching()
+
+        XCTAssertEqual(result.fileListSnapshots.map(\.root.rootID), ["first"])
+        XCTAssertFalse(result.fileListSnapshots.first?.children?.contains { $0.name == "sample.jsx" } ?? true)
+        XCTAssertEqual(result.changeSummary?.removedCount, 1)
+    }
+
+    func testDirtyOnlyWatchPollReturnsMultipleAffectedRoots() async throws {
+        let firstRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.watch.multi.first")
+        let secondRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.watch.multi.second")
+        defer {
+            try? FileManager.default.removeItem(at: firstRoot)
+            try? FileManager.default.removeItem(at: secondRoot)
+        }
+
+        let workspace = ScriptMetaKitWorkspace(configuration: ScriptMetaKitWorkspaceConfiguration(
+            nativeEventLatencyMillis: 50
+        ))
+        let roots = makeWatchRoots(firstRoot: firstRoot, secondRoot: secondRoot)
+
+        _ = try await workspace.scanRoots(
+            roots,
+            replacingGroup: "test.watch",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListAndMetadata
+        )
+        try await workspace.startWatching(
+            roots: roots,
+            replacingGroup: "test.watch",
+            drainsInitialChanges: true,
+            initialDrainDirtyOnly: true,
+            onChange: {}
+        )
+        defer {
+            Task {
+                await workspace.stopWatching()
+            }
+        }
+
+        try "alert('first');".write(
+            to: firstRoot.appendingPathComponent("first-added.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "alert('second');".write(
+            to: secondRoot.appendingPathComponent("second-added.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = try await waitForWatchChange(workspace: workspace, dirtyOnly: true)
+        await workspace.stopWatching()
+
+        XCTAssertEqual(Set(result.fileListSnapshots.map(\.root.rootID)), Set(["first", "second"]))
+        XCTAssertEqual(Set(result.roots.map(\.rootID)), Set(["first", "second"]))
+        XCTAssertNil(result.catalogSnapshot)
     }
 
     private func waitForWatchChange(
@@ -403,23 +485,6 @@ final class ScriptMetaKitAPITests: XCTestCase {
         }
         XCTFail("watch change was not observed")
         throw CancellationError()
-    }
-
-    private func drainWatchChanges(
-        workspace: ScriptMetaKitWorkspace,
-        dirtyOnly: Bool
-    ) async throws {
-        try await Task.sleep(nanoseconds: 300_000_000)
-        var idlePolls = 0
-        for _ in 0..<20 {
-            if try await workspace.pollWatchChanges(dirtyOnly: dirtyOnly) == nil {
-                idlePolls += 1
-                if idlePolls >= 3 { return }
-            } else {
-                idlePolls = 0
-            }
-            try await Task.sleep(nanoseconds: 150_000_000)
-        }
     }
 
     private func makeTemporaryScriptRoot(scriptID: String = "com.example.swiftapi.scan") throws -> URL {
@@ -438,5 +503,24 @@ final class ScriptMetaKitAPITests: XCTestCase {
         """.write(to: script, atomically: true, encoding: .utf8)
 
         return root
+    }
+
+    private func makeWatchRoots(firstRoot: URL, secondRoot: URL) -> [ScriptMetaKitRoot] {
+        [
+            ScriptMetaKitRoot(
+                rootID: "first",
+                url: firstRoot,
+                purpose: .fileListAndMetadata,
+                watchPolicy: .allRegistered,
+                refreshPolicy: .onFileEvent
+            ),
+            ScriptMetaKitRoot(
+                rootID: "second",
+                url: secondRoot,
+                purpose: .fileListAndMetadata,
+                watchPolicy: .allRegistered,
+                refreshPolicy: .onFileEvent
+            )
+        ]
     }
 }
