@@ -7,6 +7,30 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.4")
     }
 
+    func testVersionAndEditPasswordUtilityAPIsArePublic() throws {
+        XCTAssertEqual(try ScriptMetaKitEngine.normalizeVersionString("v1. 2 .3"), "1.2.3")
+        XCTAssertNil(try ScriptMetaKitEngine.normalizeVersionString("version x"))
+        XCTAssertTrue(try ScriptMetaKitEngine.validateVersionString("build 12 beta"))
+        XCTAssertFalse(try ScriptMetaKitEngine.validateVersionString("version x"))
+        XCTAssertEqual(try ScriptMetaKitEngine.compareVersions("1.0b", "1.0A"), .greater)
+        XCTAssertEqual(try ScriptMetaKitEngine.compareVersions("2.0", "2.0.1"), .less)
+        XCTAssertEqual(try ScriptMetaKitEngine.compareVersions("1.2", "1.2.0").comparisonResult, .orderedSame)
+
+        let stored = "salt:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        XCTAssertTrue(try ScriptMetaKitEngine.validateEditPasswordSHA256Format(stored))
+        XCTAssertFalse(try ScriptMetaKitEngine.validateEditPasswordSHA256Format("invalid"))
+    }
+
+    func testDistributionMetadataRendererIsAvailableSynchronously() throws {
+        let block = try ScriptMetaKitEngine.renderDistributionMetadata(records: [
+            DistributionMetadataDraft(scriptID: "com.example.public", version: "1.2.3")
+        ])
+
+        XCTAssertTrue(block.contains("SCRIPTMETA-DIST-BEGIN"))
+        XCTAssertTrue(block.contains("Script-ID=com.example.public"))
+        XCTAssertTrue(block.contains("Version=1.2.3"))
+    }
+
     func testFolderScanFindsScriptMetadata() async throws {
         let root = try makeTemporaryScriptRoot()
         defer { try? FileManager.default.removeItem(at: root) }

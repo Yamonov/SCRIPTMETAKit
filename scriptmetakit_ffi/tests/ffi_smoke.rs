@@ -13,8 +13,9 @@ use scriptmetakit_ffi::{
     SmkScriptItemSlice, SmkScriptMetaBackupGenerationSlice, SmkScriptMetaBackupRecord,
     SmkScriptMetadataDraft, SmkScriptMetadataEditPreviewResult, SmkScriptMetadataFileWriteResult,
     SmkScriptMetadataWriteRequest, SmkStatus, SmkUpdateCheckInfo, SmkUpdateProgress,
-    SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_edit_result_backup_generations,
-    smk_edit_result_backup_record, smk_edit_result_file_write_result, smk_edit_result_free,
+    SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_compare_versions,
+    smk_edit_result_backup_generations, smk_edit_result_backup_record,
+    smk_edit_result_file_write_result, smk_edit_result_free,
     smk_edit_result_metadata_edit_preview_result, smk_edit_result_text,
     smk_engine_cancel_current_operation, smk_engine_check_update_item,
     smk_engine_check_updates_for_items, smk_engine_create_default, smk_engine_free,
@@ -24,18 +25,82 @@ use scriptmetakit_ffi::{
     smk_engine_scan_folders_with_progress, smk_engine_scan_registered_roots, smk_engine_scan_roots,
     smk_engine_scriptmeta_backup_generations, smk_engine_set_resolve_macos_alias,
     smk_engine_set_roots, smk_engine_set_visible_root, smk_engine_verify_edit_password_sha256,
-    smk_engine_write_script_metadata_file, smk_scan_result_change_info,
-    smk_scan_result_file_entries, smk_scan_result_file_entry_changes, smk_scan_result_file_issues,
-    smk_scan_result_file_items, smk_scan_result_file_lists, smk_scan_result_free,
-    smk_scan_result_items, smk_scan_result_operation_info, smk_scan_result_roots,
-    smk_scan_result_update_info, smk_scan_result_update_resolutions,
-    smk_scan_result_update_statuses,
+    smk_engine_write_script_metadata_file, smk_normalize_version_string,
+    smk_scan_result_change_info, smk_scan_result_file_entries, smk_scan_result_file_entry_changes,
+    smk_scan_result_file_issues, smk_scan_result_file_items, smk_scan_result_file_lists,
+    smk_scan_result_free, smk_scan_result_items, smk_scan_result_operation_info,
+    smk_scan_result_roots, smk_scan_result_update_info, smk_scan_result_update_resolutions,
+    smk_scan_result_update_statuses, smk_validate_edit_password_sha256_format,
+    smk_validate_version_string,
 };
 #[cfg(feature = "native-watch")]
 use scriptmetakit_ffi::{
     smk_engine_poll_watcher_scan, smk_engine_poll_watcher_scan_dirty_only,
     smk_engine_start_watching, smk_engine_start_watching_with_callback, smk_engine_stop_watching,
 };
+
+#[test]
+fn exposes_version_and_edit_password_utility_functions() {
+    let raw = "v1. 2 .3";
+    let mut has_version = 0;
+    let mut result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: input slices and out pointers are valid for the duration of this call.
+    assert_eq!(
+        unsafe { smk_normalize_version_string(utf8_slice(raw), &mut has_version, &mut result) },
+        SmkStatus::Ok
+    );
+    assert_eq!(has_version, 1);
+    assert!(!result.is_null());
+
+    let mut text = SmkUtf8Slice::default();
+    // SAFETY: `result` is live and `text` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_edit_result_text(result, &mut text) },
+        SmkStatus::Ok
+    );
+    assert_eq!(utf8(text), "1.2.3");
+    // SAFETY: `result` was returned by the FFI and has not been freed.
+    unsafe { smk_edit_result_free(result) };
+
+    let mut is_valid = 0;
+    // SAFETY: input slices and out pointers are valid for the duration of each call.
+    assert_eq!(
+        unsafe { smk_validate_version_string(utf8_slice("version x"), &mut is_valid) },
+        SmkStatus::Ok
+    );
+    assert_eq!(is_valid, 0);
+    assert_eq!(
+        unsafe { smk_validate_version_string(utf8_slice("build 12 beta"), &mut is_valid) },
+        SmkStatus::Ok
+    );
+    assert_eq!(is_valid, 1);
+
+    let mut ordering = 0;
+    // SAFETY: input slices and out pointers are valid for the duration of each call.
+    assert_eq!(
+        unsafe { smk_compare_versions(utf8_slice("1.0b"), utf8_slice("1.0A"), &mut ordering) },
+        SmkStatus::Ok
+    );
+    assert_eq!(ordering, 1);
+    assert_eq!(
+        unsafe { smk_compare_versions(utf8_slice("2.0"), utf8_slice("2.0.1"), &mut ordering) },
+        SmkStatus::Ok
+    );
+    assert_eq!(ordering, -1);
+
+    let stored = "salt:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // SAFETY: input slices and out pointers are valid for the duration of each call.
+    assert_eq!(
+        unsafe { smk_validate_edit_password_sha256_format(utf8_slice(stored), &mut is_valid) },
+        SmkStatus::Ok
+    );
+    assert_eq!(is_valid, 1);
+    assert_eq!(
+        unsafe { smk_validate_edit_password_sha256_format(utf8_slice("invalid"), &mut is_valid) },
+        SmkStatus::Ok
+    );
+    assert_eq!(is_valid, 0);
+}
 
 #[test]
 fn scans_items_through_opaque_handle_and_slice() {

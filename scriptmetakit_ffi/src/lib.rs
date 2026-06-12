@@ -27,10 +27,11 @@ use scriptmetakit::{
     ScriptMetadataEditReadResult as KitScriptMetadataEditReadResult,
     ScriptMetadataFileWriteResult as KitScriptMetadataFileWriteResult, ScriptRuntimeKind,
     UpdateCheckProgress, UpdateCheckProgressPhase, UpdateCheckResult, UpdateFailure, UpdateStatus,
-    WatchIgnoreReason, WatchPathEvent, WatchPathEventKind, WatchPolicy, WatchRenameCandidate,
-    WatchRenameConfidence, WatchRescanReason, WatchRescanTarget, can_read_directory_contents,
-    clear_scriptmeta_backups, create_scriptmeta_backup, generate_edit_password_sha256,
-    inspect_script_file, is_valid_edit_password_sha256, load_cache_payload, normalize_metadata_url,
+    VersionOrdering, WatchIgnoreReason, WatchPathEvent, WatchPathEventKind, WatchPolicy,
+    WatchRenameCandidate, WatchRenameConfidence, WatchRescanReason, WatchRescanTarget,
+    can_read_directory_contents, clear_scriptmeta_backups, compare_versions,
+    create_scriptmeta_backup, generate_edit_password_sha256, inspect_script_file,
+    is_valid_edit_password_sha256, load_cache_payload, normalize_metadata_url,
     normalize_version_string, read_script_metadata_draft_from_file,
     read_script_metadata_edit_preview_from_file, render_distribution_metadata_block,
     reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
@@ -870,6 +871,87 @@ pub unsafe extern "C" fn smk_can_read_directory_contents(
         let path = path_from_slice(path)?;
         let out_can_read = out_mut(out_can_read)?;
         *out_can_read = u8::from(can_read_directory_contents(&path));
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `value` must be a valid UTF-8 slice for the duration of the call.
+/// `out_has_version` and `out_result` must be valid, writable pointers. When
+/// `out_has_version` is set to 1, the caller owns `out_result` and must release
+/// it with `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_normalize_version_string(
+    value: SmkUtf8Slice,
+    out_has_version: *mut u8,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let value = utf8_from_raw(value.ptr, value.len)?;
+        let out_has_version = out_mut(out_has_version)?;
+        let out_result = out_mut(out_result)?;
+        *out_has_version = 0;
+        *out_result = ptr::null_mut();
+
+        if let Some(normalized) = normalize_version_string(value) {
+            *out_has_version = 1;
+            *out_result = Box::into_raw(Box::new(SmkEditResult::from_text(&normalized)));
+        }
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `value` must be a valid UTF-8 slice for the duration of the call.
+/// `out_is_valid` must be a valid, writable pointer.
+pub unsafe extern "C" fn smk_validate_version_string(
+    value: SmkUtf8Slice,
+    out_is_valid: *mut u8,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let value = utf8_from_raw(value.ptr, value.len)?;
+        let out_is_valid = out_mut(out_is_valid)?;
+        *out_is_valid = bool_byte(normalize_version_string(value).is_some());
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `lhs` and `rhs` must be valid UTF-8 slices for the duration of the call.
+/// `out_ordering` must be a valid, writable pointer. The output is -1 when
+/// lhs is less than rhs, 0 when equal, and 1 when greater.
+pub unsafe extern "C" fn smk_compare_versions(
+    lhs: SmkUtf8Slice,
+    rhs: SmkUtf8Slice,
+    out_ordering: *mut i32,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let lhs = utf8_from_raw(lhs.ptr, lhs.len)?;
+        let rhs = utf8_from_raw(rhs.ptr, rhs.len)?;
+        let out_ordering = out_mut(out_ordering)?;
+        *out_ordering = version_ordering_code(compare_versions(lhs, rhs));
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `value` must be a valid UTF-8 slice for the duration of the call.
+/// `out_is_valid` must be a valid, writable pointer.
+pub unsafe extern "C" fn smk_validate_edit_password_sha256_format(
+    value: SmkUtf8Slice,
+    out_is_valid: *mut u8,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let value = utf8_from_raw(value.ptr, value.len)?;
+        let out_is_valid = out_mut(out_is_valid)?;
+        *out_is_valid = bool_byte(is_valid_edit_password_sha256(value));
         Ok(())
     })
 }
@@ -5156,6 +5238,14 @@ fn set_engine_error(engine: *mut SmkEngine, message: &str) {
 
 fn bool_byte(value: bool) -> u8 {
     u8::from(value)
+}
+
+fn version_ordering_code(ordering: VersionOrdering) -> i32 {
+    match ordering {
+        VersionOrdering::Less => -1,
+        VersionOrdering::Equal => 0,
+        VersionOrdering::Greater => 1,
+    }
 }
 
 fn optional_u64(value: Option<u64>) -> (u8, u64) {

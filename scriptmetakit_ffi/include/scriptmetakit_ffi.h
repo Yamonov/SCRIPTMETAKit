@@ -537,6 +537,28 @@ SmkStatus smk_can_read_directory_contents(
     uint8_t *out_can_read
 );
 
+SmkStatus smk_normalize_version_string(
+    SmkUtf8Slice value,
+    uint8_t *out_has_version,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_validate_version_string(
+    SmkUtf8Slice value,
+    uint8_t *out_is_valid
+);
+
+SmkStatus smk_compare_versions(
+    SmkUtf8Slice lhs,
+    SmkUtf8Slice rhs,
+    int32_t *out_ordering
+);
+
+SmkStatus smk_validate_edit_password_sha256_format(
+    SmkUtf8Slice value,
+    uint8_t *out_is_valid
+);
+
 /*
  * The C API is synchronous. Scan, update-check, cache, watcher start/stop, and
  * engine-free calls may perform file I/O, network I/O, or wait for internal

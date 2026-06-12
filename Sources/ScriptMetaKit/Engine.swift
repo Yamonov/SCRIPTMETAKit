@@ -14,11 +14,48 @@ public nonisolated enum ScriptMetaKitError: LocalizedError {
     }
 }
 
+public nonisolated enum ScriptMetaVersionOrdering: Int32, Sendable, Codable {
+    case less = -1
+    case equal = 0
+    case greater = 1
+
+    public var comparisonResult: ComparisonResult {
+        switch self {
+        case .less:
+            .orderedAscending
+        case .equal:
+            .orderedSame
+        case .greater:
+            .orderedDescending
+        }
+    }
+}
+
 public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     private let engineBox = ScriptMetaKitFFIEngineBox()
     private static let operationPriority: TaskPriority = .utility
 
     public init() {}
+
+    public static func normalizeVersionString(_ value: String) throws -> String? {
+        try normalizeVersionStringViaFFI(value)
+    }
+
+    public static func validateVersionString(_ value: String) throws -> Bool {
+        try validateVersionStringViaFFI(value)
+    }
+
+    public static func compareVersions(_ lhs: String, _ rhs: String) throws -> ScriptMetaVersionOrdering {
+        try compareVersionsViaFFI(lhs, rhs)
+    }
+
+    public static func validateEditPasswordSHA256Format(_ value: String) throws -> Bool {
+        try validateEditPasswordSHA256FormatViaFFI(value)
+    }
+
+    public static func renderDistributionMetadata(records: [DistributionMetadataDraft]) throws -> String {
+        try ScriptMetaKitFFIEngineBox().renderDistributionMetadata(records: records)
+    }
 
     public static func validateScriptIDUniqueness(
         in items: [ScriptIdUniquenessItem]
@@ -1251,6 +1288,32 @@ private nonisolated func smk_engine_check_updates_for_items_with_progress(
     _ progressCallback: SmkUpdateProgressCallback?,
     _ progressContext: UnsafeMutableRawPointer?,
     _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
+@_silgen_name("smk_normalize_version_string")
+private nonisolated func smk_normalize_version_string(
+    _ value: SmkUtf8Slice,
+    _ outHasVersion: UnsafeMutablePointer<UInt8>,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
+@_silgen_name("smk_validate_version_string")
+private nonisolated func smk_validate_version_string(
+    _ value: SmkUtf8Slice,
+    _ outIsValid: UnsafeMutablePointer<UInt8>
+) -> Int32
+
+@_silgen_name("smk_compare_versions")
+private nonisolated func smk_compare_versions(
+    _ lhs: SmkUtf8Slice,
+    _ rhs: SmkUtf8Slice,
+    _ outOrdering: UnsafeMutablePointer<Int32>
+) -> Int32
+
+@_silgen_name("smk_validate_edit_password_sha256_format")
+private nonisolated func smk_validate_edit_password_sha256_format(
+    _ value: SmkUtf8Slice,
+    _ outIsValid: UnsafeMutablePointer<UInt8>
 ) -> Int32
 
 @_silgen_name("smk_validate_script_id_uniqueness")
@@ -3119,6 +3182,66 @@ private nonisolated func scriptMetadataDraft(from draft: SmkScriptMetadataDraft)
         releaseDate: optionalString(draft.releaseDate),
         editPasswordSHA256: optionalString(draft.editPasswordSHA256)
     )
+}
+
+private nonisolated func normalizeVersionStringViaFFI(_ value: String) throws -> String? {
+    let arena = SmkInputStringArena()
+    var hasVersion: UInt8 = 0
+    var result: OpaquePointer?
+    let status = withExtendedLifetime(arena) {
+        smk_normalize_version_string(arena.slice(value), &hasVersion, &result)
+    }
+    guard status == smkStatusOK else {
+        throw ScriptMetaKitError.operationFailed(status, "SCRIPTMETAKit version normalization failed.")
+    }
+    guard hasVersion != 0, let result else {
+        return nil
+    }
+    defer {
+        smk_edit_result_free(result)
+    }
+    var text = SmkUtf8Slice()
+    try check(smk_edit_result_text(result, &text))
+    return string(text)
+}
+
+private nonisolated func validateVersionStringViaFFI(_ value: String) throws -> Bool {
+    let arena = SmkInputStringArena()
+    var isValid: UInt8 = 0
+    let status = withExtendedLifetime(arena) {
+        smk_validate_version_string(arena.slice(value), &isValid)
+    }
+    guard status == smkStatusOK else {
+        throw ScriptMetaKitError.operationFailed(status, "SCRIPTMETAKit version validation failed.")
+    }
+    return isValid != 0
+}
+
+private nonisolated func compareVersionsViaFFI(_ lhs: String, _ rhs: String) throws -> ScriptMetaVersionOrdering {
+    let arena = SmkInputStringArena()
+    var ordering: Int32 = 0
+    let status = withExtendedLifetime(arena) {
+        smk_compare_versions(arena.slice(lhs), arena.slice(rhs), &ordering)
+    }
+    guard status == smkStatusOK else {
+        throw ScriptMetaKitError.operationFailed(status, "SCRIPTMETAKit version comparison failed.")
+    }
+    guard let result = ScriptMetaVersionOrdering(rawValue: ordering) else {
+        throw ScriptMetaKitError.operationFailed(4, "SCRIPTMETAKit version comparison returned an invalid value.")
+    }
+    return result
+}
+
+private nonisolated func validateEditPasswordSHA256FormatViaFFI(_ value: String) throws -> Bool {
+    let arena = SmkInputStringArena()
+    var isValid: UInt8 = 0
+    let status = withExtendedLifetime(arena) {
+        smk_validate_edit_password_sha256_format(arena.slice(value), &isValid)
+    }
+    guard status == smkStatusOK else {
+        throw ScriptMetaKitError.operationFailed(status, "SCRIPTMETAKit edit password SHA256 validation failed.")
+    }
+    return isValid != 0
 }
 
 private nonisolated func validateScriptIDUniquenessViaFFI(
