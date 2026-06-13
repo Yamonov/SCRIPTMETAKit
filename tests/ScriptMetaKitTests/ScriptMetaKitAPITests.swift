@@ -333,6 +333,33 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertFalse(result.fileStateFingerprint.isEmpty)
     }
 
+    func testReadCompiledScriptMetadataEditPreviewThroughSwiftAPI() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitAPITests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let script = root.appendingPathComponent("preview.scpt")
+        try compileOSA(source: "display dialog \"hello\"\n", outputURL: script)
+
+        let engine = ScriptMetaKitEngine()
+        _ = try await engine.writeScriptMetadata(
+            fileURL: script,
+            draft: ScriptMetadataDraft(
+                scriptID: "com.example.swiftapi.compiled-preview",
+                version: "1.0"
+            ),
+            mode: .insertOrReplace
+        )
+        let result = try await engine.readScriptMetadataEditPreview(fileURL: script, maxBytes: 4096)
+
+        XCTAssertTrue(result.previewText.contains("display dialog \"hello\""))
+        XCTAssertTrue(result.previewText.contains("SCRIPTMETA-BEGIN"))
+        XCTAssertGreaterThan(result.previewByteCount, 0)
+        XCTAssertFalse(result.isTruncated)
+        XCTAssertFalse(result.requiresFullRead)
+    }
+
     func testScanReportsObfuscatedEditStateThroughSwiftAPI() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitAPITests-\(UUID().uuidString)", isDirectory: true)
@@ -527,6 +554,38 @@ final class ScriptMetaKitAPITests: XCTestCase {
         """.write(to: script, atomically: true, encoding: .utf8)
 
         return root
+    }
+
+    private func compileOSA(source: String, outputURL: URL) throws {
+        let osacompileURL = URL(fileURLWithPath: "/usr/bin/osacompile")
+        guard FileManager.default.isExecutableFile(atPath: osacompileURL.path) else {
+            throw XCTSkip("osacompile is unavailable")
+        }
+
+        let process = Process()
+        process.executableURL = osacompileURL
+        process.arguments = ["-o", outputURL.path]
+
+        let input = Pipe()
+        let error = Pipe()
+        process.standardInput = input
+        process.standardError = error
+
+        try process.run()
+        input.fileHandleForWriting.write(Data(source.utf8))
+        input.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+
+        if process.terminationStatus != 0 {
+            let errorData = error.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: errorData, encoding: .utf8) ?? "osacompile failed"
+            XCTFail(message)
+            throw NSError(
+                domain: "ScriptMetaKitAPITests",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
     }
 
     private func makeWatchRoots(firstRoot: URL, secondRoot: URL) -> [ScriptMetaKitRoot] {
