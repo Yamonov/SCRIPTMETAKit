@@ -671,6 +671,7 @@ SCRIPTMETA-BEGIN
 Script-ID: com.example.compiled.applescript
 Version: v1. 2 .3
 Meta-URL: 'example.com/SCRIPTMETA.txt'
+Name: CCライブラリパネル表示・非表示
 SCRIPTMETA-END
 *)
 display dialog "hello"
@@ -698,6 +699,7 @@ display dialog "hello"
         item.meta_url.as_ref().map(url::Url::as_str),
         Some("https://example.com/SCRIPTMETA.txt")
     );
+    assert_eq!(item.name.as_deref(), Some("CCライブラリパネル表示・非表示"));
     assert_eq!(
         item.runtime_kind,
         Some(scriptmetakit::ScriptRuntimeKind::AppleScript)

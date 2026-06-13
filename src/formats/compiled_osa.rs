@@ -115,8 +115,10 @@ fn extract_metadata_snippet_from_bytes(bytes: &[u8]) -> Option<CompiledOsaMetada
 }
 
 fn metadata_text_from_bytes(bytes: &[u8]) -> Option<String> {
-    utf16_metadata_block(bytes, Utf16Endian::Little)
-        .or_else(|| utf16_metadata_block(bytes, Utf16Endian::Big))
+    // Compiled OSA sources commonly embed UTF-16BE text. A BE block also exposes
+    // a one-byte-shifted LE-looking marker, so check BE before LE.
+    utf16_metadata_block(bytes, Utf16Endian::Big)
+        .or_else(|| utf16_metadata_block(bytes, Utf16Endian::Little))
         .or_else(|| {
             let block = ascii_metadata_block(bytes)?;
             std::str::from_utf8(block).ok().map(str::to_string)
@@ -548,5 +550,22 @@ mod tests {
 
         let snippet = extract_metadata_snippet_from_bytes(&bytes).expect("snippet");
         assert!(snippet.text.contains("Name=日本語"));
+    }
+
+    #[test]
+    fn extracts_utf16be_metadata_before_shifted_little_endian_candidate() {
+        let mut bytes = b"binary ascr prefix ".to_vec();
+        for unit in
+            "SCRIPTMETA-BEGIN\nScript-ID=com.example.test\nName=CCライブラリパネル表示・非表示\nSCRIPTMETA-END"
+                .encode_utf16()
+        {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes.extend_from_slice(
+            b" SCRIPTMETA-BEGIN\nScript-ID=com.example.test\nName=????\nSCRIPTMETA-END",
+        );
+
+        let snippet = extract_metadata_snippet_from_bytes(&bytes).expect("snippet");
+        assert!(snippet.text.contains("Name=CCライブラリパネル表示・非表示"));
     }
 }
