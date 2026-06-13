@@ -871,6 +871,15 @@ fn editkit_writes_compiled_scpt_metadata() {
     let metadata = scriptmetakit::parse_script_metadata(&source).expect("metadata");
     assert_eq!(metadata.script_id, "com.example.edit.compiled");
     assert_eq!(metadata.version.as_deref(), Some("3.4.5"));
+
+    let preview = scriptmetakit::read_script_metadata_edit_preview_from_file(&script_path, 4096)
+        .expect("compiled preview");
+    assert!(preview.preview_text.contains("display dialog \"hello\""));
+    assert!(preview.preview_text.contains("SCRIPTMETA-BEGIN"));
+    assert!(preview.preview_byte_count > 0);
+    assert!(preview.comment_style.is_some());
+    assert!(!preview.is_truncated);
+    assert!(!preview.requires_full_read);
 }
 
 #[test]

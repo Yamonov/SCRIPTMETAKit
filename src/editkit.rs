@@ -476,18 +476,35 @@ pub fn read_script_metadata_edit_preview_from_file(
     let file_state_fingerprint = file_state_fingerprint(&metadata);
 
     if compiled_osa::is_compiled_osa_path(path) {
-        return Ok(ScriptMetadataEditPreviewResult {
-            file_path: path.to_path_buf(),
-            preview_text: String::new(),
-            preview_byte_count: 0,
-            file_size: Some(file_size),
-            comment_style: None,
-            line_ending: "\n".to_string(),
-            has_scriptmeta_marker_in_preview: false,
-            is_truncated: file_size > 0,
-            requires_full_read: true,
+        let source = match compiled_osa::decompile_compiled_osa_source(path, None) {
+            Ok(source) => source.source,
+            Err(error) if compiled_osa_error_allows_text_fallback(error.kind) => {
+                let bytes = read_script_bytes_file(path)?;
+                decode_script_text_with_encoding(&bytes)
+                    .ok_or_else(|| ScriptMetaKitError::Io {
+                        path: path.to_path_buf(),
+                        message: "script text encoding is not supported".to_string(),
+                    })?
+                    .text
+            }
+            Err(error) => {
+                return Err(ScriptMetaKitError::Io {
+                    path: path.to_path_buf(),
+                    message: error.message,
+                });
+            }
+        };
+        let preview_text = utf8_prefix_at_most(&source, max_bytes).to_string();
+        let preview_byte_count = preview_text.len();
+        let is_truncated = source.len() > preview_byte_count;
+        return Ok(script_metadata_edit_preview_result(
+            path,
+            preview_text,
+            preview_byte_count,
+            file_size,
             file_state_fingerprint,
-        });
+            is_truncated,
+        ));
     }
 
     let file = File::open(path).map_err(|error| ScriptMetaKitError::Io {
@@ -504,14 +521,32 @@ pub fn read_script_metadata_edit_preview_from_file(
         })?;
 
     let preview_text = decode_script_text(&bytes);
-    let comment_style = ScriptMetaCommentStyle::for_path_and_source(path, &preview_text)
-        .or_else(|| ScriptMetaCommentStyle::for_path(path));
     let preview_byte_count = bytes.len();
     let is_truncated = file_size > u64::try_from(preview_byte_count).unwrap_or(u64::MAX);
+    Ok(script_metadata_edit_preview_result(
+        path,
+        preview_text,
+        preview_byte_count,
+        file_size,
+        file_state_fingerprint,
+        is_truncated,
+    ))
+}
+
+fn script_metadata_edit_preview_result(
+    path: &Path,
+    preview_text: String,
+    preview_byte_count: usize,
+    file_size: u64,
+    file_state_fingerprint: String,
+    is_truncated: bool,
+) -> ScriptMetadataEditPreviewResult {
+    let comment_style = ScriptMetaCommentStyle::for_path_and_source(path, &preview_text)
+        .or_else(|| ScriptMetaCommentStyle::for_path(path));
     let has_scriptmeta_marker_in_preview =
         preview_text.contains(SCRIPT_BEGIN) || preview_text.contains(SCRIPT_END);
     let line_ending = detected_line_ending(&preview_text).to_string();
-    Ok(ScriptMetadataEditPreviewResult {
+    ScriptMetadataEditPreviewResult {
         file_path: path.to_path_buf(),
         preview_text,
         preview_byte_count,
@@ -522,7 +557,19 @@ pub fn read_script_metadata_edit_preview_from_file(
         is_truncated,
         requires_full_read: is_truncated,
         file_state_fingerprint,
-    })
+    }
+}
+
+fn utf8_prefix_at_most(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 pub fn read_script_metadata_draft_from_file(
