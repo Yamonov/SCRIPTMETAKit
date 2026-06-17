@@ -103,7 +103,7 @@ pub(crate) fn select_distribution_metadata_for_script(
     }
 
     Ok(DistributionMetadata {
-        script_id: entries.first().and_then(|entry| entry.script_id.clone()),
+        script_id: None,
         latest_version: None,
         latest_url: None,
         latest_page_url: entries

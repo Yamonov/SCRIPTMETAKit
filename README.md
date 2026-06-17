@@ -6,9 +6,14 @@ The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.0.4`
-- Rust FFI crate: `scriptmetakit_ffi` `1.0.4`
+- Rust crate: `scriptmetakit` `1.0.5`
+- Rust FFI crate: `scriptmetakit_ffi` `1.0.5`
 - Swift package product: `ScriptMetaKit`
+
+## 1.0.5
+
+- Fixes update diagnostics for multi-script `SCRIPTMETA-DIST` blocks when the requested `Script-ID` is missing.
+- The resolver now reports the requested missing `Script-ID` instead of reusing another entry's `Script-ID`.
 
 ## License
 

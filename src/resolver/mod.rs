@@ -188,7 +188,9 @@ impl DistributionResolver {
             let latest_page_url = metadata.latest_page_url.clone().or(last_redirect_url);
             let is_unresolved = metadata.latest_version.is_none();
             let note = if is_unresolved {
-                Some("Latest-Version was not found".to_string())
+                metadata
+                    .note
+                    .or_else(|| Some("Latest-Version was not found".to_string()))
             } else {
                 metadata.note
             };

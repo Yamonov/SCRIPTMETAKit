@@ -1,5 +1,5 @@
 public enum ScriptMetaKitRuntime {
     public static let apiVersion = 1
-    public static let packageVersion = "1.0.4"
+    public static let packageVersion = "1.0.5"
     public static let usesLocalBinaryArtifact = true
 }

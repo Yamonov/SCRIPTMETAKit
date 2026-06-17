@@ -103,6 +103,29 @@ SCRIPTMETA-DIST-END
 }
 
 #[test]
+fn missing_multi_script_distribution_entry_does_not_reuse_other_script_id() {
+    let metadata = scriptmetakit::parse_distribution_metadata_for_script(
+        r#"
+SCRIPTMETA-DIST-BEGIN
+Script-ID=org.example.first
+Version=1.0.0
+Script-ID=org.example.second
+Version=2.5.0
+SCRIPTMETA-DIST-END
+"#,
+        "org.example.third",
+    )
+    .expect("missing distribution metadata should return unresolved metadata");
+
+    assert_eq!(metadata.script_id.as_deref(), None);
+    assert_eq!(metadata.latest_version.as_deref(), None);
+    assert_eq!(
+        metadata.note.as_deref(),
+        Some("distribution metadata for script id `org.example.third` was not found")
+    );
+}
+
+#[test]
 fn parses_inline_distribution_metadata_from_note_description() {
     let metadata = scriptmetakit::parse_distribution_metadata_for_script(
         r#"
@@ -3083,6 +3106,85 @@ SCRIPTMETA-DIST-END
         result.statuses_by_item_id.values().next().copied(),
         Some(scriptmetakit::UpdateStatus::UpdateAvailable)
     );
+}
+
+#[test]
+fn reports_missing_entry_in_multi_script_distribution_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dist_path = temp.path().join("SCRIPTMETA.txt");
+    let dist_url = url::Url::from_file_path(&dist_path).expect("file url");
+    std::fs::write(
+        &dist_path,
+        r#"
+SCRIPTMETA-DIST-BEGIN
+Script-ID=org.example.first
+Version=1.0.0
+Script-ID=org.example.second
+Version=2.5.0
+SCRIPTMETA-DIST-END
+"#,
+    )
+    .expect("dist");
+
+    let script_path = temp.path().join("Missing.jsx");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "Test"),
+    )
+    .expect("engine");
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![scriptmetakit::ScriptMetaItem {
+            root_id: "scripts".into(),
+            file_path: script_path.clone(),
+            identity_path: script_path.clone(),
+            runtime_kind: None,
+            shebang: None,
+            script_id: "org.example.missing".to_string(),
+            version: Some("2.0.0".into()),
+            description: None,
+            target_app: None,
+            min_target_version: None,
+            meta_url: Some(dist_url.clone()),
+            name: Some("Missing".into()),
+            author: None,
+            release_date: None,
+            edit_password_sha256: None,
+            has_scriptmeta: true,
+            has_scriptmeta_edit_password: false,
+            is_file_locked: false,
+            is_read_only: false,
+            can_edit_scriptmeta: false,
+            can_append_scriptmeta: false,
+            scriptmeta_edit_state: scriptmetakit::ScriptMetaEditState::Unknown,
+        }
+        .into()],
+    }))
+    .expect("update check");
+
+    let item_id = script_path.to_string_lossy().into_owned();
+    let expected_message =
+        "distribution metadata for script id `org.example.missing` was not found";
+    let failure = result
+        .failures_by_item_id
+        .get(&item_id)
+        .expect("failure data");
+    assert_eq!(failure.code, "unresolved_distribution");
+    assert_eq!(failure.message, expected_message);
+    assert_eq!(failure.script_id, "org.example.missing");
+    assert_eq!(
+        result.statuses_by_item_id.get(&item_id).copied(),
+        Some(scriptmetakit::UpdateStatus::Failed)
+    );
+    assert_eq!(
+        result.errors_by_item_id.get(&item_id).map(String::as_str),
+        Some(expected_message)
+    );
+    let resolution = result
+        .resolutions_by_item_id
+        .get(&item_id)
+        .expect("resolution");
+    assert_eq!(resolution.latest_version.as_deref(), None);
+    assert_eq!(resolution.note.as_deref(), Some(expected_message));
+    assert_eq!(resolution.final_page_url, dist_url);
 }
 
 #[test]
