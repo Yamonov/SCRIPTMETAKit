@@ -385,7 +385,7 @@ mod platform {
     pub struct PlatformWatcher {
         paths: cf::CFMutableArrayRef,
         run_loop: Arc<Mutex<Option<CFSendWrapper>>>,
-        stop_sender: Option<mpsc::Sender<()>>,
+        stop_source: Arc<Mutex<Option<CFSendWrapper>>>,
         worker: Option<JoinHandle<()>>,
     }
 
@@ -397,14 +397,48 @@ mod platform {
 
     unsafe impl Send for CFSendWrapper {}
 
-    const RUN_LOOP_TICK_SECONDS: cf::CFTimeInterval = 0.25;
+    type CFRunLoopSourceRef = cf::CFRef;
+    type CFHashCode = std::os::raw::c_ulong;
+
+    #[repr(C)]
+    struct CFRunLoopSourceContext {
+        version: cf::CFIndex,
+        info: *mut c_void,
+        retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+        release: Option<extern "C" fn(*const c_void)>,
+        copy_description: Option<extern "C" fn(*const c_void) -> cf::CFStringRef>,
+        equal: Option<extern "C" fn(*const c_void, *const c_void) -> cf::Boolean>,
+        hash: Option<extern "C" fn(*const c_void) -> CFHashCode>,
+        schedule: Option<extern "C" fn(*mut c_void, cf::CFRunLoopRef, cf::CFStringRef)>,
+        cancel: Option<extern "C" fn(*mut c_void, cf::CFRunLoopRef, cf::CFStringRef)>,
+        perform: Option<extern "C" fn(*mut c_void)>,
+    }
 
     unsafe extern "C" {
-        fn CFRunLoopRunInMode(
+        fn CFRunLoopRun();
+        fn CFRunLoopAddSource(
+            run_loop: cf::CFRunLoopRef,
+            source: CFRunLoopSourceRef,
             mode: cf::CFStringRef,
-            seconds: cf::CFTimeInterval,
-            return_after_source_handled: cf::Boolean,
-        ) -> i32;
+        );
+        fn CFRunLoopRemoveSource(
+            run_loop: cf::CFRunLoopRef,
+            source: CFRunLoopSourceRef,
+            mode: cf::CFStringRef,
+        );
+        fn CFRunLoopSourceCreate(
+            allocator: cf::CFAllocatorRef,
+            order: cf::CFIndex,
+            context: *mut CFRunLoopSourceContext,
+        ) -> CFRunLoopSourceRef;
+        fn CFRunLoopSourceSignal(source: CFRunLoopSourceRef);
+        fn CFRunLoopWakeUp(run_loop: cf::CFRunLoopRef);
+    }
+
+    extern "C" fn stop_current_run_loop(_info: *mut c_void) {
+        unsafe {
+            cf::CFRunLoopStop(cf::CFRunLoopGetCurrent());
+        }
     }
 
     impl PlatformWatcher {
@@ -425,7 +459,7 @@ mod platform {
                 return Ok(Self {
                     paths,
                     run_loop: Arc::new(Mutex::new(None)),
-                    stop_sender: None,
+                    stop_source: Arc::new(Mutex::new(None)),
                     worker: None,
                 });
             }
@@ -478,7 +512,8 @@ mod platform {
             let stream = CFSendWrapper(raw_stream as usize);
             let run_loop = Arc::new(Mutex::new(None));
             let worker_run_loop = Arc::clone(&run_loop);
-            let (stop_sender, stop_receiver) = mpsc::channel();
+            let stop_source = Arc::new(Mutex::new(None));
+            let worker_stop_source = Arc::clone(&stop_source);
             let (start_sender, start_receiver) = mpsc::sync_channel(1);
             let worker = match thread::Builder::new()
                 .name("scriptmetakit-fsevents".to_string())
@@ -486,8 +521,32 @@ mod platform {
                     let stream = stream.0 as fs::FSEventStreamRef;
                     unsafe {
                         let run_loop = cf::CFRunLoopGetCurrent();
+                        let mut stop_context = CFRunLoopSourceContext {
+                            version: 0,
+                            info: ptr::null_mut(),
+                            retain: None,
+                            release: None,
+                            copy_description: None,
+                            equal: None,
+                            hash: None,
+                            schedule: None,
+                            cancel: None,
+                            perform: Some(stop_current_run_loop),
+                        };
+                        let stop_source =
+                            CFRunLoopSourceCreate(cf::kCFAllocatorDefault, 0, &mut stop_context);
+                        if stop_source.is_null() {
+                            let _ = start_sender
+                                .send(Err("failed to create FSEvents stop source".to_string()));
+                            fs::FSEventStreamRelease(stream);
+                            return;
+                        }
+                        CFRunLoopAddSource(run_loop, stop_source, cf::kCFRunLoopDefaultMode);
                         if let Ok(mut stored_run_loop) = worker_run_loop.lock() {
                             *stored_run_loop = Some(CFSendWrapper(run_loop as usize));
+                        }
+                        if let Ok(mut stored_stop_source) = worker_stop_source.lock() {
+                            *stored_stop_source = Some(CFSendWrapper(stop_source as usize));
                         }
                         fs::FSEventStreamScheduleWithRunLoop(
                             stream,
@@ -497,17 +556,7 @@ mod platform {
                         let started = fs::FSEventStreamStart(stream) != 0;
                         if started {
                             let _ = start_sender.send(Ok(()));
-                            loop {
-                                match stop_receiver.try_recv() {
-                                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
-                                    Err(mpsc::TryRecvError::Empty) => {}
-                                }
-                                CFRunLoopRunInMode(
-                                    cf::kCFRunLoopDefaultMode,
-                                    RUN_LOOP_TICK_SECONDS,
-                                    1,
-                                );
-                            }
+                            CFRunLoopRun();
                         } else {
                             let _ = start_sender
                                 .send(Err("failed to start FSEvents stream".to_string()));
@@ -517,8 +566,13 @@ mod platform {
                         }
                         fs::FSEventStreamInvalidate(stream);
                         fs::FSEventStreamRelease(stream);
+                        CFRunLoopRemoveSource(run_loop, stop_source, cf::kCFRunLoopDefaultMode);
+                        cf::CFRelease(stop_source);
                         if let Ok(mut stored_run_loop) = worker_run_loop.lock() {
                             *stored_run_loop = None;
+                        }
+                        if let Ok(mut stored_stop_source) = worker_stop_source.lock() {
+                            *stored_stop_source = None;
                         }
                     }
                 }) {
@@ -553,7 +607,7 @@ mod platform {
             Ok(Self {
                 paths,
                 run_loop,
-                stop_sender: Some(stop_sender),
+                stop_source,
                 worker: Some(worker),
             })
         }
@@ -561,14 +615,21 @@ mod platform {
 
     impl Drop for PlatformWatcher {
         fn drop(&mut self) {
-            if let Some(stop_sender) = self.stop_sender.take() {
-                let _ = stop_sender.send(());
-            }
+            let stop_source = self
+                .stop_source
+                .lock()
+                .ok()
+                .and_then(|mut stored_stop_source| stored_stop_source.take());
             if let Ok(mut stored_run_loop) = self.run_loop.lock()
                 && let Some(run_loop) = stored_run_loop.take()
             {
                 unsafe {
-                    cf::CFRunLoopStop(run_loop.0 as cf::CFRunLoopRef);
+                    if let Some(stop_source) = stop_source {
+                        CFRunLoopSourceSignal(stop_source.0 as CFRunLoopSourceRef);
+                    } else {
+                        cf::CFRunLoopStop(run_loop.0 as cf::CFRunLoopRef);
+                    }
+                    CFRunLoopWakeUp(run_loop.0 as cf::CFRunLoopRef);
                 }
             }
             if let Some(worker) = self.worker.take() {

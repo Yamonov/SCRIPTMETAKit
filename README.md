@@ -6,9 +6,14 @@ The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.0.5`
-- Rust FFI crate: `scriptmetakit_ffi` `1.0.5`
+- Rust crate: `scriptmetakit` `1.0.6`
+- Rust FFI crate: `scriptmetakit_ffi` `1.0.6`
 - Swift package product: `ScriptMetaKit`
+
+## 1.0.6
+
+- Removes the periodic 0.25 second wake from the macOS FSEvents watcher while idle.
+- The watcher now blocks on the Core Foundation run loop and wakes only for file events or shutdown.
 
 ## 1.0.5
 
