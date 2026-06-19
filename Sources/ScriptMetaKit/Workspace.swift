@@ -336,6 +336,13 @@ public actor ScriptMetaKitWorkspace {
         await engine.shutdown()
     }
 
+    /// Clears roots, watchers, and in-memory scan/cache state while preserving persistent cache files.
+    public func clearVolatileState() async {
+        await engine.shutdown()
+        didConfigureEngine = false
+        loadedCacheRootIDsByScope.removeAll(keepingCapacity: false)
+    }
+
     public func checkUpdate(
         item: ScriptMetaItem,
         cacheScope: ScriptMetaCacheScope? = nil,

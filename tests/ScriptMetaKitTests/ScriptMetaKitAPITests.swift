@@ -4,7 +4,7 @@ import ScriptMetaKit
 final class ScriptMetaKitAPITests: XCTestCase {
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.5")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.7")
     }
 
     func testVersionAndEditPasswordUtilityAPIsArePublic() throws {
@@ -377,6 +377,52 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(entry.scriptMetaEditState, "obfuscated")
         XCTAssertFalse(entry.canEditScriptMeta)
         XCTAssertFalse(entry.canAppendScriptMeta)
+    }
+
+    func testWorkspaceClearVolatileStatePreservesPersistentCache() async throws {
+        let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.clearvolatile")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitAPITests-Cache-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+
+        let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let workspace = ScriptMetaKitWorkspace(configuration: ScriptMetaKitWorkspaceConfiguration(
+            cacheStore: cacheStore
+        ))
+        let roots = [
+            ScriptMetaKitRoot(
+                rootID: "clear-volatile",
+                url: root,
+                purpose: .updateCheck,
+                watchPolicy: .disabled,
+                cachePolicy: .memoryAndPersistent,
+                refreshPolicy: .scheduled,
+                priority: .userInitiated
+            )
+        ]
+
+        let scanned = try await workspace.scanCatalog(
+            roots: roots,
+            replacingGroup: "test.clearvolatile",
+            rootIDs: roots.map(\.rootID),
+            cacheScope: .catalog
+        )
+        XCTAssertEqual(scanned.allItems.map(\.scriptID), ["com.example.swiftapi.clearvolatile"])
+        XCTAssertNotNil(cacheStore.readableCacheFileURL(scope: .catalog))
+
+        await workspace.clearVolatileState()
+
+        XCTAssertNotNil(cacheStore.readableCacheFileURL(scope: .catalog))
+        let cached = try await workspace.cachedCatalogSnapshot(
+            roots: roots,
+            replacingGroup: "test.clearvolatile",
+            rootIDs: roots.map(\.rootID),
+            cacheScope: .catalog
+        )
+        XCTAssertEqual(cached?.allItems.map(\.scriptID), ["com.example.swiftapi.clearvolatile"])
     }
 
     func testDirtyOnlyWatchPollReturnsAffectedRootSnapshot() async throws {
