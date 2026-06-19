@@ -190,10 +190,7 @@ fn append_event_to_pending(
                 may_change_directory_tree,
                 identifies_folder,
                 removes_path,
-                filter.watch_roots,
-                filter.supported_extensions,
-                filter.skip_hidden_paths,
-                filter.skip_package_paths,
+                &filter,
             ) {
                 return (false, false);
             }
@@ -230,20 +227,17 @@ fn should_keep_event_path(
     may_change_directory_tree: bool,
     identifies_folder: bool,
     removes_path: bool,
-    watch_roots: &[PathBuf],
-    supported_extensions: &ExtensionPolicy,
-    skip_hidden_paths: bool,
-    skip_package_paths: bool,
+    filter: &NativeEventFilter<'_>,
 ) -> bool {
-    if skip_hidden_paths && path_has_hidden_component(path, watch_roots) {
+    if filter.skip_hidden_paths && path_has_hidden_component(path, filter.watch_roots) {
         return false;
     }
 
-    if skip_package_paths && path_has_package_component(path, watch_roots) {
+    if filter.skip_package_paths && path_has_package_component(path, filter.watch_roots) {
         return false;
     }
 
-    if supported_extensions.contains_path(path) {
+    if filter.supported_extensions.contains_path(path) {
         return true;
     }
 

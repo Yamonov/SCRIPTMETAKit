@@ -1,6 +1,6 @@
 [package]
 name = "scriptmetakit_ffi"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2024"
 rust-version = "1.94"
 description = "C ABI bridge for SCRIPTMETAKit."

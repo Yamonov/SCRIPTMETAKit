@@ -6,9 +6,13 @@ The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.0.7`
-- Rust FFI crate: `scriptmetakit_ffi` `1.0.7`
+- Rust crate: `scriptmetakit` `1.0.8`
+- Rust FFI crate: `scriptmetakit_ffi` `1.0.8`
 - Swift package product: `ScriptMetaKit`
+
+## 1.0.8
+
+- Cleans up native watcher event filtering so the Rust workspace passes strict Clippy checks with warnings denied.
 
 ## 1.0.7
 
