@@ -6,9 +6,14 @@ The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.0.6`
-- Rust FFI crate: `scriptmetakit_ffi` `1.0.6`
+- Rust crate: `scriptmetakit` `1.0.7`
+- Rust FFI crate: `scriptmetakit_ffi` `1.0.7`
 - Swift package product: `ScriptMetaKit`
+
+## 1.0.7
+
+- Adds `ScriptMetaKitWorkspace.clearVolatileState()` for ending a consumer UI session while preserving persistent cache files.
+- The new API clears in-memory workspace state and resets the engine configuration so the next operation starts from the persistent cache path normally.
 
 ## 1.0.6
 
