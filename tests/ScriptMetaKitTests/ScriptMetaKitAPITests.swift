@@ -4,7 +4,7 @@ import ScriptMetaKit
 final class ScriptMetaKitAPITests: XCTestCase {
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.7")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.8")
     }
 
     func testVersionAndEditPasswordUtilityAPIsArePublic() throws {
