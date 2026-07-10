@@ -22,5 +22,7 @@ pub(crate) use metadata_scan::{
     scan_metadata_roots_scoped_controlled,
 };
 pub use options::{ExtensionPolicy, RootPreflightOptions, ScannerOptions};
-pub use path_resolution::{PathKind, PathResolutionStatus};
+pub use path_resolution::{
+    PathKind, PathResolutionStatus, ScannablePathResolution, resolve_registered_path,
+};
 pub use root_preflight::can_read_directory_contents;

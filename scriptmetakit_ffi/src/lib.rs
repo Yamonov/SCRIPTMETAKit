@@ -7,7 +7,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     ptr, slice, str,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use scriptmetakit::scanner::CandidateRecord;
@@ -15,9 +15,10 @@ use scriptmetakit::{
     CachePolicy, CacheScope, CommentSyntax,
     DistributionMetadataDraft as KitDistributionMetadataDraft, DistributionResolution,
     FileEntryChange, FileEntryChangeKind, FileIdentity, FileIssue, FileListSnapshot,
-    FileSystemEntry, IgnoredWatchPath, OperationSummary, RefreshPolicy, RootChangeBatch, RootId,
-    RootPriority, RootPurpose, RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary,
-    ScanMode, ScanRequest, ScanResult, ScriptFileInspection, ScriptIdUniquenessItem,
+    FileSystemEntry, IgnoredWatchPath, MAX_SCRIPT_METADATA_PREVIEW_BYTES, OperationSummary,
+    RefreshPolicy, RootChangeBatch, RootId, RootPriority, RootPurpose, RootRegistration,
+    RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest, ScanResult,
+    ScannablePathResolution, ScannerOptions, ScriptFileInspection, ScriptIdUniquenessItem,
     ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration, ScriptMetaBackupOptions,
     ScriptMetaBackupReason, ScriptMetaBackupRecord as KitScriptMetaBackupRecord,
     ScriptMetaCatalogSnapshot, ScriptMetaEditState, ScriptMetaItem, ScriptMetaKitConfig,
@@ -34,10 +35,10 @@ use scriptmetakit::{
     is_valid_edit_password_sha256, load_cache_payload, normalize_metadata_url,
     normalize_version_string, read_script_metadata_draft_from_file,
     read_script_metadata_edit_preview_from_file, render_distribution_metadata_block,
-    reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
-    save_cache_payload, script_path_may_affect_metadata, scriptmeta_backup_generations,
-    supported_script_extensions_text, validate_script_id_uniqueness, verify_edit_password_sha256,
-    write_script_metadata_to_file,
+    reset_scriptmeta_backups_with_current_as_initial, resolve_registered_path,
+    restore_scriptmeta_backup, save_cache_payload, script_path_may_affect_metadata,
+    scriptmeta_backup_generations, supported_script_extensions_text, validate_script_id_uniqueness,
+    verify_edit_password_sha256, write_script_metadata_to_file,
 };
 use url::Url;
 
@@ -147,6 +148,17 @@ pub struct SmkScriptFileInspection {
     pub can_edit_scriptmeta: u8,
     pub can_append_scriptmeta: u8,
     pub scriptmeta_edit_state: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkPathResolution {
+    pub display_path: SmkUtf8Slice,
+    pub source_path: SmkUtf8Slice,
+    pub resolved_path: SmkUtf8Slice,
+    pub path_kind: SmkUtf8Slice,
+    pub resolution_status: SmkUtf8Slice,
+    pub resolution_message: SmkUtf8Slice,
 }
 
 #[repr(C)]
@@ -674,8 +686,12 @@ pub struct SmkScriptMetaBackupGenerationSlice {
 }
 
 pub struct SmkEngine {
-    engine: ScriptMetaKitEngine,
+    state: Mutex<SmkEngineState>,
     cancellation: scriptmetakit::OperationCancellation,
+}
+
+struct SmkEngineState {
+    engine: ScriptMetaKitEngine,
     last_error: Vec<u8>,
     #[cfg(feature = "native-watch")]
     watcher: Option<NativeWatcher>,
@@ -739,8 +755,19 @@ pub struct SmkScriptFileInspectionResult {
     inspection: SmkScriptFileInspection,
 }
 
+pub struct SmkPathResolutionResult {
+    string_storage: Vec<u8>,
+    string_overflow: Vec<Box<[u8]>>,
+    resolution: SmkPathResolution,
+}
+
 thread_local! {
     static SCRIPT_FILE_INSPECTION_STORAGE: RefCell<Option<SmkScriptFileInspectionResult>> =
+        const { RefCell::new(None) };
+}
+
+thread_local! {
+    static PATH_RESOLUTION_STORAGE: RefCell<Option<SmkPathResolutionResult>> =
         const { RefCell::new(None) };
 }
 
@@ -752,6 +779,26 @@ impl SmkScriptFileInspectionResult {
             inspection: SmkScriptFileInspection::default(),
         };
         result.inspection = smk_script_file_inspection(
+            value,
+            &mut result.string_storage,
+            &mut result.string_overflow,
+        );
+        result
+    }
+}
+
+impl SmkPathResolutionResult {
+    fn new(value: ScannablePathResolution) -> Self {
+        let capacity = value.display_path.as_os_str().len()
+            + value.source_path.as_os_str().len()
+            + value.resolved_path.as_os_str().len()
+            + value.resolution_message.as_ref().map_or(0, String::len);
+        let mut result = Self {
+            string_storage: Vec::with_capacity(capacity),
+            string_overflow: Vec::new(),
+            resolution: SmkPathResolution::default(),
+        };
+        result.resolution = smk_path_resolution(
             value,
             &mut result.string_storage,
             &mut result.string_overflow,
@@ -775,11 +822,13 @@ pub unsafe extern "C" fn smk_engine_create_default(out_engine: *mut *mut SmkEngi
             .map_err(|error| (SmkStatus::EngineError, error.to_string()))?;
         let cancellation = engine.cancellation_token();
         let handle = Box::new(SmkEngine {
-            engine,
+            state: Mutex::new(SmkEngineState {
+                engine,
+                last_error: Vec::new(),
+                #[cfg(feature = "native-watch")]
+                watcher: None,
+            }),
             cancellation,
-            last_error: Vec::new(),
-            #[cfg(feature = "native-watch")]
-            watcher: None,
         });
         *out_engine = Box::into_raw(handle);
         Ok(())
@@ -835,6 +884,39 @@ pub unsafe extern "C" fn smk_inspect_script_file_path(
             *out_inspection = storage
                 .as_ref()
                 .map(|result| result.inspection)
+                .unwrap_or_default();
+            Ok(())
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `path` must be a valid UTF-8 path slice for the duration of the call.
+/// `out_resolution` must be a valid, writable pointer.
+pub unsafe extern "C" fn smk_resolve_registered_path(
+    path: SmkUtf8Slice,
+    follow_symlinks: u8,
+    resolve_macos_alias: u8,
+    out_resolution: *mut SmkPathResolution,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let path = path_from_slice(path)?;
+        let out_resolution = out_mut(out_resolution)?;
+        let options = ScannerOptions {
+            follow_symlinks: follow_symlinks != 0,
+            resolve_macos_alias: resolve_macos_alias != 0,
+            ..ScannerOptions::default()
+        };
+        PATH_RESOLUTION_STORAGE.with(|storage| {
+            let mut storage = storage.borrow_mut();
+            *storage = Some(SmkPathResolutionResult::new(resolve_registered_path(
+                &path, &options, None,
+            )));
+            *out_resolution = storage
+                .as_ref()
+                .map(|result| result.resolution)
                 .unwrap_or_default();
             Ok(())
         })
@@ -985,7 +1067,7 @@ pub unsafe extern "C" fn smk_engine_set_resolve_macos_alias(
     enabled: u8,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         engine.engine.config_mut().scanner.resolve_macos_alias = enabled != 0;
         Ok(())
@@ -1007,7 +1089,7 @@ pub unsafe extern "C" fn smk_engine_set_decompile_compiled_osa_during_scan(
     enabled: u8,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         engine
             .engine
@@ -1033,7 +1115,7 @@ pub unsafe extern "C" fn smk_engine_set_native_event_latency_millis(
     latency_millis: u64,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         engine
             .engine
@@ -1066,7 +1148,7 @@ pub unsafe extern "C" fn smk_engine_set_root_preflight_options(
     min_scanned_items_for_time_limit: usize,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let preflight = &mut engine.engine.config_mut().scanner.root_preflight;
         preflight.reject_trash_roots = reject_trash_roots != 0;
@@ -1154,7 +1236,7 @@ pub unsafe extern "C" fn smk_engine_scan_folders(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1211,7 +1293,7 @@ pub unsafe extern "C" fn smk_engine_scan_folders_with_progress(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1261,7 +1343,7 @@ pub unsafe extern "C" fn smk_engine_set_roots(
     root_count: usize,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
 
@@ -1296,7 +1378,7 @@ pub unsafe extern "C" fn smk_engine_replace_root_group(
     root_count: usize,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
@@ -1332,7 +1414,7 @@ pub unsafe extern "C" fn smk_engine_insert_roots_into_group(
     root_count: usize,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
@@ -1365,7 +1447,7 @@ pub unsafe extern "C" fn smk_engine_set_visible_root(
     has_root_id: u8,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let root_id = if has_root_id == 0 {
             None
@@ -1396,7 +1478,7 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1445,7 +1527,7 @@ pub unsafe extern "C" fn smk_engine_scan_roots(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1496,7 +1578,7 @@ pub unsafe extern "C" fn smk_engine_cached_roots(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1530,7 +1612,7 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots_with_progress(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1577,7 +1659,7 @@ pub unsafe extern "C" fn smk_engine_scan_roots_with_progress(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1623,7 +1705,7 @@ pub unsafe extern "C" fn smk_engine_check_update_item(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1663,7 +1745,7 @@ pub unsafe extern "C" fn smk_engine_check_update_item_with_progress(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1710,7 +1792,7 @@ pub unsafe extern "C" fn smk_engine_check_updates_for_items(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1751,7 +1833,7 @@ pub unsafe extern "C" fn smk_engine_check_updates_for_items_with_progress(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -1913,7 +1995,7 @@ pub unsafe extern "C" fn smk_engine_load_cache_file(
     cache_path: SmkUtf8Slice,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let cache_path = path_from_slice(cache_path)?;
         let payload = load_cache_payload(&cache_path).map_err(|error| {
@@ -1946,7 +2028,7 @@ pub unsafe extern "C" fn smk_engine_save_cache_file(
     cache_path: SmkUtf8Slice,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
 
         let scope = cache_scope_from_u32(scope)?;
@@ -1977,9 +2059,9 @@ pub unsafe extern "C" fn smk_engine_save_cache_file(
 /// normally by calling one of the scan functions first.
 pub unsafe extern "C" fn smk_engine_start_watching(engine: *mut SmkEngine) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        start_watching_engine(engine, None, ptr::null_mut()).map_err(|message| {
+        start_watching_engine(&mut engine, None, ptr::null_mut()).map_err(|message| {
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })
@@ -2005,9 +2087,9 @@ pub unsafe extern "C" fn smk_engine_start_watching_with_callback(
     context: *mut c_void,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        start_watching_engine(engine, callback, context).map_err(|message| {
+        start_watching_engine(&mut engine, callback, context).map_err(|message| {
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })
@@ -2025,9 +2107,9 @@ pub unsafe extern "C" fn smk_engine_start_watching_with_callback(
 /// `engine` must be null or a live engine handle.
 pub unsafe extern "C" fn smk_engine_stop_watching(engine: *mut SmkEngine) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        stop_watching_engine(engine);
+        stop_watching_engine(&mut engine);
         Ok(())
     });
 
@@ -2049,14 +2131,14 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_changed = out_mut(out_changed)?;
         let out_result = out_mut(out_result)?;
         *out_changed = 0;
         *out_result = ptr::null_mut();
         engine.clear_error();
 
-        match poll_watcher_scan(engine, false) {
+        match poll_watcher_scan(&mut engine, false) {
             Ok(Some(result)) => {
                 *out_changed = 1;
                 *out_result = Box::into_raw(Box::new(result));
@@ -2089,14 +2171,14 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan_dirty_only(
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_changed = out_mut(out_changed)?;
         let out_result = out_mut(out_result)?;
         *out_changed = 0;
         *out_result = ptr::null_mut();
         engine.clear_error();
 
-        match poll_watcher_scan(engine, true) {
+        match poll_watcher_scan(&mut engine, true) {
             Ok(Some(result)) => {
                 *out_changed = 1;
                 *out_result = Box::into_raw(Box::new(result));
@@ -2591,7 +2673,7 @@ pub unsafe extern "C" fn smk_engine_write_script_metadata_file(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -2636,7 +2718,7 @@ pub unsafe extern "C" fn smk_engine_read_script_metadata_draft_file(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -2675,10 +2757,18 @@ pub unsafe extern "C" fn smk_engine_read_script_metadata_edit_preview_file(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
+
+        if max_bytes > MAX_SCRIPT_METADATA_PREVIEW_BYTES {
+            let message = format!(
+                "metadata preview byte limit must not exceed {MAX_SCRIPT_METADATA_PREVIEW_BYTES}"
+            );
+            engine.set_error(&message);
+            return Err((SmkStatus::InvalidArgument, message));
+        }
 
         let file_path = path_from_slice(file_path)?;
         match read_script_metadata_edit_preview_from_file(&file_path, max_bytes) {
@@ -2716,7 +2806,7 @@ pub unsafe extern "C" fn smk_engine_render_distribution_metadata(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -2753,7 +2843,7 @@ pub unsafe extern "C" fn smk_engine_generate_edit_password_sha256(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -2790,7 +2880,7 @@ pub unsafe extern "C" fn smk_engine_verify_edit_password_sha256(
     out_is_match: *mut u8,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_is_match = out_mut(out_is_match)?;
         engine.clear_error();
 
@@ -2825,7 +2915,7 @@ pub unsafe extern "C" fn smk_engine_scriptmeta_backup_generations(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -2868,7 +2958,7 @@ pub unsafe extern "C" fn smk_engine_create_scriptmeta_backup(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -2910,7 +3000,7 @@ pub unsafe extern "C" fn smk_engine_restore_scriptmeta_backup(
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -2948,7 +3038,7 @@ pub unsafe extern "C" fn smk_engine_clear_scriptmeta_backups(
     backup_root_path: SmkUtf8Slice,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         engine.clear_error();
 
         let file_path = path_from_slice(file_path)?;
@@ -2983,7 +3073,7 @@ pub unsafe extern "C" fn smk_engine_reset_scriptmeta_backups_with_current_as_ini
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
     let status = ffi_guard(|| {
-        let engine = engine_mut(engine)?;
+        let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
         *out_result = ptr::null_mut();
         engine.clear_error();
@@ -3280,7 +3370,7 @@ fn scan_selected_roots(
 
 #[cfg(feature = "native-watch")]
 fn start_watching_engine(
-    engine: &mut SmkEngine,
+    engine: &mut SmkEngineState,
     callback: SmkWatchNotificationCallback,
     context: *mut c_void,
 ) -> Result<(), String> {
@@ -3303,7 +3393,7 @@ fn start_watching_engine(
 
 #[cfg(not(feature = "native-watch"))]
 fn start_watching_engine(
-    _engine: &mut SmkEngine,
+    _engine: &mut SmkEngineState,
     _callback: SmkWatchNotificationCallback,
     _context: *mut c_void,
 ) -> Result<(), String> {
@@ -3311,16 +3401,16 @@ fn start_watching_engine(
 }
 
 #[cfg(feature = "native-watch")]
-fn stop_watching_engine(engine: &mut SmkEngine) {
+fn stop_watching_engine(engine: &mut SmkEngineState) {
     engine.watcher = None;
 }
 
 #[cfg(not(feature = "native-watch"))]
-fn stop_watching_engine(_engine: &mut SmkEngine) {}
+fn stop_watching_engine(_engine: &mut SmkEngineState) {}
 
 #[cfg(feature = "native-watch")]
 fn poll_watcher_scan(
-    engine: &mut SmkEngine,
+    engine: &mut SmkEngineState,
     dirty_only: bool,
 ) -> Result<Option<SmkScanResult>, String> {
     let Some(watcher) = engine.watcher.as_ref() else {
@@ -3403,7 +3493,7 @@ fn filter_dirty_scan_result(scan_result: &mut ScanResult, affected_root_ids: &BT
 
 #[cfg(not(feature = "native-watch"))]
 fn poll_watcher_scan(
-    _engine: &mut SmkEngine,
+    _engine: &mut SmkEngineState,
     _dirty_only: bool,
 ) -> Result<Option<SmkScanResult>, String> {
     Err("native-watch feature is not enabled".to_string())
@@ -4695,7 +4785,7 @@ fn backup_generation_string_bytes(value: &KitScriptMetaBackupGeneration) -> usiz
         .saturating_add(value.file_path.to_string_lossy().len())
 }
 
-impl SmkEngine {
+impl SmkEngineState {
     fn clear_error(&mut self) {
         self.last_error.clear();
     }
@@ -4728,20 +4818,32 @@ fn out_mut<'a, T>(ptr: *mut T) -> Result<&'a mut T, (SmkStatus, String)> {
     Ok(unsafe { &mut *ptr })
 }
 
-fn engine_mut<'a>(engine: *mut SmkEngine) -> Result<&'a mut SmkEngine, (SmkStatus, String)> {
+fn engine_mut<'a>(
+    engine: *mut SmkEngine,
+) -> Result<MutexGuard<'a, SmkEngineState>, (SmkStatus, String)> {
     if engine.is_null() {
         return Err((SmkStatus::NullArgument, "engine handle is null".to_string()));
     }
     // SAFETY: the caller must pass a live `SmkEngine` returned by this crate.
-    Ok(unsafe { &mut *engine })
+    let engine = unsafe { &*engine };
+    Ok(engine
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
-fn engine_ref<'a>(engine: *const SmkEngine) -> Result<&'a SmkEngine, (SmkStatus, String)> {
+fn engine_ref<'a>(
+    engine: *const SmkEngine,
+) -> Result<MutexGuard<'a, SmkEngineState>, (SmkStatus, String)> {
     if engine.is_null() {
         return Err((SmkStatus::NullArgument, "engine handle is null".to_string()));
     }
     // SAFETY: the caller must pass a live `SmkEngine` returned by this crate.
-    Ok(unsafe { &*engine })
+    let engine = unsafe { &*engine };
+    Ok(engine
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 fn scan_result_ref<'a>(
@@ -5230,9 +5332,12 @@ fn emit_update_progress(
 fn set_engine_error(engine: *mut SmkEngine, message: &str) {
     if !engine.is_null() {
         // SAFETY: best-effort error recording for a caller-provided live handle.
-        unsafe {
-            (*engine).set_error(message);
-        }
+        let engine = unsafe { &*engine };
+        engine
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_error(message);
     }
 }
 
@@ -5348,6 +5453,29 @@ fn smk_script_file_inspection(
         can_edit_scriptmeta: bool_byte(value.can_edit_scriptmeta),
         can_append_scriptmeta: bool_byte(value.can_append_scriptmeta),
         scriptmeta_edit_state: static_slice(value.scriptmeta_edit_state.as_str()),
+    }
+}
+
+fn smk_path_resolution(
+    value: ScannablePathResolution,
+    string_storage: &mut Vec<u8>,
+    string_overflow: &mut Vec<Box<[u8]>>,
+) -> SmkPathResolution {
+    let display_path = value.display_path.to_string_lossy();
+    let source_path = value.source_path.to_string_lossy();
+    let resolved_path = value.resolved_path.to_string_lossy();
+    SmkPathResolution {
+        display_path: push_stable_string(string_storage, string_overflow, &display_path),
+        source_path: push_stable_string(string_storage, string_overflow, &source_path),
+        resolved_path: push_stable_string(string_storage, string_overflow, &resolved_path),
+        path_kind: static_slice(value.path_kind.as_str()),
+        resolution_status: static_slice(value.resolution_status.as_str()),
+        resolution_message: value
+            .resolution_message
+            .as_deref()
+            .map_or_else(SmkUtf8Slice::empty, |message| {
+                push_stable_string(string_storage, string_overflow, message)
+            }),
     }
 }
 

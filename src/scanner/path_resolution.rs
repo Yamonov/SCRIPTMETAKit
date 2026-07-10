@@ -69,6 +69,29 @@ pub(crate) struct ResolvedPath {
     pub resolution_message: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScannablePathResolution {
+    pub display_path: PathBuf,
+    pub source_path: PathBuf,
+    pub resolved_path: PathBuf,
+    pub path_kind: PathKind,
+    pub resolution_status: PathResolutionStatus,
+    pub resolution_message: Option<String>,
+}
+
+impl From<ResolvedPath> for ScannablePathResolution {
+    fn from(resolved: ResolvedPath) -> Self {
+        Self {
+            display_path: resolved.display_path,
+            source_path: resolved.source_path,
+            resolved_path: resolved.resolved_path,
+            path_kind: resolved.path_kind,
+            resolution_status: resolved.resolution_status,
+            resolution_message: resolved.resolution_message,
+        }
+    }
+}
+
 impl ResolvedPath {
     pub(crate) fn with_status(
         mut self,
@@ -79,6 +102,19 @@ impl ResolvedPath {
         self.resolution_message = resolution_message.into();
         self
     }
+
+    pub(crate) fn is_unfollowed_symlink(&self) -> bool {
+        self.path_kind == PathKind::Symlink
+            && self.resolution_status == PathResolutionStatus::NotRequested
+    }
+}
+
+pub fn resolve_registered_path(
+    path: &Path,
+    options: &ScannerOptions,
+    extensions: Option<&ExtensionPolicy>,
+) -> ScannablePathResolution {
+    resolve_scannable_path(path.to_path_buf(), path.to_path_buf(), options, extensions).into()
 }
 
 pub(crate) fn resolve_scannable_path(
@@ -129,7 +165,7 @@ fn should_probe_macos_alias_file(
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return true;
     };
-    extensions.is_some_and(|extensions| extensions.contains_extension(extension))
+    extensions.is_none_or(|extensions| extensions.contains_extension(extension))
 }
 
 fn resolve_symlink_path(

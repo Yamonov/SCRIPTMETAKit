@@ -13,10 +13,13 @@ pub use metadata::{
     ScriptMetaItemRef, ScriptMetadata, ScriptRuntimeKind,
 };
 pub use operation::{FileIssue, OperationCancellation, OperationStatus, OperationSummary};
-pub(crate) use parser::select_distribution_metadata_for_script;
+pub(crate) use parser::{
+    clean_metadata_line, has_script_metadata_block, has_script_metadata_block_with_options,
+    select_distribution_metadata_for_script,
+};
 pub use parser::{
     normalize_metadata_url, parse_distribution_metadata, parse_distribution_metadata_for_script,
-    parse_distribution_metadata_records, parse_script_metadata,
+    parse_distribution_metadata_records, parse_script_metadata, parse_script_metadata_with_options,
 };
 pub use text::{
     DecodedScriptText, ScriptTextEncoding, decode_script_text, decode_script_text_strict,

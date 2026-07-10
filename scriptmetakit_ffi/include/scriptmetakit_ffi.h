@@ -87,6 +87,15 @@ typedef struct SmkScriptFileInspection {
     SmkUtf8Slice scriptmeta_edit_state;
 } SmkScriptFileInspection;
 
+typedef struct SmkPathResolution {
+    SmkUtf8Slice display_path;
+    SmkUtf8Slice source_path;
+    SmkUtf8Slice resolved_path;
+    SmkUtf8Slice path_kind;
+    SmkUtf8Slice resolution_status;
+    SmkUtf8Slice resolution_message;
+} SmkPathResolution;
+
 typedef struct SmkScriptItem {
     SmkUtf8Slice root_id;
     SmkUtf8Slice file_path;
@@ -527,6 +536,16 @@ SmkStatus smk_inspect_script_file_path(
     SmkScriptFileInspection *out_inspection
 );
 
+// String slices inside out_resolution remain valid until the next
+// smk_resolve_registered_path call on the same thread. Copy them immediately
+// if the caller needs to keep them longer or cross thread boundaries.
+SmkStatus smk_resolve_registered_path(
+    SmkUtf8Slice path,
+    uint8_t follow_symlinks,
+    uint8_t resolve_macos_alias,
+    SmkPathResolution *out_resolution
+);
+
 SmkStatus smk_script_path_may_affect_metadata(
     SmkUtf8Slice path,
     uint8_t *out_may_affect
@@ -560,6 +579,30 @@ SmkStatus smk_validate_edit_password_sha256_format(
 );
 
 /*
+ * Ownership and lifetime
+ * ----------------------
+ * - smk_engine_create_default transfers one SmkEngine to the caller. Release
+ *   it exactly once with smk_engine_free after all operations have finished.
+ * - Functions returning SmkScanResult, SmkEditResult, or
+ *   SmkScriptIdUniquenessResult transfer one result object to the caller.
+ *   Release it with the matching *_free function.
+ * - Slices returned by a result accessor are borrowed from that result. They
+ *   remain valid until the result is freed and must not be freed separately.
+ * - Input slices and arrays are borrowed only for the duration of the call.
+ * - smk_supported_script_extensions returns process-lifetime static storage.
+ * - smk_inspect_script_file_path and smk_resolve_registered_path use
+ *   thread-local storage as documented above their declarations.
+ *
+ * Thread safety and callbacks
+ * ---------------------------
+ * Engine state is synchronized internally. At most one ordinary operation on
+ * an engine handle executes at a time; concurrent ordinary calls wait. A
+ * caller may invoke smk_engine_cancel_current_operation concurrently, including
+ * from an update progress callback. Do not call any other engine operation or
+ * free the engine from a callback. Callback pointers and their nested slices
+ * are borrowed only for the duration of that callback invocation; copy data
+ * before retaining it or sending it to another thread.
+ *
  * The C API is synchronous. Scan, update-check, cache, watcher start/stop, and
  * engine-free calls may perform file I/O, network I/O, or wait for internal
  * worker threads. Call them from a background worker thread rather than a UI or

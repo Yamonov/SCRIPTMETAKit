@@ -37,6 +37,27 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
 
     public init() {}
 
+    private func runOperation<Result: Sendable>(
+        _ operation: @escaping @Sendable (ScriptMetaKitFFIEngineBox) throws -> Result
+    ) async throws -> Result {
+        let ticket = ScriptMetaKitOperationTicket()
+        let task = Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.runOperation(ticket: ticket) {
+                try operation(engineBox)
+            }
+        }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let result = try await task.value
+            try Task.checkCancellation()
+            return result
+        } onCancel: { [engineBox] in
+            if ticket.requestCancellation() {
+                engineBox.cancelCurrentOperation()
+            }
+        }
+    }
+
     public static func normalizeVersionString(_ value: String) throws -> String? {
         try normalizeVersionStringViaFFI(value)
     }
@@ -84,51 +105,51 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         checkUpdates: Bool,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.scan(folderURLs: folderURLs, checkUpdates: checkUpdates, onProgress: onProgress)
-        }.value
+        }
     }
 
     public func checkUpdate(
         item: ScriptMetaItem,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.checkUpdate(item: item, onProgress: onProgress)
-        }.value
+        }
     }
 
     public func checkUpdates(
         items: [ScriptMetaItem],
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.checkUpdates(items: items, onProgress: onProgress)
-        }.value
+        }
     }
 
     public func setRoots(_ roots: [ScriptMetaKitRoot]) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.setRoots(roots)
-        }.value
+        }
     }
 
     public func replaceRootGroup(_ roots: [ScriptMetaKitRoot], groupID: String) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.replaceRootGroup(roots, groupID: groupID)
-        }.value
+        }
     }
 
     public func insertRootsIntoGroup(_ roots: [ScriptMetaKitRoot], groupID: String) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.insertRootsIntoGroup(roots, groupID: groupID)
-        }.value
+        }
     }
 
     public func setVisibleRoot(_ rootID: String?) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.setVisibleRoot(rootID)
-        }.value
+        }
     }
 
     public func clearVisibleRoot() async throws {
@@ -140,9 +161,9 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     }
 
     public func shutdown() async {
-        await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        _ = try? await runOperation { engineBox in
             engineBox.shutdown()
-        }.value
+        }
     }
 
     public func scanRegisteredRoots(
@@ -150,9 +171,9 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         checkUpdates: Bool,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.scanRegisteredRoots(mode: mode, checkUpdates: checkUpdates, onProgress: onProgress)
-        }.value
+        }
     }
 
     public func scanRoots(
@@ -161,18 +182,18 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         checkUpdates: Bool,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.scanRoots(rootIDs: rootIDs, mode: mode, checkUpdates: checkUpdates, onProgress: onProgress)
-        }.value
+        }
     }
 
     public func cachedRoots(
         rootIDs: [String],
         mode: ScriptMetaScanMode = .fileListAndMetadata
     ) async throws -> ScriptMetaScanResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.cachedRoots(rootIDs: rootIDs, mode: mode)
-        }.value
+        }
     }
 
     public func scanRoot(
@@ -185,57 +206,57 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     }
 
     public func startWatching(onChange: @escaping @Sendable () -> Void) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.startWatching(onChange: onChange)
-        }.value
+        }
     }
 
     public func startWatching(folderURLs: [URL], onChange: @escaping @Sendable () -> Void) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.startWatching(folderURLs: folderURLs, onChange: onChange)
-        }.value
+        }
     }
 
     public func stopWatching() async {
-        await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        _ = try? await runOperation { engineBox in
             engineBox.stopWatching()
-        }.value
+        }
     }
 
     public func setResolveMacOSAlias(_ enabled: Bool) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.setResolveMacOSAlias(enabled)
-        }.value
+        }
     }
 
     public func setDecompileCompiledOSADuringScan(_ enabled: Bool) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.setDecompileCompiledOSADuringScan(enabled)
-        }.value
+        }
     }
 
     public func setNativeEventLatencyMillis(_ latencyMillis: UInt64) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.setNativeEventLatencyMillis(latencyMillis)
-        }.value
+        }
     }
 
     public func setRootPreflightOptions(_ options: ScriptMetaRootPreflightOptions) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.setRootPreflightOptions(options)
-        }.value
+        }
     }
 
     public func loadCache(from fileURL: URL) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.loadCache(from: fileURL)
-        }.value
+        }
     }
 
     public func saveCache(to fileURL: URL, scope: ScriptMetaCacheScope = .all) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.saveCache(to: fileURL, scope: scope)
-        }.value
+        }
     }
 
     public func writeScriptMetadata(
@@ -244,56 +265,56 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         mode: ScriptMetaWriteMode = .insertOrReplace,
         backupRootURL: URL? = nil
     ) async throws -> ScriptMetadataFileWriteResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.writeScriptMetadata(
                 fileURL: fileURL,
                 draft: draft,
                 mode: mode,
                 backupRootURL: backupRootURL
             )
-        }.value
+        }
     }
 
     public func readScriptMetadataDraft(fileURL: URL) async throws -> ScriptMetadataEditReadResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.readScriptMetadataDraft(fileURL: fileURL)
-        }.value
+        }
     }
 
     public func readScriptMetadataEditPreview(
         fileURL: URL,
         maxBytes: Int = 8 * 1024
     ) async throws -> ScriptMetadataEditPreviewResult {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.readScriptMetadataEditPreview(fileURL: fileURL, maxBytes: maxBytes)
-        }.value
+        }
     }
 
     public func renderDistributionMetadata(records: [DistributionMetadataDraft]) async throws -> String {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.renderDistributionMetadata(records: records)
-        }.value
+        }
     }
 
     public func generateEditPasswordSHA256(password: String) async throws -> String {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.generateEditPasswordSHA256(password: password)
-        }.value
+        }
     }
 
     public func verifyEditPasswordSHA256(password: String, storedValue: String) async throws -> Bool {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.verifyEditPasswordSHA256(password: password, storedValue: storedValue)
-        }.value
+        }
     }
 
     public func scriptMetaBackupGenerations(
         fileURL: URL,
         backupRootURL: URL
     ) async throws -> [ScriptMetaBackupGeneration] {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.scriptMetaBackupGenerations(fileURL: fileURL, backupRootURL: backupRootURL)
-        }.value
+        }
     }
 
     public func createScriptMetaBackup(
@@ -301,9 +322,9 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         backupRootURL: URL,
         reason: ScriptMetaBackupReason = .beforeSave
     ) async throws -> ScriptMetaBackupRecord {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.createScriptMetaBackup(fileURL: fileURL, backupRootURL: backupRootURL, reason: reason)
-        }.value
+        }
     }
 
     public func restoreScriptMetaBackup(
@@ -311,31 +332,31 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         backupRootURL: URL,
         generationID: String
     ) async throws -> ScriptMetaBackupRecord {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.restoreScriptMetaBackup(
                 fileURL: fileURL,
                 backupRootURL: backupRootURL,
                 generationID: generationID
             )
-        }.value
+        }
     }
 
     public func clearScriptMetaBackups(fileURL: URL, backupRootURL: URL) async throws {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.clearScriptMetaBackups(fileURL: fileURL, backupRootURL: backupRootURL)
-        }.value
+        }
     }
 
     public func resetScriptMetaBackupsWithCurrentAsInitial(
         fileURL: URL,
         backupRootURL: URL
     ) async throws -> ScriptMetaBackupRecord {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.resetScriptMetaBackupsWithCurrentAsInitial(
                 fileURL: fileURL,
                 backupRootURL: backupRootURL
             )
-        }.value
+        }
     }
 
     public func validateScriptIDUniqueness(in items: [ScriptMetaItem]) throws -> ScriptIdUniquenessReport {
@@ -343,13 +364,14 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     }
 
     public func pollWatchChanges(dirtyOnly: Bool = false) async throws -> ScriptMetaScanResult? {
-        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+        try await runOperation { engineBox in
             try engineBox.pollWatchChanges(dirtyOnly: dirtyOnly)
-        }.value
+        }
     }
 }
 
 private nonisolated let smkStatusOK: Int32 = 0
+private nonisolated let smkStatusInvalidArgument: Int32 = 3
 
 private nonisolated struct SmkUtf8Slice {
     var ptr: UnsafePointer<UInt8>?
@@ -1606,7 +1628,61 @@ private nonisolated func smk_edit_result_backup_generations(
 @_silgen_name("smk_edit_result_free")
 private nonisolated func smk_edit_result_free(_ result: OpaquePointer?)
 
+private nonisolated final class ScriptMetaKitOperationTicket: @unchecked Sendable {
+    private enum State {
+        case waiting
+        case cancellationRequested
+        case active
+        case finished
+    }
+
+    private let lock = NSLock()
+    private var state = State.waiting
+
+    var isCancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return state == .cancellationRequested
+    }
+
+    func requestCancellation() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        switch state {
+        case .waiting:
+            state = .cancellationRequested
+            return false
+        case .active:
+            return true
+        case .cancellationRequested, .finished:
+            return false
+        }
+    }
+
+    func activate() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        switch state {
+        case .waiting:
+            state = .active
+            return true
+        case .cancellationRequested:
+            state = .finished
+            return false
+        case .active, .finished:
+            return false
+        }
+    }
+
+    func finish() {
+        lock.lock()
+        state = .finished
+        lock.unlock()
+    }
+}
+
 private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
+    private let operationGate = NSLock()
     private let lock = NSLock()
     private let cancellationLock = NSLock()
     private var engine: ScriptMetaKitFFIEngine?
@@ -1615,6 +1691,25 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
 
     deinit {
         shutdown()
+    }
+
+    func runOperation<Result>(
+        ticket: ScriptMetaKitOperationTicket,
+        _ operation: () throws -> Result
+    ) throws -> Result {
+        while operationGate.try() == false {
+            if ticket.isCancellationRequested {
+                throw CancellationError()
+            }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        defer { operationGate.unlock() }
+
+        guard ticket.activate() else {
+            throw CancellationError()
+        }
+        defer { ticket.finish() }
+        return try operation()
     }
 
     private func ensureEngineLocked() throws -> ScriptMetaKitFFIEngine {
@@ -2348,7 +2443,10 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
               options.minScannedFileCountForLargeRoot >= 0,
               options.minScriptRatioDenominator >= 0,
               options.minScannedItemsForTimeLimit >= 0 else {
-            throw ScriptMetaKitError.operationFailed(2, "root preflight thresholds must not be negative")
+            throw ScriptMetaKitError.operationFailed(
+                smkStatusInvalidArgument,
+                "root preflight thresholds must not be negative"
+            )
         }
         let status = smk_engine_set_root_preflight_options(
             handle,
@@ -2453,6 +2551,12 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         fileURL: URL,
         maxBytes: Int
     ) throws -> ScriptMetadataEditPreviewResult {
+        guard maxBytes >= 0 else {
+            throw ScriptMetaKitError.operationFailed(
+                smkStatusInvalidArgument,
+                "metadata preview byte limit must not be negative"
+            )
+        }
         let arena = SmkInputStringArena()
         var result: OpaquePointer?
         let status = withExtendedLifetime(arena) {

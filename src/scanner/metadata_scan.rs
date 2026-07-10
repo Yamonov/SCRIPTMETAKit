@@ -15,12 +15,13 @@ use crate::{
     RootId, TimestampMillis,
     catalog::{FileIdentity, RootError, RootRegistration, RootSnapshot, RootStatus},
     core::{
-        OperationCancellation, ScriptMetaEditState, ScriptMetaItem, ScriptMetaItemRef,
-        ScriptRuntimeKind, VersionOrdering, compare_versions, decode_script_text,
-        parse_script_metadata,
+        OperationCancellation, ParserOptions, ScriptMetaEditState, ScriptMetaItem,
+        ScriptMetaItemRef, ScriptRuntimeKind, VersionOrdering, compare_versions,
+        decode_script_text, has_script_metadata_block_with_options,
+        parse_script_metadata_with_options,
     },
     formats::{
-        compiled_osa, detect_script_file, has_scriptmeta_tag, is_script_package_path,
+        compiled_osa, detect_script_file, is_script_package_path,
         scriptmeta_edit_capability_from_cached_metadata,
         scriptmeta_edit_capability_from_file_list_probe, scriptmeta_edit_capability_from_metadata,
     },
@@ -139,9 +140,14 @@ pub fn scan_metadata_roots_scoped<'a, I>(
 where
     I: IntoIterator<Item = &'a RootRegistration>,
 {
+    let parser_options = ParserOptions {
+        max_prefix_bytes: options.max_prefix_bytes,
+        ..ParserOptions::default()
+    };
     scan_metadata_roots_scoped_controlled(
         roots,
         options,
+        &parser_options,
         extensions,
         previous_cache,
         dirty_directories_by_root,
@@ -152,6 +158,7 @@ where
 pub(crate) fn scan_metadata_roots_scoped_controlled<'a, I>(
     roots: I,
     options: &ScannerOptions,
+    parser_options: &ParserOptions,
     extensions: &ExtensionPolicy,
     previous_cache: Option<&CandidateCache>,
     dirty_directories_by_root: Option<&BTreeMap<RootId, Vec<PathBuf>>>,
@@ -162,13 +169,17 @@ where
 {
     let roots: Vec<_> = roots.into_iter().collect();
     let reusable_records = reusable_records_by_identity_path(previous_cache, options);
+    let rules = MetadataScanRules {
+        scanner: options,
+        parser: parser_options,
+        extensions,
+    };
     let mut records = Vec::new();
     let mut root_snapshots = Vec::new();
 
     for output in scan_metadata_root_outputs(
         &roots,
-        options,
-        extensions,
+        rules,
         previous_cache,
         &reusable_records,
         dirty_directories_by_root,
@@ -197,6 +208,13 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+struct MetadataScanRules<'a> {
+    scanner: &'a ScannerOptions,
+    parser: &'a ParserOptions,
+    extensions: &'a ExtensionPolicy,
+}
+
 #[derive(Debug)]
 struct MetadataRootScanOutput {
     root: RootSnapshot,
@@ -205,8 +223,7 @@ struct MetadataRootScanOutput {
 
 fn scan_metadata_root_outputs<'a>(
     roots: &[&'a RootRegistration],
-    options: &ScannerOptions,
-    extensions: &ExtensionPolicy,
+    rules: MetadataScanRules<'a>,
     previous_cache: Option<&CandidateCache>,
     reusable_records: &BTreeMap<&'a Path, &'a CandidateRecord>,
     dirty_directories_by_root: Option<&BTreeMap<RootId, Vec<PathBuf>>>,
@@ -225,8 +242,7 @@ fn scan_metadata_root_outputs<'a>(
                     dirty_directories_by_root.and_then(|dirty| dirty.get(&root.root_id));
                 scan_metadata_root(
                     root,
-                    options,
-                    extensions,
+                    rules,
                     previous_cache,
                     reusable_records,
                     dirty_directories.map(Vec::as_slice),
@@ -250,8 +266,7 @@ fn scan_metadata_root_outputs<'a>(
                         dirty_directories_by_root.and_then(|dirty| dirty.get(&root.root_id));
                     let output = scan_metadata_root(
                         root,
-                        options,
-                        extensions,
+                        rules,
                         previous_cache,
                         reusable_records,
                         dirty_directories.map(Vec::as_slice),
@@ -272,19 +287,21 @@ fn scan_metadata_root_outputs<'a>(
 
 fn scan_metadata_root<'a>(
     root: &'a RootRegistration,
-    options: &ScannerOptions,
-    extensions: &ExtensionPolicy,
+    rules: MetadataScanRules<'a>,
     previous_cache: Option<&CandidateCache>,
     reusable_records: &BTreeMap<&'a Path, &'a CandidateRecord>,
     dirty_directories: Option<&[PathBuf]>,
     cancellation: Option<&OperationCancellation>,
 ) -> MetadataRootScanOutput {
+    let options = rules.scanner;
+    let extensions = rules.extensions;
     let started = Instant::now();
     let timeout = options
         .scan_timeout_per_root_millis
         .map(Duration::from_millis);
     let mut snapshot = RootSnapshot::new(root.root_id.clone(), root.path.clone());
     let mut records = Vec::new();
+    let is_dirty_refresh = dirty_directories.is_some();
 
     match root.path.try_exists() {
         Ok(true) => {}
@@ -319,8 +336,10 @@ fn scan_metadata_root<'a>(
         root,
         root_path: Arc::new(root.path.clone()),
         options,
+        parser_options: rules.parser,
         extensions,
         reusable_records,
+        allow_record_reuse: !is_dirty_refresh,
         timeout,
         started,
         visited_directories: BTreeSet::new(),
@@ -339,6 +358,17 @@ fn scan_metadata_root<'a>(
         options,
         Some(extensions),
     );
+    if root_resolution.is_unfollowed_symlink() {
+        snapshot.status = RootStatus::Unreadable;
+        snapshot.error = Some(RootError {
+            code: "symlink_following_disabled".to_string(),
+            message: "root is a symlink and symlink following is disabled".to_string(),
+        });
+        return MetadataRootScanOutput {
+            root: snapshot,
+            records,
+        };
+    }
     let root_metadata = match fs::metadata(&root_resolution.resolved_path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -367,7 +397,8 @@ fn scan_metadata_root<'a>(
         .map(|directories| normalize_dirty_directories(directories, &normalized_root_path))
         .filter(|directories| !directories.is_empty());
 
-    if let Some(dirty_directories) = normalized_dirty_directories.as_deref()
+    let dirty_refresh_context = if let Some(dirty_directories) =
+        normalized_dirty_directories.as_deref()
         && !dirty_directories
             .iter()
             .any(|directory| directory == &normalized_root_path)
@@ -379,8 +410,7 @@ fn scan_metadata_root<'a>(
             &mut state,
             &mut records,
         );
-        records =
-            merge_dirty_metadata_records(previous_cache, &root.root_id, dirty_directories, records);
+        Some((previous_cache, dirty_directories))
     } else {
         if let Some((status, root_error)) =
             root_content_preflight_issue(&root_resolution.resolved_path, options, extensions)
@@ -399,7 +429,8 @@ fn scan_metadata_root<'a>(
             &mut state,
             &mut records,
         );
-    }
+        None
+    };
     if let Some(error) = state.root_error {
         snapshot.status = RootStatus::Unreadable;
         snapshot.error = Some(error);
@@ -416,7 +447,19 @@ fn scan_metadata_root<'a>(
             RootStatus::Ready
         };
     }
-    snapshot.is_dirty = false;
+    if let Some((previous_cache, dirty_directories)) = dirty_refresh_context.as_ref() {
+        if snapshot.status == RootStatus::Ready {
+            records = merge_dirty_metadata_records(
+                previous_cache,
+                &root.root_id,
+                dirty_directories,
+                records,
+            );
+        } else {
+            records = previous_metadata_records(previous_cache, &root.root_id);
+        }
+    }
+    snapshot.is_dirty = dirty_refresh_context.is_some() && snapshot.status != RootStatus::Ready;
     snapshot.last_loaded_at = Some(now_timestamp_millis());
     snapshot.item_count = records
         .iter()
@@ -490,6 +533,18 @@ fn merge_dirty_metadata_records(
     records
 }
 
+fn previous_metadata_records(
+    previous_cache: &CandidateCache,
+    root_id: &RootId,
+) -> Vec<CandidateRecord> {
+    previous_cache
+        .records
+        .iter()
+        .filter(|record| record.root_id == *root_id)
+        .cloned()
+        .collect()
+}
+
 fn relative_depth(root_path: &Path, path: &Path) -> usize {
     path.strip_prefix(root_path)
         .map(|relative| relative.components().count())
@@ -511,8 +566,10 @@ struct MetadataWalkState<'a> {
     root: &'a RootRegistration,
     root_path: Arc<PathBuf>,
     options: &'a ScannerOptions,
+    parser_options: &'a ParserOptions,
     extensions: &'a ExtensionPolicy,
     reusable_records: &'a BTreeMap<&'a Path, &'a CandidateRecord>,
+    allow_record_reuse: bool,
     timeout: Option<Duration>,
     started: Instant,
     visited_directories: BTreeSet<PathBuf>,
@@ -568,7 +625,7 @@ fn scan_directory(
     let entries = match fs::read_dir(source_directory) {
         Ok(entries) => entries,
         Err(error) => {
-            if depth == 0 {
+            if state.root_error.is_none() {
                 let (_, root_error) = root_io_error(&error, "read_directory_failed");
                 state.root_error = Some(root_error);
             }
@@ -594,6 +651,9 @@ fn scan_directory(
             state.options,
             Some(state.extensions),
         );
+        if resolved.is_unfollowed_symlink() {
+            continue;
+        }
         if is_script_package_path(&resolved.display_path)
             || is_script_package_path(&resolved.resolved_path)
         {
@@ -687,7 +747,8 @@ fn candidate_record(
     let identity = file_identity(identity_path, metadata);
 
     if let Some(record) = state.reusable_records.get(identity_path).filter(|record| {
-        state.options.reuse_unchanged_records
+        state.allow_record_reuse
+            && state.options.reuse_unchanged_records
             && record.file_size == file_size
             && record.content_modified_at == content_modified_at
     }) {
@@ -742,7 +803,7 @@ fn candidate_record(
 
     let source_result = read_script_source(
         identity_path,
-        state.options.max_prefix_bytes,
+        state.parser_options.max_prefix_bytes,
         metadata.len(),
         compiled_osa_timeout_for_state(state),
         state.options.decompile_compiled_osa_during_scan,
@@ -774,10 +835,12 @@ fn candidate_record(
     };
     let script_info = detect_script_file(identity_path, source_text.as_deref());
     let runtime_kind = runtime_kind_override.or(script_info.runtime_kind);
-    let has_scriptmeta = source_text.as_deref().is_some_and(has_scriptmeta_tag);
+    let has_scriptmeta = source_text
+        .as_deref()
+        .is_some_and(|text| has_script_metadata_block_with_options(text, state.parser_options));
     let parsed_metadata = source_text
         .as_deref()
-        .and_then(|text| parse_script_metadata(text).ok());
+        .and_then(|text| parse_script_metadata_with_options(text, state.parser_options).ok());
     let has_scriptmeta_edit_password = parsed_metadata
         .as_ref()
         .is_some_and(|metadata| metadata.edit_password_sha256.is_some());

@@ -49,6 +49,15 @@ private nonisolated struct SmkPolicyScriptFileInspection {
     }
 }
 
+private nonisolated struct SmkPolicyPathResolution {
+    var displayPath = SmkPolicyUtf8Slice()
+    var sourcePath = SmkPolicyUtf8Slice()
+    var resolvedPath = SmkPolicyUtf8Slice()
+    var pathKind = SmkPolicyUtf8Slice()
+    var resolutionStatus = SmkPolicyUtf8Slice()
+    var resolutionMessage = SmkPolicyUtf8Slice()
+}
+
 @_silgen_name("smk_supported_script_extensions")
 private nonisolated func smk_supported_script_extensions(
     _ outExtensions: UnsafeMutablePointer<SmkPolicyUtf8Slice>
@@ -58,6 +67,14 @@ private nonisolated func smk_supported_script_extensions(
 private nonisolated func smk_inspect_script_file_path(
     _ path: SmkPolicyUtf8Slice,
     _ outInspection: UnsafeMutablePointer<SmkPolicyScriptFileInspection>
+) -> Int32
+
+@_silgen_name("smk_resolve_registered_path")
+private nonisolated func smk_resolve_registered_path(
+    _ path: SmkPolicyUtf8Slice,
+    _ followSymlinks: UInt8,
+    _ resolveMacOSAlias: UInt8,
+    _ outResolution: UnsafeMutablePointer<SmkPolicyPathResolution>
 ) -> Int32
 
 @_silgen_name("smk_script_path_may_affect_metadata")
@@ -103,6 +120,31 @@ public nonisolated struct ScriptMetaScriptFileInspection: Codable, Equatable, Se
     }
 }
 
+public nonisolated struct ScriptMetaPathResolution: Codable, Equatable, Sendable {
+    public var displayURL: URL
+    public var sourceURL: URL
+    public var resolvedURL: URL
+    public var pathKind: String
+    public var resolutionStatus: String
+    public var resolutionMessage: String?
+
+    public init(
+        displayURL: URL,
+        sourceURL: URL,
+        resolvedURL: URL,
+        pathKind: String,
+        resolutionStatus: String,
+        resolutionMessage: String? = nil
+    ) {
+        self.displayURL = displayURL
+        self.sourceURL = sourceURL
+        self.resolvedURL = resolvedURL
+        self.pathKind = pathKind
+        self.resolutionStatus = resolutionStatus
+        self.resolutionMessage = resolutionMessage
+    }
+}
+
 public nonisolated enum ScriptMetaScriptFilePolicy {
     public static let supportedPathExtensions: Set<String> = {
         var extensions = SmkPolicyUtf8Slice()
@@ -131,6 +173,31 @@ public nonisolated enum ScriptMetaScriptFilePolicy {
             canEditScriptMeta: inspection.canEditScriptMeta != 0,
             canAppendScriptMeta: inspection.canAppendScriptMeta != 0,
             scriptMetaEditState: optionalString(inspection.scriptMetaEditState) ?? "unknown"
+        )
+    }
+
+    public static func resolveRegisteredPath(
+        _ url: URL,
+        followSymlinks: Bool = true,
+        resolveMacOSAlias: Bool = true
+    ) -> ScriptMetaPathResolution? {
+        var resolution = SmkPolicyPathResolution()
+        let status = withUTF8Slice(url.standardizedFileURL.path) { pathSlice in
+            smk_resolve_registered_path(
+                pathSlice,
+                followSymlinks ? 1 : 0,
+                resolveMacOSAlias ? 1 : 0,
+                &resolution
+            )
+        }
+        guard status == smkPolicyStatusOK else { return nil }
+        return ScriptMetaPathResolution(
+            displayURL: URL(fileURLWithPath: string(resolution.displayPath)),
+            sourceURL: URL(fileURLWithPath: string(resolution.sourcePath)),
+            resolvedURL: URL(fileURLWithPath: string(resolution.resolvedPath)),
+            pathKind: string(resolution.pathKind),
+            resolutionStatus: string(resolution.resolutionStatus),
+            resolutionMessage: optionalString(resolution.resolutionMessage)
         )
     }
 

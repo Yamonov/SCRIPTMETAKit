@@ -88,6 +88,20 @@ impl OperationSummary {
             message: Some("operation timed out before all work completed".to_string()),
         }
     }
+
+    #[must_use]
+    pub fn partial(total_units: usize, completed_units: usize, failed_units: usize) -> Self {
+        Self {
+            status: OperationStatus::Partial,
+            total_units,
+            completed_units,
+            failed_units,
+            cancelled: false,
+            timed_out: false,
+            reason_code: Some("operation_partial".to_string()),
+            message: Some("operation completed with incomplete roots".to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

@@ -4,11 +4,21 @@ SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning
 
 The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer applications that need a reusable SCRIPTMETA engine across platforms.
 
+Registered macOS aliases and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. `PathKind::WindowsShortcut` is reserved for compatibility; `.lnk` resolution is not implemented in the 1.0 series and callers must treat it as unsupported.
+
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.0.8`
-- Rust FFI crate: `scriptmetakit_ffi` `1.0.8`
+- Rust crate: `scriptmetakit` `1.0.9`
+- Rust FFI crate: `scriptmetakit_ffi` `1.0.9`
 - Swift package product: `ScriptMetaKit`
+
+## 1.0.9
+
+- Makes FFI cancellation, Swift Task cancellation, and Workspace compound operations safe under concurrency.
+- Preserves the previous catalog and dirty state when a refresh is cancelled, times out, overflows, or encounters an unreadable subtree.
+- Preserves executable permissions, ACLs, and extended attributes during metadata edits, and makes backup reset transactional.
+- Unifies parser, marker, JSDoc, symlink, alias, UTF-16, and scan-status behavior across Rust, C FFI, and Swift.
+- Adds a public registered-path resolution API and reproducible, staged XCFramework generation with a release manifest.
 
 ## 1.0.8
 

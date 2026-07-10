@@ -182,7 +182,7 @@ pub fn script_header_probe_byte_limit(path: &Path) -> usize {
 
 #[must_use]
 pub fn has_scriptmeta_tag(prefix_text: &str) -> bool {
-    prefix_text.contains("SCRIPTMETA-BEGIN")
+    crate::core::has_script_metadata_block(prefix_text)
 }
 
 #[must_use]

@@ -15,9 +15,9 @@ use uuid::Uuid;
 use crate::{
     ItemId,
     core::{
-        ScriptMetaKitError, ScriptMetaKitResult, ScriptRuntimeKind, decode_script_text,
-        decode_script_text_with_encoding, encode_script_text, normalize_metadata_url,
-        normalize_version_string,
+        ScriptMetaKitError, ScriptMetaKitResult, ScriptRuntimeKind, clean_metadata_line,
+        decode_script_text, decode_script_text_with_encoding, encode_script_text,
+        has_script_metadata_block, normalize_metadata_url, normalize_version_string,
     },
     formats::{self, CommentSyntax, compiled_osa},
 };
@@ -30,6 +30,7 @@ const DESCRIPTION_BEGIN: &str = "Description-BEGIN";
 const DESCRIPTION_END: &str = "Description-END";
 const BACKUP_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_SCRIPT_METADATA_PREVIEW_BYTES: usize = 8 * 1024;
+pub const MAX_SCRIPT_METADATA_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScriptIdUniquenessReport {
@@ -468,6 +469,11 @@ pub fn read_script_metadata_edit_preview_from_file(
     } else {
         max_bytes
     };
+    if max_bytes > MAX_SCRIPT_METADATA_PREVIEW_BYTES {
+        return Err(ScriptMetaKitError::InvalidConfig(format!(
+            "metadata preview byte limit must not exceed {MAX_SCRIPT_METADATA_PREVIEW_BYTES}"
+        )));
+    }
     let metadata = fs::metadata(path).map_err(|error| ScriptMetaKitError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
@@ -543,8 +549,7 @@ fn script_metadata_edit_preview_result(
 ) -> ScriptMetadataEditPreviewResult {
     let comment_style = ScriptMetaCommentStyle::for_path_and_source(path, &preview_text)
         .or_else(|| ScriptMetaCommentStyle::for_path(path));
-    let has_scriptmeta_marker_in_preview =
-        preview_text.contains(SCRIPT_BEGIN) || preview_text.contains(SCRIPT_END);
+    let has_scriptmeta_marker_in_preview = has_script_metadata_block(&preview_text);
     let line_ending = detected_line_ending(&preview_text).to_string();
     ScriptMetadataEditPreviewResult {
         file_path: path.to_path_buf(),
@@ -622,6 +627,7 @@ pub fn write_script_metadata_to_file(
     mode: ScriptMetaWriteMode,
     backup_options: Option<&ScriptMetaBackupOptions>,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
+    ensure_script_file_writable(path)?;
     if compiled_osa::is_compiled_osa_path(path) {
         return write_script_metadata_to_compiled_osa_file(path, draft, mode, backup_options);
     }
@@ -708,6 +714,13 @@ fn write_compiled_osa_temp_result(
     operation: ScriptMetaWriteOperation,
     backup_options: Option<&ScriptMetaBackupOptions>,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
+    if let Err(error) = copy_replacement_metadata(path, temp_path) {
+        let _ = fs::remove_file(temp_path);
+        return Err(ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        });
+    }
     let backup = match backup_options {
         Some(options) => Some(create_scriptmeta_backup(
             path,
@@ -997,8 +1010,75 @@ pub fn reset_scriptmeta_backups_with_current_as_initial(
     path: &Path,
     options: &ScriptMetaBackupOptions,
 ) -> ScriptMetaKitResult<ScriptMetaBackupRecord> {
-    clear_scriptmeta_backups(path, options)?;
-    create_scriptmeta_backup(path, options, ScriptMetaBackupReason::ResetInitial)
+    let transaction_id = Uuid::new_v4();
+    let staged_root = options
+        .root_directory
+        .join(format!(".reset-{transaction_id}"));
+    let staged_options = ScriptMetaBackupOptions {
+        root_directory: staged_root.clone(),
+    };
+    let mut record =
+        match create_scriptmeta_backup(path, &staged_options, ScriptMetaBackupReason::ResetInitial)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staged_root);
+                return Err(error);
+            }
+        };
+
+    let target_directory = backup_file_directory(path, options);
+    let staged_directory = backup_file_directory(path, &staged_options);
+    let target_parent = target_directory.parent().unwrap_or(&options.root_directory);
+    if let Err(error) = fs::create_dir_all(target_parent) {
+        let _ = fs::remove_dir_all(&staged_root);
+        return Err(ScriptMetaKitError::Io {
+            path: target_parent.to_path_buf(),
+            message: error.to_string(),
+        });
+    }
+
+    let previous_directory = target_parent.join(format!(
+        ".{}.reset-previous-{transaction_id}",
+        target_directory
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    let had_previous_directory = target_directory.exists();
+    if had_previous_directory && let Err(error) = fs::rename(&target_directory, &previous_directory)
+    {
+        let _ = fs::remove_dir_all(&staged_root);
+        return Err(ScriptMetaKitError::Io {
+            path: target_directory,
+            message: error.to_string(),
+        });
+    }
+
+    if let Err(error) = fs::rename(&staged_directory, &target_directory) {
+        let rollback_error = had_previous_directory
+            .then(|| fs::rename(&previous_directory, &target_directory).err())
+            .flatten();
+        let _ = fs::remove_dir_all(&staged_root);
+        let message = match rollback_error {
+            Some(rollback_error) => format!(
+                "{error}; restoring the previous backup history also failed: {rollback_error}"
+            ),
+            None => error.to_string(),
+        };
+        return Err(ScriptMetaKitError::Io {
+            path: target_directory,
+            message,
+        });
+    }
+
+    if had_previous_directory {
+        let _ = fs::remove_dir_all(previous_directory);
+    }
+    let _ = fs::remove_dir_all(staged_root);
+    record.backup_file_path =
+        backup_generations_directory(path, options).join(&record.backup_file_name);
+    Ok(record)
 }
 
 fn validate_script_metadata_draft(draft: &ScriptMetadataDraft) -> ScriptMetaKitResult<()> {
@@ -1125,13 +1205,13 @@ fn parse_block_elements(content: &str) -> Vec<ScriptMetaBlockElement> {
     let mut elements = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
-        let line = lines[index];
+        let line = clean_metadata_line(lines[index]);
         let trimmed = line.trim();
         if trimmed == DESCRIPTION_BEGIN {
             let mut body = Vec::new();
             index += 1;
             while index < lines.len() {
-                let body_line = lines[index];
+                let body_line = clean_metadata_line(lines[index]);
                 if body_line.trim() == DESCRIPTION_END {
                     break;
                 }
@@ -1821,6 +1901,23 @@ fn read_script_bytes_file(path: &Path) -> ScriptMetaKitResult<Vec<u8>> {
     })
 }
 
+fn ensure_script_file_writable(path: &Path) -> ScriptMetaKitResult<()> {
+    let inspection = formats::inspect_script_file(path);
+    if inspection.is_file_locked {
+        return Err(ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "script file is locked".to_string(),
+        });
+    }
+    if inspection.is_read_only {
+        return Err(ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "script file or its parent directory is read-only".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn compiled_osa_temp_path(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(
@@ -1848,9 +1945,50 @@ fn write_bytes_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
+    if path.exists() {
+        copy_replacement_metadata(path, &temp_path)?;
+    }
     replace_file(&temp_path, path)?;
     temp_guard.disarm();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn copy_replacement_metadata(source_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let source = CString::new(source_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source path contains a null byte",
+        )
+    })?;
+    let target = CString::new(target_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target path contains a null byte",
+        )
+    })?;
+    // SAFETY: both paths are valid, null-terminated C strings that remain alive
+    // for the duration of copyfile. A null state is explicitly permitted.
+    let result = unsafe {
+        libc::copyfile(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null_mut(),
+            libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    fs::set_permissions(target_path, fs::metadata(source_path)?.permissions())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_replacement_metadata(source_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    fs::set_permissions(target_path, fs::metadata(source_path)?.permissions())
 }
 
 struct TemporaryEditFile {
@@ -2076,6 +2214,11 @@ fn wrap_metadata_block(block: &str, style: ScriptMetaCommentStyle) -> String {
 mod tests {
     use std::{fs, path::Path};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
+    use std::process::Command;
+
     use tempfile::tempdir;
     use url::Url;
 
@@ -2083,10 +2226,11 @@ mod tests {
         DistributionMetadataDraft, ScriptIdUniquenessItem, ScriptMetaBackupOptions,
         ScriptMetaBackupReason, ScriptMetaCommentStyle, ScriptMetaWriteMode, ScriptMetadataDraft,
         append_script_metadata_to_text, backup_file_directory, clear_scriptmeta_backups,
-        generate_edit_password_sha256, is_valid_edit_password_sha256,
+        create_scriptmeta_backup, generate_edit_password_sha256, is_valid_edit_password_sha256,
         render_distribution_metadata_block, render_script_metadata_for_style,
-        restore_scriptmeta_backup, scriptmeta_backup_generations, validate_script_id_uniqueness,
-        verify_edit_password_sha256, write_script_metadata_to_file, write_script_metadata_to_text,
+        reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
+        scriptmeta_backup_generations, validate_script_id_uniqueness, verify_edit_password_sha256,
+        write_script_metadata_to_file, write_script_metadata_to_text,
     };
     use crate::core::{parse_distribution_metadata_for_script, parse_script_metadata};
 
@@ -2210,6 +2354,36 @@ mod tests {
     }
 
     #[test]
+    fn replaces_script_id_inside_star_prefixed_jsdoc_metadata() {
+        let source = "/**\n * SCRIPTMETA-BEGIN\n * Script-ID=com.example.old\n * Unknown-Key=keep\n * SCRIPTMETA-END\n */\nalert('x');\n";
+        let read = super::read_script_metadata_draft_from_text(source, Path::new("example.jsx"))
+            .expect("read");
+        assert_eq!(read.draft.script_id, "com.example.old");
+
+        let draft = ScriptMetadataDraft {
+            script_id: "com.example.new".to_string(),
+            ..ScriptMetadataDraft::default()
+        };
+        let updated = write_script_metadata_to_text(
+            source,
+            Path::new("example.jsx"),
+            &draft,
+            ScriptMetaWriteMode::InsertOrReplace,
+        )
+        .expect("write");
+
+        assert!(!updated.text.contains("Script-ID=com.example.old"));
+        assert!(updated.text.contains("Script-ID=com.example.new"));
+        assert!(updated.text.contains("Unknown-Key=keep"));
+        assert_eq!(
+            parse_script_metadata(&updated.text)
+                .expect("parse")
+                .script_id,
+            "com.example.new"
+        );
+    }
+
+    #[test]
     fn insert_only_rejects_existing_script_metadata() {
         let draft = ScriptMetadataDraft {
             script_id: "com.example.new".to_string(),
@@ -2306,6 +2480,167 @@ mod tests {
         );
 
         clear_scriptmeta_backups(&script_path, &backup_options).expect("clear backups");
+    }
+
+    #[test]
+    fn reset_backups_replaces_history_only_after_staging_the_current_file() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("example.jsx");
+        fs::write(&script_path, "alert('old');\n").expect("write script");
+        let backup_options = ScriptMetaBackupOptions {
+            root_directory: directory.path().join("backups"),
+        };
+        create_scriptmeta_backup(
+            &script_path,
+            &backup_options,
+            ScriptMetaBackupReason::BeforeSave,
+        )
+        .expect("old backup");
+        fs::write(&script_path, "alert('current');\n").expect("update script");
+
+        let reset = reset_scriptmeta_backups_with_current_as_initial(&script_path, &backup_options)
+            .expect("reset backups");
+        let generations = scriptmeta_backup_generations(&script_path, &backup_options)
+            .expect("reset generations");
+
+        assert!(reset.backup_file_path.exists());
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].id, reset.id);
+        assert_eq!(generations[0].reason, ScriptMetaBackupReason::ResetInitial);
+        assert_eq!(
+            fs::read_to_string(&generations[0].file_path).expect("read reset backup"),
+            "alert('current');\n"
+        );
+    }
+
+    #[test]
+    fn failed_backup_reset_keeps_the_previous_history() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("example.jsx");
+        fs::write(&script_path, "alert('old');\n").expect("write script");
+        let backup_options = ScriptMetaBackupOptions {
+            root_directory: directory.path().join("backups"),
+        };
+        let previous = create_scriptmeta_backup(
+            &script_path,
+            &backup_options,
+            ScriptMetaBackupReason::BeforeSave,
+        )
+        .expect("old backup");
+        fs::remove_file(&script_path).expect("remove current script");
+
+        assert!(
+            reset_scriptmeta_backups_with_current_as_initial(&script_path, &backup_options)
+                .is_err()
+        );
+        let generations = scriptmeta_backup_generations(&script_path, &backup_options)
+            .expect("previous generations");
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].id, previous.id);
+        assert!(previous.backup_file_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_metadata_write_preserves_executable_permissions() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("example.jsx");
+        fs::write(&script_path, "alert('before');\n").expect("write script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        let draft = ScriptMetadataDraft {
+            script_id: "com.example.permissions".to_string(),
+            ..ScriptMetadataDraft::default()
+        };
+
+        write_script_metadata_to_file(
+            &script_path,
+            &draft,
+            ScriptMetaWriteMode::InsertOrReplace,
+            None,
+        )
+        .expect("write metadata");
+
+        assert_eq!(
+            fs::metadata(&script_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn metadata_write_rejects_read_only_files_without_changing_them() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("example.jsx");
+        let original = "alert('before');\n";
+        fs::write(&script_path, original).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&script_path, permissions).expect("make read-only");
+        let draft = ScriptMetadataDraft {
+            script_id: "com.example.readonly".to_string(),
+            ..ScriptMetadataDraft::default()
+        };
+
+        let result = write_script_metadata_to_file(
+            &script_path,
+            &draft,
+            ScriptMetaWriteMode::InsertOrReplace,
+            None,
+        );
+
+        #[cfg(unix)]
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o644))
+            .expect("restore permissions");
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&script_path, permissions).expect("restore permissions");
+        }
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&script_path).expect("read script"),
+            original
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn atomic_metadata_write_preserves_extended_attributes() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("example.jsx");
+        fs::write(&script_path, "alert('before');\n").expect("write script");
+        let attribute = "com.example.ScriptMetaKit.test";
+        let set_status = Command::new("/usr/bin/xattr")
+            .args(["-w", attribute, "preserved"])
+            .arg(&script_path)
+            .status()
+            .expect("set xattr");
+        assert!(set_status.success());
+        let draft = ScriptMetadataDraft {
+            script_id: "com.example.xattr".to_string(),
+            ..ScriptMetadataDraft::default()
+        };
+
+        write_script_metadata_to_file(
+            &script_path,
+            &draft,
+            ScriptMetaWriteMode::InsertOrReplace,
+            None,
+        )
+        .expect("write metadata");
+
+        let output = Command::new("/usr/bin/xattr")
+            .args(["-p", attribute])
+            .arg(&script_path)
+            .output()
+            .expect("read xattr");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "preserved");
     }
 
     #[test]

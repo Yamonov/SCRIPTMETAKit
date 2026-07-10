@@ -739,7 +739,7 @@ mod platform {
         mem,
         os::windows::ffi::{OsStrExt, OsStringExt},
         path::{Path, PathBuf},
-        ptr, slice,
+        ptr,
         sync::mpsc,
         thread::{self, JoinHandle},
     };
@@ -1050,14 +1050,11 @@ mod platform {
                 let _ = sender.send(NativeFsEvent::Overflow);
                 break;
             }
-            let name_len = file_name_byte_len / 2;
-
-            let name = unsafe {
-                OsString::from_wide(slice::from_raw_parts(
-                    buffer.as_ptr().add(name_offset) as *const u16,
-                    name_len,
-                ))
-            };
+            let name_wide = buffer[name_offset..name_offset + file_name_byte_len]
+                .chunks_exact(2)
+                .map(|code_unit| u16::from_le_bytes([code_unit[0], code_unit[1]]))
+                .collect::<Vec<_>>();
+            let name = OsString::from_wide(&name_wide);
             let path = root.join(PathBuf::from(name));
             let may_change_directory_tree = matches!(
                 action,

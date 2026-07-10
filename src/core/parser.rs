@@ -3,7 +3,7 @@ use std::{borrow::Cow, convert::Infallible};
 use url::Url;
 
 use super::{
-    DistributionMetadata, ScriptMetaKitError, ScriptMetaKitResult, ScriptMetadata,
+    DistributionMetadata, ParserOptions, ScriptMetaKitError, ScriptMetaKitResult, ScriptMetadata,
     normalize_version_string,
 };
 
@@ -40,7 +40,14 @@ const DISTRIBUTION_METADATA_KEYS: &[&str] = &[
 ];
 
 pub fn parse_script_metadata(text: &str) -> ScriptMetaKitResult<ScriptMetadata> {
-    let body = block_between(text, SCRIPT_BEGIN, SCRIPT_END)
+    parse_script_metadata_with_options(text, &ParserOptions::default())
+}
+
+pub fn parse_script_metadata_with_options(
+    text: &str,
+    options: &ParserOptions,
+) -> ScriptMetaKitResult<ScriptMetadata> {
+    let body = script_metadata_body(text, options.require_closed_block)
         .ok_or_else(|| ScriptMetaKitError::Parse("missing SCRIPTMETA block".to_string()))?;
     let fields = parse_script_metadata_fields(body);
     let script_id = fields.script_id.ok_or_else(|| {
@@ -62,6 +69,16 @@ pub fn parse_script_metadata(text: &str) -> ScriptMetaKitResult<ScriptMetadata> 
         release_date: fields.release_date,
         edit_password_sha256: fields.edit_password_sha256,
     })
+}
+
+#[must_use]
+pub(crate) fn has_script_metadata_block(text: &str) -> bool {
+    has_script_metadata_block_with_options(text, &ParserOptions::default())
+}
+
+#[must_use]
+pub(crate) fn has_script_metadata_block_with_options(text: &str, options: &ParserOptions) -> bool {
+    script_metadata_body(text, options.require_closed_block).is_some()
 }
 
 pub fn parse_distribution_metadata(text: &str) -> ScriptMetaKitResult<DistributionMetadata> {
@@ -180,6 +197,17 @@ fn block_between<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
     let rest = &text[after_begin..];
     let end_index = find_ascii_case_insensitive(rest, end)?;
     Some(&rest[..end_index])
+}
+
+fn script_metadata_body(text: &str, require_closed_block: bool) -> Option<&str> {
+    let begin_index = find_ascii_case_insensitive(text, SCRIPT_BEGIN)?;
+    let after_begin = begin_index + SCRIPT_BEGIN.len();
+    let rest = &text[after_begin..];
+    match find_ascii_case_insensitive(rest, SCRIPT_END) {
+        Some(end_index) => Some(&rest[..end_index]),
+        None if !require_closed_block => Some(rest),
+        None => None,
+    }
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -473,7 +501,7 @@ fn is_metadata_key_boundary(line: &str, index: usize) -> bool {
             .is_some_and(char::is_whitespace)
 }
 
-fn clean_line(line: &str) -> &str {
+pub(crate) fn clean_metadata_line(line: &str) -> &str {
     let mut trimmed = line.trim();
     for prefix in ["//", "--", "#", "*", "/*", "*/", ";"] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
@@ -481,6 +509,10 @@ fn clean_line(line: &str) -> &str {
         }
     }
     trimmed
+}
+
+fn clean_line(line: &str) -> &str {
+    clean_metadata_line(line)
 }
 
 fn normalize_distribution_body(body: &str) -> Cow<'_, str> {
@@ -637,7 +669,9 @@ fn parse_metadata_url(value: &str) -> Option<Url> {
 mod tests {
     use super::{
         normalize_metadata_url, parse_distribution_metadata_for_script, parse_script_metadata,
+        parse_script_metadata_with_options,
     };
+    use crate::core::ParserOptions;
 
     #[test]
     fn normalizes_script_versions_and_urls() {
@@ -754,5 +788,22 @@ scriptmeta-end
         .expect("metadata");
 
         assert_eq!(metadata.script_id, "com.example.case");
+    }
+
+    #[test]
+    fn parser_options_control_unclosed_script_metadata_blocks() {
+        let text = "SCRIPTMETA-BEGIN\nScript-ID: com.example.unclosed\n";
+
+        assert!(parse_script_metadata(text).is_err());
+        let metadata = parse_script_metadata_with_options(
+            text,
+            &ParserOptions {
+                max_prefix_bytes: 1024,
+                require_closed_block: false,
+            },
+        )
+        .expect("unclosed metadata");
+
+        assert_eq!(metadata.script_id, "com.example.unclosed");
     }
 }

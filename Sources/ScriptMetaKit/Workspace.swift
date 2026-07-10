@@ -112,6 +112,8 @@ public actor ScriptMetaKitWorkspace {
     private let configuration: ScriptMetaKitWorkspaceConfiguration
     private var didConfigureEngine = false
     private var loadedCacheRootIDsByScope: [UInt32: Set<String>] = [:]
+    private var hasExclusiveOperation = false
+    private var exclusiveOperationWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(configuration: ScriptMetaKitWorkspaceConfiguration = ScriptMetaKitWorkspaceConfiguration()) {
         self.configuration = configuration
@@ -126,6 +128,9 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
@@ -151,6 +156,9 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await mergeRoot(root, groupID: groupID)
         if let cacheScope {
@@ -176,6 +184,9 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await engine.insertRootsIntoGroup(roots, groupID: groupID)
         let rootIDs = roots.map(\.rootID)
@@ -194,11 +205,52 @@ public actor ScriptMetaKitWorkspace {
         return result
     }
 
+    /// Replaces a complete root group, scans only the requested roots, and returns
+    /// the current combined result for `resultRootIDs` as one non-reentrant operation.
+    public func scanRegisteredRoots(
+        _ roots: [ScriptMetaKitRoot],
+        replacingGroup groupID: String,
+        scanningRootIDs: [String],
+        resultRootIDs: [String],
+        mode: ScriptMetaScanMode,
+        checkUpdates: Bool = false,
+        cacheScope: ScriptMetaCacheScope? = nil,
+        onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
+    ) async throws -> ScriptMetaScanResult {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
+        try await configureEngineIfNeeded()
+        try await replaceRoots(roots, groupID: groupID)
+        if let cacheScope {
+            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: resultRootIDs)
+        }
+        let scannedResult = try await engine.scanRoots(
+            rootIDs: scanningRootIDs,
+            mode: mode,
+            checkUpdates: checkUpdates,
+            onProgress: onProgress
+        )
+        let result: ScriptMetaScanResult
+        if resultRootIDs == scanningRootIDs {
+            result = scannedResult
+        } else {
+            result = try await engine.cachedRoots(rootIDs: resultRootIDs, mode: mode)
+        }
+        if let cacheScope {
+            await savePersistentCache(scope: cacheScope)
+        }
+        return result
+    }
+
     public func cachedScanResult(
         rootIDs: [String],
         mode: ScriptMetaScanMode,
         cacheScope: ScriptMetaCacheScope? = nil
     ) async throws -> ScriptMetaScanResult {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         if let cacheScope {
             await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
@@ -223,6 +275,9 @@ public actor ScriptMetaKitWorkspace {
         insertingIntoGroup groupID: String,
         cacheScope: ScriptMetaCacheScope? = .fileList
     ) async throws -> FileListSnapshot? {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await mergeRoot(root, groupID: groupID)
         if let cacheScope {
@@ -238,6 +293,9 @@ public actor ScriptMetaKitWorkspace {
         rootIDs: [String],
         cacheScope: ScriptMetaCacheScope? = .catalog
     ) async throws -> ScriptMetaCatalogSnapshot? {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
@@ -252,6 +310,9 @@ public actor ScriptMetaKitWorkspace {
         replacingGroup groupID: String,
         cacheScope: ScriptMetaCacheScope? = nil
     ) async throws {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
@@ -260,6 +321,9 @@ public actor ScriptMetaKitWorkspace {
     }
 
     public func setVisibleRoot(_ rootID: String?) async throws {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await engine.setVisibleRoot(rootID)
     }
@@ -272,6 +336,9 @@ public actor ScriptMetaKitWorkspace {
         initialDrainDirtyOnly: Bool = false,
         onChange: @escaping @Sendable () -> Void
     ) async throws {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
@@ -279,7 +346,7 @@ public actor ScriptMetaKitWorkspace {
         }
         try await engine.startWatching(onChange: onChange)
         if drainsInitialChanges {
-            try await drainWatchChanges(dirtyOnly: initialDrainDirtyOnly)
+            try await drainWatchChangesUnlocked(dirtyOnly: initialDrainDirtyOnly)
         }
     }
 
@@ -287,16 +354,33 @@ public actor ScriptMetaKitWorkspace {
         dirtyOnly: Bool = false,
         cacheScope: ScriptMetaCacheScope? = nil
     ) async throws -> ScriptMetaScanResult? {
-        try await configureEngineIfNeeded()
-        let result = try await engine.pollWatchChanges(dirtyOnly: dirtyOnly)
-        if result != nil, let cacheScope {
-            await savePersistentCache(scope: cacheScope)
-        }
-        return result
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
+        return try await pollWatchChangesUnlocked(dirtyOnly: dirtyOnly, cacheScope: cacheScope)
     }
 
     public func drainWatchChanges(
         dirtyOnly: Bool = false,
+        initialDelayMillis: UInt64 = 300,
+        pollingIntervalMillis: UInt64 = 150,
+        idlePollCount: Int = 3,
+        maxPollCount: Int = 20
+    ) async throws {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
+        try await drainWatchChangesUnlocked(
+            dirtyOnly: dirtyOnly,
+            initialDelayMillis: initialDelayMillis,
+            pollingIntervalMillis: pollingIntervalMillis,
+            idlePollCount: idlePollCount,
+            maxPollCount: maxPollCount
+        )
+    }
+
+    private func drainWatchChangesUnlocked(
+        dirtyOnly: Bool,
         initialDelayMillis: UInt64 = 300,
         pollingIntervalMillis: UInt64 = 150,
         idlePollCount: Int = 3,
@@ -310,7 +394,7 @@ public actor ScriptMetaKitWorkspace {
         let allowedPolls = max(requiredIdlePolls, maxPollCount)
         var idlePolls = 0
         for _ in 0..<allowedPolls {
-            if try await pollWatchChanges(dirtyOnly: dirtyOnly) == nil {
+            if try await pollWatchChangesUnlocked(dirtyOnly: dirtyOnly, cacheScope: nil) == nil {
                 idlePolls += 1
                 if idlePolls >= requiredIdlePolls {
                     return
@@ -325,6 +409,8 @@ public actor ScriptMetaKitWorkspace {
     }
 
     public func stopWatching() async {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
         await engine.stopWatching()
     }
 
@@ -333,11 +419,15 @@ public actor ScriptMetaKitWorkspace {
     }
 
     public func shutdown() async {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
         await engine.shutdown()
     }
 
     /// Clears roots, watchers, and in-memory scan/cache state while preserving persistent cache files.
     public func clearVolatileState() async {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
         await engine.shutdown()
         didConfigureEngine = false
         loadedCacheRootIDsByScope.removeAll(keepingCapacity: false)
@@ -348,6 +438,9 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         let result = try await engine.checkUpdate(item: item, onProgress: onProgress)
         if let cacheScope {
@@ -361,6 +454,9 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
+        await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
         try await configureEngineIfNeeded()
         let result = try await engine.checkUpdates(items: items, onProgress: onProgress)
         if let cacheScope {
@@ -412,6 +508,36 @@ public actor ScriptMetaKitWorkspace {
             cacheStore.enforceSizeLimit(scope: scope)
         } catch {
             return
+        }
+    }
+
+    private func pollWatchChangesUnlocked(
+        dirtyOnly: Bool,
+        cacheScope: ScriptMetaCacheScope?
+    ) async throws -> ScriptMetaScanResult? {
+        try await configureEngineIfNeeded()
+        let result = try await engine.pollWatchChanges(dirtyOnly: dirtyOnly)
+        if result != nil, let cacheScope {
+            await savePersistentCache(scope: cacheScope)
+        }
+        return result
+    }
+
+    private func enterExclusiveOperation() async {
+        if hasExclusiveOperation == false {
+            hasExclusiveOperation = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            exclusiveOperationWaiters.append(continuation)
+        }
+    }
+
+    private func leaveExclusiveOperation() {
+        if exclusiveOperationWaiters.isEmpty {
+            hasExclusiveOperation = false
+        } else {
+            exclusiveOperationWaiters.removeFirst().resume()
         }
     }
 }

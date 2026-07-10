@@ -27,22 +27,23 @@ pub use core::{
     ScriptMetaKitResult, ScriptMetadata, ScriptRuntimeKind, VersionOrdering, compare_versions,
     decode_script_text, decode_script_text_strict, normalize_metadata_url,
     normalize_version_string, parse_distribution_metadata, parse_distribution_metadata_for_script,
-    parse_distribution_metadata_records, parse_script_metadata,
+    parse_distribution_metadata_records, parse_script_metadata, parse_script_metadata_with_options,
 };
 pub use editkit::{
-    DEFAULT_SCRIPT_METADATA_PREVIEW_BYTES, DistributionMetadataDraft, ScriptIdDuplicate,
-    ScriptIdUniquenessItem, ScriptIdUniquenessReport, ScriptMetaBackupGeneration,
-    ScriptMetaBackupOptions, ScriptMetaBackupReason, ScriptMetaBackupRecord,
-    ScriptMetaCommentStyle, ScriptMetaWriteMode, ScriptMetaWriteOperation, ScriptMetadataDraft,
-    ScriptMetadataEditPreviewResult, ScriptMetadataEditReadResult, ScriptMetadataFileWriteResult,
-    ScriptMetadataTextWriteResult, append_script_metadata_to_file, append_script_metadata_to_text,
-    clear_scriptmeta_backups, create_scriptmeta_backup, generate_edit_password_sha256,
-    is_valid_edit_password_sha256, read_script_metadata_draft_from_file,
-    read_script_metadata_draft_from_text, read_script_metadata_edit_preview_from_file,
-    render_distribution_metadata_block, render_script_metadata_block,
-    render_script_metadata_for_style, reset_scriptmeta_backups_with_current_as_initial,
-    restore_scriptmeta_backup, scriptmeta_backup_generations, validate_script_id_uniqueness,
-    verify_edit_password_sha256, write_script_metadata_to_file, write_script_metadata_to_text,
+    DEFAULT_SCRIPT_METADATA_PREVIEW_BYTES, DistributionMetadataDraft,
+    MAX_SCRIPT_METADATA_PREVIEW_BYTES, ScriptIdDuplicate, ScriptIdUniquenessItem,
+    ScriptIdUniquenessReport, ScriptMetaBackupGeneration, ScriptMetaBackupOptions,
+    ScriptMetaBackupReason, ScriptMetaBackupRecord, ScriptMetaCommentStyle, ScriptMetaWriteMode,
+    ScriptMetaWriteOperation, ScriptMetadataDraft, ScriptMetadataEditPreviewResult,
+    ScriptMetadataEditReadResult, ScriptMetadataFileWriteResult, ScriptMetadataTextWriteResult,
+    append_script_metadata_to_file, append_script_metadata_to_text, clear_scriptmeta_backups,
+    create_scriptmeta_backup, generate_edit_password_sha256, is_valid_edit_password_sha256,
+    read_script_metadata_draft_from_file, read_script_metadata_draft_from_text,
+    read_script_metadata_edit_preview_from_file, render_distribution_metadata_block,
+    render_script_metadata_block, render_script_metadata_for_style,
+    reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
+    scriptmeta_backup_generations, validate_script_id_uniqueness, verify_edit_password_sha256,
+    write_script_metadata_to_file, write_script_metadata_to_text,
 };
 pub use engine::ScriptMetaKitEngine;
 pub use formats::{
@@ -54,7 +55,7 @@ pub use formats::{
 pub use resolver::{DistributionResolver, DistributionResolverOptions, UpdateResolver};
 pub use scanner::{
     ExtensionPolicy, FileSystemEntry, PathKind, PathResolutionStatus, RootPreflightOptions,
-    ScannerOptions, can_read_directory_contents,
+    ScannablePathResolution, ScannerOptions, can_read_directory_contents, resolve_registered_path,
 };
 pub use storage::{CachePayload, CacheSchema, load_cache_payload, save_cache_payload};
 #[cfg(feature = "native-watch")]
@@ -97,6 +98,6 @@ mod tests {
     #[test]
     fn exposes_package_metadata() {
         assert_eq!(package_name(), "scriptmetakit");
-        assert_eq!(package_version(), "1.0.8");
+        assert_eq!(package_version(), "1.0.9");
     }
 }

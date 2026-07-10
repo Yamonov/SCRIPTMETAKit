@@ -140,6 +140,20 @@ pub(crate) fn scan_file_list_root_controlled(
         options,
         Some(extensions),
     );
+    if root_resolution.is_unfollowed_symlink() {
+        root.status = RootStatus::Unreadable;
+        root.error = Some(RootError {
+            code: "symlink_following_disabled".to_string(),
+            message: "root is a symlink and symlink following is disabled".to_string(),
+        });
+        return DirectoryScanOutput {
+            root,
+            children: Vec::new(),
+            directory_states: state.directory_states,
+            truncated: false,
+            change_summary: None,
+        };
+    }
     let root_metadata = match fs::metadata(&root_resolution.resolved_path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -190,6 +204,9 @@ pub(crate) fn scan_file_list_root_controlled(
             RootStatus::Cancelled
         } else if state.timed_out {
             RootStatus::TimedOut
+        } else if state.truncated {
+            root.error = Some(scan_limit_root_error());
+            RootStatus::Overflowed
         } else {
             RootStatus::Ready
         };
@@ -346,10 +363,22 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
     } else {
         root.status = if timed_out {
             RootStatus::TimedOut
+        } else if truncated {
+            root.error = Some(scan_limit_root_error());
+            RootStatus::Overflowed
         } else {
             RootStatus::Ready
         };
-        root.error = None;
+        if root.status == RootStatus::Ready {
+            root.error = None;
+        }
+    }
+    if root.status != RootStatus::Ready {
+        children = previous_children.clone();
+        directory_states = previous_snapshot.directory_states.clone();
+        truncated = previous_snapshot.truncated;
+        root.item_count = count_entries(&children);
+        root.is_dirty = true;
     }
 
     DirectoryScanOutput {
@@ -397,6 +426,9 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
 
     let previous_dirty_entries =
         clone_dirty_directory_entries(previous_children, &dirty_directories);
+    let fallback_children = previous_children.clone();
+    let fallback_directory_states = previous_snapshot.directory_states.clone();
+    let fallback_truncated = previous_snapshot.truncated;
     let mut children = previous_snapshot.children.take().unwrap_or_default();
     let mut directory_states = previous_snapshot.directory_states;
     let mut truncated = previous_snapshot.truncated;
@@ -447,16 +479,8 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
     }
     sort_entries(&mut children);
 
-    let current_dirty_entries = clone_dirty_directory_entries(&children, &dirty_directories);
     let mut root = previous_snapshot.root;
-    let change_summary = diff_file_entry_sets(
-        &root.root_id,
-        &previous_dirty_entries,
-        &current_dirty_entries,
-    );
-    root.item_count = count_entries(&children);
     root.last_loaded_at = Some(now_timestamp_millis());
-    root.is_dirty = false;
     if let Some(error) = root_error {
         root.status = RootStatus::Unreadable;
         root.error = Some(error);
@@ -466,11 +490,33 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
     } else {
         root.status = if timed_out {
             RootStatus::TimedOut
+        } else if truncated {
+            root.error = Some(scan_limit_root_error());
+            RootStatus::Overflowed
         } else {
             RootStatus::Ready
         };
-        root.error = None;
+        if root.status == RootStatus::Ready {
+            root.error = None;
+        }
     }
+
+    let change_summary = if root.status == RootStatus::Ready {
+        root.is_dirty = false;
+        let current_dirty_entries = clone_dirty_directory_entries(&children, &dirty_directories);
+        diff_file_entry_sets(
+            &root.root_id,
+            &previous_dirty_entries,
+            &current_dirty_entries,
+        )
+    } else {
+        root.is_dirty = true;
+        children = fallback_children;
+        directory_states = fallback_directory_states;
+        truncated = fallback_truncated;
+        ScanChangeSummary::default()
+    };
+    root.item_count = count_entries(&children);
 
     Ok(DirectoryScanOutput {
         root,
@@ -606,6 +652,11 @@ fn scan_directory(
             state.options,
             Some(state.extensions),
         );
+        if resolved.is_unfollowed_symlink() {
+            children.push(resolution_error_entry(resolved));
+            state.visited_nodes += 1;
+            continue;
+        }
         if should_include_resolution_error(&resolved) {
             children.push(resolution_error_entry(resolved));
             state.visited_nodes += 1;
@@ -898,6 +949,13 @@ fn cancelled_root_error() -> RootError {
     RootError {
         code: "operation_cancelled".to_string(),
         message: "operation was cancelled".to_string(),
+    }
+}
+
+fn scan_limit_root_error() -> RootError {
+    RootError {
+        code: "scan_limit_exceeded".to_string(),
+        message: "file list scan reached a configured depth or node limit".to_string(),
     }
 }
 

@@ -23,7 +23,8 @@ let package = Package(
         ),
         .testTarget(
             name: "ScriptMetaKitTests",
-            dependencies: ["ScriptMetaKit"]
+            dependencies: ["ScriptMetaKit"],
+            path: "tests/ScriptMetaKitTests"
         )
     ]
 )

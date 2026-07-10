@@ -2,9 +2,65 @@ import XCTest
 import ScriptMetaKit
 
 final class ScriptMetaKitAPITests: XCTestCase {
+    func testParentTaskCancellationStopsAnActiveScan() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitCancellation-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in 0..<4_000 {
+            try "alert(\(index));\n".write(
+                to: root.appendingPathComponent("script-\(index).jsx"),
+                atomically: false,
+                encoding: .utf8
+            )
+        }
+
+        let engine = ScriptMetaKitEngine()
+        let scanTask = Task {
+            try await engine.scan(folderURL: root, checkUpdates: false)
+        }
+        try await Task.sleep(nanoseconds: 1_000_000)
+        scanTask.cancel()
+
+        do {
+            _ = try await scanTask.value
+            XCTFail("cancelled parent task returned a scan result")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
+
+    func testRegisteredPathResolutionUsesThePublicSwiftWrapper() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitPathResolution-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("target.jsx")
+        let link = root.appendingPathComponent("alias.jsx")
+        try "alert('target');\n".write(to: target, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let followed = try XCTUnwrap(
+            ScriptMetaScriptFilePolicy.resolveRegisteredPath(link, followSymlinks: true)
+        )
+        XCTAssertEqual(followed.pathKind, "symlink")
+        XCTAssertEqual(followed.resolutionStatus, "resolved")
+        XCTAssertEqual(
+            followed.resolvedURL.resolvingSymlinksInPath(),
+            target.resolvingSymlinksInPath()
+        )
+
+        let unfollowed = try XCTUnwrap(
+            ScriptMetaScriptFilePolicy.resolveRegisteredPath(link, followSymlinks: false)
+        )
+        XCTAssertEqual(unfollowed.pathKind, "symlink")
+        XCTAssertEqual(unfollowed.resolutionStatus, "not_requested")
+        XCTAssertEqual(unfollowed.resolvedURL.standardizedFileURL, link.standardizedFileURL)
+    }
+
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.8")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.9")
     }
 
     func testVersionAndEditPasswordUtilityAPIsArePublic() throws {
@@ -333,6 +389,23 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertFalse(result.fileStateFingerprint.isEmpty)
     }
 
+    func testReadScriptMetadataEditPreviewRejectsNegativeLimit() async throws {
+        let script = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitNegativePreview-\(UUID().uuidString).jsx")
+        try "alert('x');\n".write(to: script, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: script) }
+
+        do {
+            _ = try await ScriptMetaKitEngine().readScriptMetadataEditPreview(
+                fileURL: script,
+                maxBytes: -1
+            )
+            XCTFail("negative maxBytes must fail")
+        } catch let ScriptMetaKitError.operationFailed(status, _) {
+            XCTAssertEqual(status, 3)
+        }
+    }
+
     func testReadCompiledScriptMetadataEditPreviewThroughSwiftAPI() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitAPITests-\(UUID().uuidString)", isDirectory: true)
@@ -423,6 +496,78 @@ final class ScriptMetaKitAPITests: XCTestCase {
             cacheScope: .catalog
         )
         XCTAssertEqual(cached?.allItems.map(\.scriptID), ["com.example.swiftapi.clearvolatile"])
+    }
+
+    func testWorkspaceSerializesConcurrentReplacementScansForTheSameGroup() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitWorkspaceRace-\(UUID().uuidString)", isDirectory: true)
+        let directoryA = root.appendingPathComponent("A", isDirectory: true)
+        let directoryB = root.appendingPathComponent("B", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: directoryB, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.a\n// SCRIPTMETA-END\n"
+            .write(to: directoryA.appendingPathComponent("A.jsx"), atomically: true, encoding: .utf8)
+        try "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.b\n// SCRIPTMETA-END\n"
+            .write(to: directoryB.appendingPathComponent("B.jsx"), atomically: true, encoding: .utf8)
+
+        let workspace = ScriptMetaKitWorkspace()
+        let rootA = ScriptMetaKitRoot(rootID: "A", url: directoryA)
+        let rootB = ScriptMetaKitRoot(rootID: "B", url: directoryB)
+        async let resultA = workspace.scanRoots(
+            [rootA],
+            replacingGroup: "shared",
+            rootIDs: ["A"],
+            mode: .metadataOnly
+        )
+        async let resultB = workspace.scanRoots(
+            [rootB],
+            replacingGroup: "shared",
+            rootIDs: ["B"],
+            mode: .metadataOnly
+        )
+
+        let (scanA, scanB) = try await (resultA, resultB)
+        XCTAssertEqual(scanA.roots.map(\.rootID), ["A"])
+        XCTAssertEqual(scanB.roots.map(\.rootID), ["B"])
+        XCTAssertEqual(scanA.allItems.map(\.scriptID), ["com.example.a"])
+        XCTAssertEqual(scanB.allItems.map(\.scriptID), ["com.example.b"])
+    }
+
+    func testWorkspaceCompositePartialScanReturnsTheCompleteRegisteredCatalog() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitCompositeScan-\(UUID().uuidString)", isDirectory: true)
+        let directoryA = root.appendingPathComponent("A", isDirectory: true)
+        let directoryB = root.appendingPathComponent("B", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: directoryB, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.a\n// SCRIPTMETA-END\n"
+            .write(to: directoryA.appendingPathComponent("A.jsx"), atomically: true, encoding: .utf8)
+        try "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.b\n// SCRIPTMETA-END\n"
+            .write(to: directoryB.appendingPathComponent("B.jsx"), atomically: true, encoding: .utf8)
+
+        let workspace = ScriptMetaKitWorkspace()
+        let roots = [
+            ScriptMetaKitRoot(rootID: "A", url: directoryA),
+            ScriptMetaKitRoot(rootID: "B", url: directoryB),
+        ]
+        _ = try await workspace.scanRoots(
+            roots,
+            replacingGroup: "registered",
+            rootIDs: ["A", "B"],
+            mode: .metadataOnly
+        )
+        let result = try await workspace.scanRegisteredRoots(
+            roots,
+            replacingGroup: "registered",
+            scanningRootIDs: ["A"],
+            resultRootIDs: ["A", "B"],
+            mode: .metadataOnly
+        )
+
+        XCTAssertEqual(Set(result.roots.map(\.rootID)), Set(["A", "B"]))
+        XCTAssertEqual(Set(result.allItems.map(\.scriptID)), Set(["com.example.a", "com.example.b"]))
     }
 
     func testDirtyOnlyWatchPollReturnsAffectedRootSnapshot() async throws {

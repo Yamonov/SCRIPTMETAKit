@@ -33,6 +33,8 @@ use scriptmetakit_ffi::{
     smk_scan_result_update_statuses, smk_validate_edit_password_sha256_format,
     smk_validate_version_string,
 };
+#[cfg(unix)]
+use scriptmetakit_ffi::{SmkPathResolution, smk_resolve_registered_path};
 #[cfg(feature = "native-watch")]
 use scriptmetakit_ffi::{
     smk_engine_poll_watcher_scan, smk_engine_poll_watcher_scan_dirty_only,
@@ -100,6 +102,46 @@ fn exposes_version_and_edit_password_utility_functions() {
         SmkStatus::Ok
     );
     assert_eq!(is_valid, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn resolves_registered_symlink_paths_through_the_public_ffi() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let target = directory.path().join("target.jsx");
+    let link = directory.path().join("alias.jsx");
+    std::fs::write(&target, "alert('target');\n").expect("target");
+    symlink(&target, &link).expect("symlink");
+    let mut resolution = SmkPathResolution::default();
+
+    // SAFETY: the path slice and out pointer remain valid for this call.
+    assert_eq!(
+        unsafe {
+            smk_resolve_registered_path(utf8_slice(&link.to_string_lossy()), 1, 1, &mut resolution)
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(utf8(resolution.path_kind), "symlink");
+    assert_eq!(utf8(resolution.resolution_status), "resolved");
+    assert_eq!(
+        utf8(resolution.resolved_path),
+        std::fs::canonicalize(&target)
+            .expect("canonical target")
+            .to_string_lossy()
+    );
+
+    // SAFETY: the path slice and out pointer remain valid for this call.
+    assert_eq!(
+        unsafe {
+            smk_resolve_registered_path(utf8_slice(&link.to_string_lossy()), 0, 1, &mut resolution)
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(utf8(resolution.path_kind), "symlink");
+    assert_eq!(utf8(resolution.resolution_status), "not_requested");
+    assert_eq!(utf8(resolution.resolved_path), link.to_string_lossy());
 }
 
 #[test]
@@ -332,6 +374,34 @@ fn reads_script_metadata_edit_preview_through_ffi() {
         smk_edit_result_free(edit_result);
         smk_engine_free(engine);
     }
+}
+
+#[test]
+fn rejects_oversized_script_metadata_preview_limit_through_ffi() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("PreviewLimit.jsx");
+    std::fs::write(&script_path, "alert('x');\n").expect("script");
+
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    let path = script_path.to_string_lossy().into_owned();
+    let mut edit_result: *mut SmkEditResult = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            smk_engine_read_script_metadata_edit_preview_file(
+                engine,
+                utf8_slice(&path),
+                usize::MAX,
+                &mut edit_result,
+            )
+        },
+        SmkStatus::InvalidArgument
+    );
+    assert!(edit_result.is_null());
+    unsafe { smk_engine_free(engine) };
 }
 
 #[test]
@@ -977,6 +1047,60 @@ SCRIPTMETA-DIST-END
 }
 
 #[test]
+fn progress_callback_can_cancel_the_active_ffi_operation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dist_path = temp.path().join("SCRIPTMETA.txt");
+    let dist_url = url::Url::from_file_path(&dist_path).expect("file url");
+    std::fs::write(
+        temp.path().join("Example.jsx"),
+        format!(
+            "// SCRIPTMETA-BEGIN\n// Script-ID: com.example.ffi.cancel\n// Version: 1.0.0\n// Meta-URL: {dist_url}\n// SCRIPTMETA-END\n"
+        ),
+    )
+    .expect("script");
+    std::fs::write(
+        &dist_path,
+        "SCRIPTMETA-DIST-BEGIN\nScript-ID: com.example.ffi.cancel\nLatest-Version: 2.0.0\nSCRIPTMETA-DIST-END\n",
+    )
+    .expect("dist");
+
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    let path = temp.path().to_string_lossy().into_owned();
+    let path_slice = utf8_slice(&path);
+    let mut context = CancelProgressContext {
+        engine,
+        phases: Vec::new(),
+    };
+    let mut scan_result: *mut SmkScanResult = ptr::null_mut();
+
+    assert_eq!(
+        unsafe {
+            smk_engine_scan_folders_with_progress(
+                engine,
+                &path_slice,
+                1,
+                1,
+                Some(cancel_from_progress),
+                (&mut context as *mut CancelProgressContext).cast::<c_void>(),
+                &mut scan_result,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert!(!scan_result.is_null());
+    assert!(context.phases.iter().any(|phase| phase == "started"));
+
+    unsafe {
+        smk_scan_result_free(scan_result);
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
 fn reports_file_changes_through_reused_engine() {
     let temp = tempfile::tempdir().expect("tempdir");
     let removed_path = temp.path().join("Removed.jsx");
@@ -1589,4 +1713,25 @@ extern "C" fn collect_progress_phase(progress: *const SmkUpdateProgress, context
     let progress = unsafe { &*progress };
     phases.push(utf8(progress.phase));
     assert!(progress.completed_items <= progress.total_items);
+}
+
+struct CancelProgressContext {
+    engine: *mut SmkEngine,
+    phases: Vec<String>,
+}
+
+extern "C" fn cancel_from_progress(progress: *const SmkUpdateProgress, context: *mut c_void) {
+    if progress.is_null() || context.is_null() {
+        return;
+    }
+    let context = unsafe { &mut *context.cast::<CancelProgressContext>() };
+    let progress = unsafe { &*progress };
+    let phase = utf8(progress.phase);
+    context.phases.push(phase.clone());
+    if phase == "started" {
+        assert_eq!(
+            unsafe { smk_engine_cancel_current_operation(context.engine) },
+            SmkStatus::Ok
+        );
+    }
 }

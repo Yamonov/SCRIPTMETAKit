@@ -24,6 +24,20 @@ fn default_config_sets_scan_and_update_timeouts() {
 }
 
 #[test]
+fn disabled_update_check_stops_before_resolver_creation() {
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "DisabledUpdateCheck");
+    config.update_check.enabled = false;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+
+    let error = pollster::block_on(
+        engine.check_updates(scriptmetakit::UpdateCheckRequest { items: Vec::new() }),
+    )
+    .expect_err("disabled update check");
+
+    assert!(error.to_string().contains("update checking is disabled"));
+}
+
+#[test]
 fn parses_script_metadata_without_replacing_name() {
     let metadata = scriptmetakit::parse_script_metadata(
         r#"
@@ -313,6 +327,64 @@ fn scans_metadata_and_file_list() {
             .as_deref(),
         Some("Example Script")
     );
+}
+
+#[test]
+fn config_parser_options_control_metadata_scan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("ParserOptions.jsx");
+    let source = format!(
+        "// {}\n// SCRIPTMETA-BEGIN\n// Script-ID: com.example.parser-options\n",
+        "padding".repeat(32)
+    );
+    std::fs::write(&script_path, source).expect("script");
+    let root = scriptmetakit::RootRegistration {
+        root_id: "scripts".into(),
+        path: temp.path().to_path_buf(),
+        display_name: Some("Scripts".into()),
+        purpose: scriptmetakit::RootPurpose::MetadataCatalog,
+        watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
+        cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+        refresh_policy: scriptmetakit::RefreshPolicy::OnFileEvent,
+        priority: scriptmetakit::RootPriority::UserInitiated,
+    };
+
+    let mut strict_config = scriptmetakit::ScriptMetaKitConfig::new("Test", "ParserStrict");
+    strict_config.scanner.max_prefix_bytes = 4096;
+    strict_config.parser.max_prefix_bytes = 64;
+    strict_config.parser.require_closed_block = false;
+    let mut strict_engine =
+        scriptmetakit::ScriptMetaKitEngine::new(strict_config).expect("strict engine");
+    strict_engine.set_roots(vec![root.clone()]).expect("roots");
+    let short_prefix = strict_engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("short prefix scan");
+    assert!(
+        short_prefix
+            .catalog_snapshot
+            .expect("short prefix catalog")
+            .all_items
+            .is_empty()
+    );
+
+    let mut permissive_config = scriptmetakit::ScriptMetaKitConfig::new("Test", "ParserPermissive");
+    permissive_config.scanner.max_prefix_bytes = 64;
+    permissive_config.parser.max_prefix_bytes = 4096;
+    permissive_config.parser.require_closed_block = false;
+    let mut permissive_engine =
+        scriptmetakit::ScriptMetaKitEngine::new(permissive_config).expect("permissive engine");
+    permissive_engine.set_roots(vec![root]).expect("roots");
+    let full_prefix = permissive_engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("full prefix scan");
+    let catalog = full_prefix.catalog_snapshot.expect("full prefix catalog");
+    let items = &catalog.all_items;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].script_id, "com.example.parser-options");
 }
 
 #[test]
@@ -1718,6 +1790,73 @@ fn skips_macos_alias_script_when_resolution_is_disabled() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn follow_symlinks_false_never_scans_root_directory_or_file_targets() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let external = tempfile::tempdir().expect("external");
+    std::fs::write(
+        external.path().join("External.jsx"),
+        "/*\nSCRIPTMETA-BEGIN\nScript-ID=com.example.external\nSCRIPTMETA-END\n*/\n",
+    )
+    .expect("external script");
+
+    let linked_root = temp.path().join("LinkedRoot");
+    symlink(external.path(), &linked_root).expect("root symlink");
+
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "NoSymlinks");
+    config.scanner.follow_symlinks = false;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config.clone()).expect("engine");
+    let root_result = engine
+        .scan_root_paths(
+            vec![linked_root],
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        )
+        .expect("root scan");
+    assert_eq!(
+        root_result.roots[0].status,
+        scriptmetakit::RootStatus::Unreadable
+    );
+    assert!(
+        root_result
+            .catalog_snapshot
+            .as_ref()
+            .is_none_or(|catalog| catalog.all_items.is_empty())
+    );
+
+    let registered_root = temp.path().join("Registered");
+    std::fs::create_dir(&registered_root).expect("registered root");
+    symlink(external.path(), registered_root.join("LinkedDirectory")).expect("directory symlink");
+    symlink(
+        external.path().join("External.jsx"),
+        registered_root.join("LinkedFile.jsx"),
+    )
+    .expect("file symlink");
+
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let nested_result = engine
+        .scan_root_paths(
+            vec![registered_root],
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        )
+        .expect("nested scan");
+    assert!(
+        nested_result
+            .catalog_snapshot
+            .as_ref()
+            .is_none_or(|catalog| catalog.all_items.is_empty())
+    );
+    let entries = nested_result.flattened_file_entries();
+    assert_eq!(
+        entries
+            .filter(|entry| entry.path_kind == scriptmetakit::PathKind::Symlink)
+            .count(),
+        2
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn reports_macos_alias_directory_cycle_without_descending() {
@@ -2032,6 +2171,87 @@ alert('first updated');
             .all_items
             .iter()
             .find(|item| item.script_id == "com.example.first")
+            .and_then(|item| item.version.as_deref()),
+        Some("1.0.1")
+    );
+}
+
+#[test]
+fn interrupted_dirty_refresh_keeps_old_catalog_and_retries_without_a_new_event() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let scripts = temp.path().join("Scripts");
+    std::fs::create_dir(&scripts).expect("scripts directory");
+    let script = scripts.join("Example.jsx");
+    std::fs::write(
+        &script,
+        "// SCRIPTMETA-BEGIN\n// Script-ID: com.example.retry\n// Version: 1.0.0\n// SCRIPTMETA-END\n",
+    )
+    .expect("initial script");
+
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "DirtyRetry"),
+    )
+    .expect("engine");
+    engine
+        .scan_root_paths(
+            vec![temp.path().to_path_buf()],
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        )
+        .expect("initial scan");
+
+    std::fs::write(
+        &script,
+        "// SCRIPTMETA-BEGIN\n// Script-ID: com.example.retry\n// Version: 1.0.1\n// SCRIPTMETA-END\n",
+    )
+    .expect("updated script");
+    engine
+        .mark_changed_paths(scriptmetakit::RawChangeBatch {
+            paths: vec![script],
+            overflowed: false,
+        })
+        .expect("mark changed");
+    engine.config_mut().scanner.max_nodes_per_root = 0;
+
+    let interrupted = engine
+        .refresh_dirty_roots(scriptmetakit::RefreshRequest {
+            mode: scriptmetakit::ScanMode::FileListAndMetadata,
+        })
+        .expect("interrupted refresh");
+    assert_eq!(
+        interrupted.operation.status,
+        scriptmetakit::OperationStatus::Partial
+    );
+    assert!(
+        interrupted
+            .roots
+            .iter()
+            .any(|root| { root.status == scriptmetakit::RootStatus::Overflowed && root.is_dirty })
+    );
+    assert_eq!(
+        interrupted
+            .catalog_snapshot
+            .as_ref()
+            .and_then(|catalog| catalog.all_items.first())
+            .and_then(|item| item.version.as_deref()),
+        Some("1.0.0")
+    );
+
+    engine.config_mut().scanner.max_nodes_per_root = 10_000;
+    let retried = engine
+        .refresh_dirty_roots(scriptmetakit::RefreshRequest {
+            mode: scriptmetakit::ScanMode::FileListAndMetadata,
+        })
+        .expect("retry");
+    assert_eq!(
+        retried.operation.status,
+        scriptmetakit::OperationStatus::Finished
+    );
+    assert!(retried.roots.iter().all(|root| !root.is_dirty));
+    assert_eq!(
+        retried
+            .catalog_snapshot
+            .as_ref()
+            .and_then(|catalog| catalog.all_items.first())
             .and_then(|item| item.version.as_deref()),
         Some("1.0.1")
     );
@@ -2442,6 +2662,63 @@ fn reads_script_metadata_edit_draft_with_unknown_lines() {
         scriptmetakit::ScriptMetaCommentStyle::JavaScriptBlock
     );
     assert!(!result.source_fingerprint.is_empty());
+}
+
+#[test]
+fn reads_script_metadata_inside_jsdoc_header() {
+    let source = "/**\n * Illustrator Ruby GUI Script\n * 使い方:\n * 1. テキストフレームを選択\n \n\nSCRIPTMETA-BEGIN\nScript-ID=local.yamo.Illustrator_Ruby_GUI_2y0r4yzmq57t\nName=Illustratorでルビを振る\nDescription=https://github.com/akiyo-as/illustrator_ruby_GUI\nSCRIPTMETA-END\n\n*/\nalert('x');\n";
+
+    let metadata = scriptmetakit::parse_script_metadata(source).expect("metadata");
+    assert_eq!(
+        metadata.script_id,
+        "local.yamo.Illustrator_Ruby_GUI_2y0r4yzmq57t"
+    );
+    assert_eq!(metadata.name.as_deref(), Some("Illustratorでルビを振る"));
+    assert_eq!(
+        metadata.description.as_deref(),
+        Some("https://github.com/akiyo-as/illustrator_ruby_GUI")
+    );
+
+    let draft = scriptmetakit::read_script_metadata_draft_from_text(
+        source,
+        std::path::Path::new("Illustrator Ruby GUI.jsx"),
+    )
+    .expect("read draft");
+    assert!(draft.has_existing_block);
+    assert_eq!(
+        draft.draft.script_id,
+        "local.yamo.Illustrator_Ruby_GUI_2y0r4yzmq57t"
+    );
+}
+
+#[test]
+fn scans_script_metadata_inside_jsdoc_header() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("Illustrator Ruby GUI.jsx");
+    std::fs::write(
+        &script_path,
+        "/**\n * Illustrator Ruby GUI Script\n * 使い方:\n \n\nSCRIPTMETA-BEGIN\nScript-ID=local.yamo.Illustrator_Ruby_GUI_2y0r4yzmq57t\nName=Illustratorでルビを振る\nDescription=https://github.com/akiyo-as/illustrator_ruby_GUI\nSCRIPTMETA-END\n\n*/\nalert('x');\n",
+    )
+    .expect("write script");
+
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "JSDoc"),
+    )
+    .expect("engine");
+    let result = engine
+        .scan_root_paths(
+            vec![temp.path().to_path_buf()],
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        )
+        .expect("scan");
+    let catalog = result.catalog_snapshot.expect("catalog");
+    let items = &catalog.all_items;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].script_id,
+        "local.yamo.Illustrator_Ruby_GUI_2y0r4yzmq57t"
+    );
+    assert_eq!(items[0].name.as_deref(), Some("Illustratorでルビを振る"));
 }
 
 #[test]

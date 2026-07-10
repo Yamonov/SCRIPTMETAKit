@@ -431,6 +431,7 @@ impl ScriptMetaKitEngine {
                         .iter()
                         .map(|index| &self.roots[*index]),
                     &self.config.scanner,
+                    &self.config.parser,
                     &self.config.supported_extensions,
                     previous_cache,
                     dirty_directories.as_ref(),
@@ -546,7 +547,13 @@ impl ScriptMetaKitEngine {
         };
         self.enforce_memory_node_limit();
         for root_id in &root_ids {
-            self.dirty_roots.remove(root_id);
+            if self
+                .root_snapshots
+                .get(root_id)
+                .is_some_and(|root| matches!(root.status, RootStatus::Ready | RootStatus::Missing))
+            {
+                self.dirty_roots.remove(root_id);
+            }
         }
         self.touch_memory_cache_if_needed();
 
@@ -805,6 +812,11 @@ impl ScriptMetaKitEngine {
         cache_mode: UpdateCheckCacheMode,
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.begin_operation();
+        if !self.config.update_check.enabled {
+            return Err(ScriptMetaKitError::InvalidConfig(
+                "update checking is disabled".to_string(),
+            ));
+        }
         let checked_at = now_timestamp_millis();
         let mut result = UpdateCheckResult {
             checked_at,
@@ -1836,11 +1848,9 @@ fn merged_root_purpose(lhs: RootPurpose, rhs: RootPurpose) -> RootPurpose {
     if lhs == RootPurpose::FileListAndMetadata || rhs == RootPurpose::FileListAndMetadata {
         return RootPurpose::FileListAndMetadata;
     }
-    if matches!(
-        (lhs, rhs),
-        (RootPurpose::FileList, RootPurpose::MetadataCatalog)
-            | (RootPurpose::MetadataCatalog, RootPurpose::FileList)
-    ) {
+    if (lhs.includes_file_list() || rhs.includes_file_list())
+        && (lhs.includes_metadata() || rhs.includes_metadata())
+    {
         return RootPurpose::FileListAndMetadata;
     }
     rhs
@@ -2094,6 +2104,11 @@ fn scan_operation_summary(roots: &[RootSnapshot]) -> OperationSummary {
         OperationSummary::cancelled(total, completed, failed)
     } else if roots.iter().any(|root| root.status == RootStatus::TimedOut) {
         OperationSummary::timed_out(total, completed, failed)
+    } else if roots
+        .iter()
+        .any(|root| matches!(root.status, RootStatus::Overflowed | RootStatus::Unreadable))
+    {
+        OperationSummary::partial(total, completed, failed)
     } else {
         OperationSummary::finished(total, completed, failed)
     }
@@ -2685,7 +2700,7 @@ mod tests {
 
     use super::{
         apply_metadata_capabilities_to_file_list_snapshots, decode_all_cache_data,
-        update_work_groups,
+        merged_root_purpose, update_work_groups,
     };
     use crate::{
         RootId,
@@ -2742,6 +2757,18 @@ mod tests {
             .expect("remove file list roots");
 
         assert_eq!(engine.roots(), &[metadata_root]);
+    }
+
+    #[test]
+    fn root_purpose_merge_preserves_file_list_and_update_metadata_in_both_orders() {
+        assert_eq!(
+            merged_root_purpose(RootPurpose::FileList, RootPurpose::UpdateCheck),
+            RootPurpose::FileListAndMetadata
+        );
+        assert_eq!(
+            merged_root_purpose(RootPurpose::UpdateCheck, RootPurpose::FileList),
+            RootPurpose::FileListAndMetadata
+        );
     }
 
     #[test]

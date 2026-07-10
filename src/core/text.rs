@@ -39,6 +39,10 @@ pub fn decode_script_text_strict(bytes: &[u8]) -> Option<Cow<'_, str>> {
         return decode_script_text_with_encoding(bytes).map(|decoded| Cow::Owned(decoded.text));
     }
 
+    if let Some(decoded) = decode_bomless_utf16_text(bytes) {
+        return Some(Cow::Owned(decoded.text));
+    }
+
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Some(Cow::Borrowed(text));
     }
@@ -68,6 +72,10 @@ pub fn decode_script_text_with_encoding(bytes: &[u8]) -> Option<DecodedScriptTex
         return decode_with_encoding(UTF_16BE, &bytes[2..], ScriptTextEncoding::Utf16BigEndianBom);
     }
 
+    if let Some(decoded) = decode_bomless_utf16_text(bytes) {
+        return Some(decoded);
+    }
+
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Some(DecodedScriptText {
             text: text.to_string(),
@@ -78,6 +86,31 @@ pub fn decode_script_text_with_encoding(bytes: &[u8]) -> Option<DecodedScriptTex
     decode_legacy_japanese_text(bytes)
         .or_else(|| decode_with_encoding(UTF_16LE, bytes, ScriptTextEncoding::Utf16LittleEndian))
         .or_else(|| decode_with_encoding(UTF_16BE, bytes, ScriptTextEncoding::Utf16BigEndian))
+}
+
+fn decode_bomless_utf16_text(bytes: &[u8]) -> Option<DecodedScriptText> {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let sampled_pairs = bytes.len().min(1024) / 2;
+    let mut even_zeroes = 0usize;
+    let mut odd_zeroes = 0usize;
+    for pair in bytes[..sampled_pairs * 2].chunks_exact(2) {
+        even_zeroes += usize::from(pair[0] == 0);
+        odd_zeroes += usize::from(pair[1] == 0);
+    }
+
+    let likely_little_endian =
+        odd_zeroes * 4 >= sampled_pairs * 3 && even_zeroes * 4 <= sampled_pairs;
+    let likely_big_endian = even_zeroes * 4 >= sampled_pairs * 3 && odd_zeroes * 4 <= sampled_pairs;
+    if likely_little_endian {
+        decode_with_encoding(UTF_16LE, bytes, ScriptTextEncoding::Utf16LittleEndian)
+    } else if likely_big_endian {
+        decode_with_encoding(UTF_16BE, bytes, ScriptTextEncoding::Utf16BigEndian)
+    } else {
+        None
+    }
 }
 
 #[must_use]
@@ -220,6 +253,32 @@ mod tests {
         ];
 
         assert_eq!(decode_script_text(&bytes), "SCRIP");
+    }
+
+    #[test]
+    fn decodes_ascii_heavy_utf16le_without_bom_before_legacy_encodings() {
+        let bytes = "SCRIPTMETA-BEGIN\nScript-ID=com.example.utf16\nSCRIPTMETA-END"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let decoded = decode_script_text_with_encoding(&bytes).expect("decode");
+
+        assert_eq!(decoded.encoding, ScriptTextEncoding::Utf16LittleEndian);
+        assert!(decoded.text.contains("Script-ID=com.example.utf16"));
+    }
+
+    #[test]
+    fn decodes_ascii_heavy_utf16be_without_bom_before_legacy_encodings() {
+        let bytes = "SCRIPTMETA-BEGIN\nScript-ID=com.example.utf16be\nSCRIPTMETA-END"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let decoded = decode_script_text_with_encoding(&bytes).expect("decode");
+
+        assert_eq!(decoded.encoding, ScriptTextEncoding::Utf16BigEndian);
+        assert!(decoded.text.contains("Script-ID=com.example.utf16be"));
     }
 
     #[test]
