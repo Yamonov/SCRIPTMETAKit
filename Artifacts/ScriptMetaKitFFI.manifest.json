@@ -1,0 +1,9 @@
+{
+  "packageVersion": "1.0.9",
+  "gitRevision": "5f808998bc42469964459be2a578f38d568d761b",
+  "sourceState": "clean",
+  "sourceTreeSHA256": "9d1adf0cb7e3e8e55a253ebd441108a3bc4ff8b1109b6c1de06a406f3bdaea2b",
+  "features": "blocking-http,native-watch",
+  "architectures": "x86_64 arm64",
+  "dylibSHA256": "a323020b8b268b69bccfe4a4fb15903a1dcba730e5768b5980ed198b7a16a9de"
+}
