@@ -2007,12 +2007,20 @@ fn compiled_osa_temp_path(path: &Path) -> PathBuf {
 #[derive(Debug)]
 enum AtomicWriteError {
     BeforeCommit(std::io::Error),
+    #[cfg(not(windows))]
     DurabilityAfterCommit(std::io::Error),
 }
 
 impl AtomicWriteError {
     fn is_committed(&self) -> bool {
-        matches!(self, Self::DurabilityAfterCommit(_))
+        #[cfg(not(windows))]
+        {
+            matches!(self, Self::DurabilityAfterCommit(_))
+        }
+        #[cfg(windows)]
+        {
+            false
+        }
     }
 }
 
@@ -2020,6 +2028,7 @@ impl std::fmt::Display for AtomicWriteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BeforeCommit(error) => error.fmt(formatter),
+            #[cfg(not(windows))]
             Self::DurabilityAfterCommit(error) => write!(
                 formatter,
                 "file replacement succeeded, but directory durability sync failed: {error}"
@@ -2818,6 +2827,7 @@ mod tests {
         #[cfg(not(unix))]
         {
             let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             fs::set_permissions(&script_path, permissions).expect("restore permissions");
         }
@@ -2878,28 +2888,26 @@ mod tests {
         let backup_path = generations_directory.join(backup_file_name);
         fs::write(&backup_path, "alert('legacy');\n").expect("backup file");
         let backup_size = fs::metadata(&backup_path).expect("backup metadata").len();
+        let legacy_index = serde_json::json!({
+            "schemaVersion": 1,
+            "fileID": "legacy",
+            "originalPath": script_path.to_string_lossy(),
+            "fileName": "Legacy.jsx",
+            "firstGenerationID": "20260606-153000-abcdef123456",
+            "generations": [
+                {
+                    "id": "20260606-153000-abcdef123456",
+                    "createdAt": "2026-06-06T06:30:00Z",
+                    "backupFileName": backup_file_name,
+                    "fileSize": backup_size,
+                    "sha256": "unused",
+                    "reason": "beforeRestore",
+                }
+            ]
+        });
         fs::write(
             backup_directory.join("index.json"),
-            format!(
-                r#"{{
-  "schemaVersion" : 1,
-  "fileID" : "legacy",
-  "originalPath" : "{}",
-  "fileName" : "Legacy.jsx",
-  "firstGenerationID" : "20260606-153000-abcdef123456",
-  "generations" : [
-    {{
-      "id" : "20260606-153000-abcdef123456",
-      "createdAt" : "2026-06-06T06:30:00Z",
-      "backupFileName" : "{backup_file_name}",
-      "fileSize" : {backup_size},
-      "sha256" : "unused",
-      "reason" : "beforeRestore"
-    }}
-  ]
-}}"#,
-                script_path.display()
-            ),
+            serde_json::to_vec_pretty(&legacy_index).expect("legacy index json"),
         )
         .expect("legacy index");
 

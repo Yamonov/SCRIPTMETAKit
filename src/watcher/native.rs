@@ -868,7 +868,6 @@ mod platform {
         os::windows::ffi::{OsStrExt, OsStringExt},
         path::{Path, PathBuf},
         ptr,
-        sync::mpsc,
         thread::{self, JoinHandle},
     };
 
@@ -1166,7 +1165,7 @@ mod platform {
                     .try_into()
                     .expect("FILE_NOTIFY_INFORMATION file name length bytes"),
             ) as usize;
-            if file_name_byte_len % 2 != 0 {
+            if !file_name_byte_len.is_multiple_of(2) {
                 let _ = sender.send(NativeFsEvent::Overflow);
                 break;
             }

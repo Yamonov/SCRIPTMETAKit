@@ -275,7 +275,7 @@ fn is_restricted_registered_root(root_path: &Path) -> bool {
 
 #[cfg(windows)]
 fn trim_windows_root_separator(path: &str) -> &str {
-    path.trim_end_matches(|character| character == '\\' || character == '/')
+    path.trim_end_matches(['\\', '/'])
 }
 
 #[cfg(windows)]

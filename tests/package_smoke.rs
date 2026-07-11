@@ -4672,6 +4672,7 @@ fn spawn_counted_http_response(
         while !server_stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("blocking test stream");
                     let request = read_http_request_headers(&mut stream);
                     if !has_complete_http_request_headers(&request) {
                         continue;
@@ -4737,6 +4738,9 @@ fn spawn_conditional_http_response(
         while !server_stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking conditional test stream");
                     let request = read_http_request_headers(&mut stream);
                     if !has_complete_http_request_headers(&request) {
                         continue;
@@ -4823,6 +4827,9 @@ fn spawn_counted_stalled_http() -> (
         while !server_stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking stalled test stream");
                     server_requests.fetch_add(1, Ordering::AcqRel);
                     thread::spawn(move || {
                         let mut request = [0_u8; 1024];
