@@ -18,18 +18,63 @@ private nonisolated func smk_can_read_directory_contents(
     _ outCanRead: UnsafeMutablePointer<UInt8>
 ) -> Int32
 
+public nonisolated enum ScriptMetaKitDiagnosticSeverity: String, Codable, Sendable {
+    case information
+    case warning
+    case error
+}
+
+public nonisolated struct ScriptMetaKitDiagnostic: Codable, Sendable {
+    public var severity: ScriptMetaKitDiagnosticSeverity
+    public var code: String
+    public var message: String
+    public var path: String?
+
+    public init(
+        severity: ScriptMetaKitDiagnosticSeverity,
+        code: String,
+        message: String,
+        path: String? = nil
+    ) {
+        self.severity = severity
+        self.code = code
+        self.message = message
+        self.path = path
+    }
+}
+
+public nonisolated struct ScriptMetaKitWatchSequence: AsyncSequence, Sendable {
+    public typealias Element = ScriptMetaScanResult
+    public typealias AsyncIterator = AsyncThrowingStream<Element, Error>.Iterator
+
+    private let stream: AsyncThrowingStream<Element, Error>
+
+    init(stream: AsyncThrowingStream<Element, Error>) {
+        self.stream = stream
+    }
+
+    public func makeAsyncIterator() -> AsyncIterator {
+        stream.makeAsyncIterator()
+    }
+}
+
 public nonisolated struct ScriptMetaKitPersistentCacheStore: Sendable {
+    public static let defaultMaximumCacheBytes = 64 * 1024 * 1024
+
     public var directoryURL: URL
     public var maximumCacheBytes: Int
 
-    public init(directoryURL: URL, maximumCacheBytes: Int = 80 * 1024 * 1024) {
+    public init(
+        directoryURL: URL,
+        maximumCacheBytes: Int = Self.defaultMaximumCacheBytes
+    ) {
         self.directoryURL = directoryURL
         self.maximumCacheBytes = maximumCacheBytes
     }
 
     public static func applicationSupport(
         bundleIdentifier: String,
-        maximumCacheBytes: Int = 80 * 1024 * 1024,
+        maximumCacheBytes: Int = Self.defaultMaximumCacheBytes,
         fileManager: FileManager = .default
     ) -> ScriptMetaKitPersistentCacheStore? {
         guard let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
@@ -93,30 +138,56 @@ public nonisolated struct ScriptMetaKitWorkspaceConfiguration: Sendable {
     public var rootPreflightOptions: ScriptMetaRootPreflightOptions?
     public var resolvesMacOSAliases: Bool
     public var nativeEventLatencyMillis: UInt64?
+    public var cacheSaveDebounceMillis: UInt64
+    public var operationalPolicy: ScriptMetaKitOperationalPolicy?
+    public var diagnosticHandler: (@Sendable (ScriptMetaKitDiagnostic) -> Void)?
 
     public init(
         cacheStore: ScriptMetaKitPersistentCacheStore? = nil,
         rootPreflightOptions: ScriptMetaRootPreflightOptions? = nil,
         resolvesMacOSAliases: Bool = true,
-        nativeEventLatencyMillis: UInt64? = nil
+        nativeEventLatencyMillis: UInt64? = nil,
+        cacheSaveDebounceMillis: UInt64 = 300,
+        operationalPolicy: ScriptMetaKitOperationalPolicy? = nil,
+        diagnosticHandler: (@Sendable (ScriptMetaKitDiagnostic) -> Void)? = nil
     ) {
         self.cacheStore = cacheStore
         self.rootPreflightOptions = rootPreflightOptions
         self.resolvesMacOSAliases = resolvesMacOSAliases
         self.nativeEventLatencyMillis = nativeEventLatencyMillis
+        self.cacheSaveDebounceMillis = cacheSaveDebounceMillis
+        self.operationalPolicy = operationalPolicy
+        self.diagnosticHandler = diagnosticHandler
     }
 }
 
 public actor ScriptMetaKitWorkspace {
+    private struct ExclusiveOperationWaiter {
+        let id: UInt64
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private let engine = ScriptMetaKitEngine()
     private let configuration: ScriptMetaKitWorkspaceConfiguration
     private var didConfigureEngine = false
     private var loadedCacheRootIDsByScope: [UInt32: Set<String>] = [:]
     private var hasExclusiveOperation = false
-    private var exclusiveOperationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var nextExclusiveOperationWaiterID: UInt64 = 0
+    private var exclusiveOperationWaiters: [ExclusiveOperationWaiter] = []
+    private var cacheSaveGenerationByScope: [UInt32: UInt64] = [:]
+    private var pendingCacheSaveTasks: [UInt32: Task<Void, Never>] = [:]
 
     public init(configuration: ScriptMetaKitWorkspaceConfiguration = ScriptMetaKitWorkspaceConfiguration()) {
         self.configuration = configuration
+    }
+
+    func performExclusiveOperation<T: Sendable>(
+        _ operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
+        return try await operation()
     }
 
     public func scanRoots(
@@ -128,7 +199,7 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -156,7 +227,7 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -184,7 +255,7 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -217,7 +288,7 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -248,7 +319,7 @@ public actor ScriptMetaKitWorkspace {
         mode: ScriptMetaScanMode,
         cacheScope: ScriptMetaCacheScope? = nil
     ) async throws -> ScriptMetaScanResult {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -275,7 +346,7 @@ public actor ScriptMetaKitWorkspace {
         insertingIntoGroup groupID: String,
         cacheScope: ScriptMetaCacheScope? = .fileList
     ) async throws -> FileListSnapshot? {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -293,7 +364,7 @@ public actor ScriptMetaKitWorkspace {
         rootIDs: [String],
         cacheScope: ScriptMetaCacheScope? = .catalog
     ) async throws -> ScriptMetaCatalogSnapshot? {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -310,7 +381,7 @@ public actor ScriptMetaKitWorkspace {
         replacingGroup groupID: String,
         cacheScope: ScriptMetaCacheScope? = nil
     ) async throws {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -321,7 +392,7 @@ public actor ScriptMetaKitWorkspace {
     }
 
     public func setVisibleRoot(_ rootID: String?) async throws {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -336,7 +407,7 @@ public actor ScriptMetaKitWorkspace {
         initialDrainDirtyOnly: Bool = false,
         onChange: @escaping @Sendable () -> Void
     ) async throws {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -347,14 +418,71 @@ public actor ScriptMetaKitWorkspace {
         try await engine.startWatching(onChange: onChange)
         if drainsInitialChanges {
             try await drainWatchChangesUnlocked(dirtyOnly: initialDrainDirtyOnly)
+            if let cacheScope {
+                await savePersistentCache(scope: cacheScope)
+            }
         }
+    }
+
+    public func watchChanges(
+        roots: [ScriptMetaKitRoot],
+        replacingGroup groupID: String,
+        cacheScope: ScriptMetaCacheScope? = nil,
+        dirtyOnly: Bool = false
+    ) async throws -> ScriptMetaKitWatchSequence {
+        let (notifications, notificationContinuation) = AsyncStream<Void>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let (changes, changeContinuation) = AsyncThrowingStream<ScriptMetaScanResult, Error>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let pump = Task { [weak self] in
+            for await _ in notifications {
+                guard let self else { break }
+                do {
+                    if let result = try await self.pollWatchChanges(
+                        dirtyOnly: dirtyOnly,
+                        cacheScope: cacheScope
+                    ) {
+                        changeContinuation.yield(result)
+                    }
+                } catch is CancellationError {
+                    break
+                } catch {
+                    changeContinuation.finish(throwing: error)
+                    return
+                }
+            }
+            changeContinuation.finish()
+        }
+        changeContinuation.onTermination = { [weak self] _ in
+            pump.cancel()
+            notificationContinuation.finish()
+            Task { await self?.stopWatching() }
+        }
+
+        do {
+            try await startWatching(
+                roots: roots,
+                replacingGroup: groupID,
+                cacheScope: cacheScope,
+                drainsInitialChanges: false,
+                onChange: { notificationContinuation.yield() }
+            )
+        } catch {
+            pump.cancel()
+            notificationContinuation.finish()
+            changeContinuation.finish(throwing: error)
+            throw error
+        }
+        return ScriptMetaKitWatchSequence(stream: changes)
     }
 
     public func pollWatchChanges(
         dirtyOnly: Bool = false,
         cacheScope: ScriptMetaCacheScope? = nil
     ) async throws -> ScriptMetaScanResult? {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         return try await pollWatchChangesUnlocked(dirtyOnly: dirtyOnly, cacheScope: cacheScope)
@@ -367,7 +495,7 @@ public actor ScriptMetaKitWorkspace {
         idlePollCount: Int = 3,
         maxPollCount: Int = 20
     ) async throws {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await drainWatchChangesUnlocked(
@@ -408,8 +536,17 @@ public actor ScriptMetaKitWorkspace {
         }
     }
 
-    public func stopWatching() async {
-        await enterExclusiveOperation()
+    public func stopWatching(
+        operationPolicy: ScriptMetaOperationTerminationPolicy = .waitForCurrentOperation
+    ) async {
+        if operationPolicy == .cancelCurrentOperation {
+            engine.cancelCurrentOrPendingOperationForTermination()
+        }
+        do {
+            try await enterExclusiveOperation()
+        } catch {
+            return
+        }
         defer { leaveExclusiveOperation() }
         await engine.stopWatching()
     }
@@ -418,16 +555,36 @@ public actor ScriptMetaKitWorkspace {
         engine.cancelCurrentOperation()
     }
 
-    public func shutdown() async {
-        await enterExclusiveOperation()
+    public func shutdown(
+        operationPolicy: ScriptMetaOperationTerminationPolicy = .waitForCurrentOperation
+    ) async {
+        if operationPolicy == .cancelCurrentOperation {
+            engine.cancelCurrentOrPendingOperationForTermination()
+        }
+        do {
+            try await enterExclusiveOperation()
+        } catch {
+            return
+        }
         defer { leaveExclusiveOperation() }
+        await flushPendingPersistentCacheSaves()
         await engine.shutdown()
     }
 
     /// Clears roots, watchers, and in-memory scan/cache state while preserving persistent cache files.
-    public func clearVolatileState() async {
-        await enterExclusiveOperation()
+    public func clearVolatileState(
+        operationPolicy: ScriptMetaOperationTerminationPolicy = .waitForCurrentOperation
+    ) async {
+        if operationPolicy == .cancelCurrentOperation {
+            engine.cancelCurrentOrPendingOperationForTermination()
+        }
+        do {
+            try await enterExclusiveOperation()
+        } catch {
+            return
+        }
         defer { leaveExclusiveOperation() }
+        await flushPendingPersistentCacheSaves()
         await engine.shutdown()
         didConfigureEngine = false
         loadedCacheRootIDsByScope.removeAll(keepingCapacity: false)
@@ -438,7 +595,7 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -454,7 +611,7 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope? = nil,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
-        await enterExclusiveOperation()
+        try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
@@ -469,6 +626,9 @@ public actor ScriptMetaKitWorkspace {
         guard didConfigureEngine == false else { return }
         if let options = configuration.rootPreflightOptions {
             try await engine.setRootPreflightOptions(options)
+        }
+        if let policy = configuration.operationalPolicy {
+            try await engine.setOperationalPolicy(policy)
         }
         try await engine.setResolveMacOSAlias(configuration.resolvesMacOSAliases)
         if let nativeEventLatencyMillis = configuration.nativeEventLatencyMillis {
@@ -497,6 +657,12 @@ public actor ScriptMetaKitWorkspace {
         do {
             try await engine.loadCache(from: url)
         } catch {
+            emitDiagnostic(
+                severity: .warning,
+                code: "cache_load_failed",
+                message: String(describing: error),
+                path: url.path
+            )
             cacheStore.remove(scope: scope)
         }
     }
@@ -507,7 +673,73 @@ public actor ScriptMetaKitWorkspace {
             try await engine.saveCache(to: cacheStore.writableCacheFileURL(scope: scope), scope: scope)
             cacheStore.enforceSizeLimit(scope: scope)
         } catch {
+            emitDiagnostic(
+                severity: .warning,
+                code: "cache_save_failed",
+                message: String(describing: error),
+                path: cacheStore.writableCacheFileURL(scope: scope).path
+            )
             return
+        }
+    }
+
+    private func emitDiagnostic(
+        severity: ScriptMetaKitDiagnosticSeverity,
+        code: String,
+        message: String,
+        path: String? = nil
+    ) {
+        configuration.diagnosticHandler?(ScriptMetaKitDiagnostic(
+            severity: severity,
+            code: code,
+            message: message,
+            path: path
+        ))
+    }
+
+    private func schedulePersistentCacheSave(scope: ScriptMetaCacheScope) {
+        let scopeKey = scope.rawValue
+        let generation = cacheSaveGenerationByScope[scopeKey, default: 0] &+ 1
+        cacheSaveGenerationByScope[scopeKey] = generation
+        pendingCacheSaveTasks[scopeKey]?.cancel()
+        let delay = configuration.cacheSaveDebounceMillis
+        pendingCacheSaveTasks[scopeKey] = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(for: .milliseconds(delay))
+            }
+            guard Task.isCancelled == false else { return }
+            await self?.saveScheduledPersistentCache(
+                scope: scope,
+                scopeKey: scopeKey,
+                generation: generation
+            )
+        }
+    }
+
+    private func saveScheduledPersistentCache(
+        scope: ScriptMetaCacheScope,
+        scopeKey: UInt32,
+        generation: UInt64
+    ) async {
+        guard cacheSaveGenerationByScope[scopeKey] == generation else { return }
+        pendingCacheSaveTasks[scopeKey] = nil
+        do {
+            try await enterExclusiveOperation()
+        } catch {
+            return
+        }
+        defer { leaveExclusiveOperation() }
+        await savePersistentCache(scope: scope)
+    }
+
+    private func flushPendingPersistentCacheSaves() async {
+        let scopes = pendingCacheSaveTasks.keys.compactMap(ScriptMetaCacheScope.init(rawValue:))
+        for task in pendingCacheSaveTasks.values {
+            task.cancel()
+        }
+        pendingCacheSaveTasks.removeAll(keepingCapacity: false)
+        for scope in scopes {
+            await savePersistentCache(scope: scope)
         }
     }
 
@@ -518,26 +750,52 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         let result = try await engine.pollWatchChanges(dirtyOnly: dirtyOnly)
         if result != nil, let cacheScope {
-            await savePersistentCache(scope: cacheScope)
+            schedulePersistentCacheSave(scope: cacheScope)
         }
         return result
     }
 
-    private func enterExclusiveOperation() async {
+    private func enterExclusiveOperation() async throws {
+        try Task.checkCancellation()
         if hasExclusiveOperation == false {
             hasExclusiveOperation = true
             return
         }
-        await withCheckedContinuation { continuation in
-            exclusiveOperationWaiters.append(continuation)
+
+        let waiterID = nextExclusiveOperationWaiterID
+        nextExclusiveOperationWaiterID &+= 1
+        let acquired = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                exclusiveOperationWaiters.append(ExclusiveOperationWaiter(
+                    id: waiterID,
+                    continuation: continuation
+                ))
+            }
+        } onCancel: {
+            Task { await self.cancelExclusiveOperationWaiter(waiterID) }
         }
+        guard acquired else {
+            throw CancellationError()
+        }
+        if Task.isCancelled {
+            leaveExclusiveOperation()
+            throw CancellationError()
+        }
+    }
+
+    private func cancelExclusiveOperationWaiter(_ waiterID: UInt64) {
+        guard let index = exclusiveOperationWaiters.firstIndex(where: { $0.id == waiterID }) else {
+            return
+        }
+        let waiter = exclusiveOperationWaiters.remove(at: index)
+        waiter.continuation.resume(returning: false)
     }
 
     private func leaveExclusiveOperation() {
         if exclusiveOperationWaiters.isEmpty {
             hasExclusiveOperation = false
         } else {
-            exclusiveOperationWaiters.removeFirst().resume()
+            exclusiveOperationWaiters.removeFirst().continuation.resume(returning: true)
         }
     }
 }

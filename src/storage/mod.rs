@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
 };
@@ -11,6 +12,8 @@ use crate::{
     core::{ScriptMetaKitError, ScriptMetaKitResult},
     now_timestamp_millis,
 };
+
+pub const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheSchema {
@@ -160,12 +163,16 @@ pub fn save_cache_payload(
 
     let temp_path = temporary_cache_path(path);
     let mut temp_guard = TemporaryCacheFile::new(temp_path.clone());
-    let file = File::create(&temp_path).map_err(|error| ScriptMetaKitError::Io {
-        path: temp_path.clone(),
-        message: error.to_string(),
-    })?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| ScriptMetaKitError::Io {
+            path: temp_path.clone(),
+            message: error.to_string(),
+        })?;
     let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, payload)
+    serde_json::to_writer(&mut writer, payload)
         .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
     writer.flush().map_err(|error| ScriptMetaKitError::Io {
         path: temp_path.clone(),
@@ -186,8 +193,45 @@ pub fn save_cache_payload(
     Ok(())
 }
 
+pub fn cache_payload_content_fingerprint(payload: &CachePayload) -> ScriptMetaKitResult<String> {
+    #[derive(Serialize)]
+    struct FingerprintPayload<'a> {
+        schema_version: u32,
+        min_supported_schema_version: u32,
+        package_version: &'a str,
+        app_id: Option<&'a str>,
+        cache_namespace: Option<&'a str>,
+        scope: CacheScope,
+        data: &'a Value,
+    }
+
+    let bytes = serde_json::to_vec(&FingerprintPayload {
+        schema_version: payload.schema.schema_version,
+        min_supported_schema_version: payload.schema.min_supported_schema_version,
+        package_version: &payload.schema.package_version,
+        app_id: payload.schema.app_id.as_deref(),
+        cache_namespace: payload.schema.cache_namespace.as_deref(),
+        scope: payload.scope,
+        data: &payload.data,
+    })
+    .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 pub fn load_cache_payload(path: impl AsRef<Path>) -> ScriptMetaKitResult<CachePayload> {
     let path = path.as_ref();
+    let file_size = fs::metadata(path)
+        .map_err(|error| ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?
+        .len();
+    if file_size > MAX_CACHE_FILE_BYTES {
+        return Err(ScriptMetaKitError::Cache(format!(
+            "cache file exceeds the {} byte safety limit",
+            MAX_CACHE_FILE_BYTES
+        )));
+    }
     let file = File::open(path).map_err(|error| ScriptMetaKitError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
@@ -202,11 +246,7 @@ fn temporary_cache_path(path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_default();
-    file_name.push(format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        now_timestamp_millis()
-    ));
+    file_name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
     path.with_file_name(file_name)
 }
 
@@ -241,7 +281,17 @@ fn replace_cache_file(temp_path: &Path, destination: &Path) -> ScriptMetaKitResu
     fs::rename(temp_path, destination).map_err(|error| ScriptMetaKitError::Io {
         path: destination.to_path_buf(),
         message: error.to_string(),
+    })?;
+    sync_parent_directory(destination).map_err(|error| ScriptMetaKitError::Io {
+        path: destination.to_path_buf(),
+        message: error.to_string(),
     })
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
 }
 
 #[cfg(windows)]

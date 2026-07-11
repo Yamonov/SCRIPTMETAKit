@@ -99,6 +99,24 @@ pub(crate) fn scan_file_list_root_controlled(
     extensions: &ExtensionPolicy,
     cancellation: Option<&OperationCancellation>,
 ) -> DirectoryScanOutput {
+    scan_file_list_root_controlled_with_probe(
+        root_id,
+        root_path,
+        options,
+        extensions,
+        cancellation,
+        true,
+    )
+}
+
+fn scan_file_list_root_controlled_with_probe(
+    root_id: &RootId,
+    root_path: &Path,
+    options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+    cancellation: Option<&OperationCancellation>,
+    probe_script_headers: bool,
+) -> DirectoryScanOutput {
     let mut root = RootSnapshot::new(root_id.clone(), root_path.to_path_buf());
     let started = Instant::now();
     let timeout = options
@@ -132,6 +150,7 @@ pub(crate) fn scan_file_list_root_controlled(
         cancelled: false,
         root_error: None,
         cancellation,
+        probe_script_headers,
     };
 
     let root_resolution = resolve_scannable_path(
@@ -221,6 +240,39 @@ pub(crate) fn scan_file_list_root_controlled(
     }
 }
 
+pub(crate) fn scan_file_list_root_transactional_controlled(
+    root_id: &RootId,
+    root_path: &Path,
+    options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+    previous_snapshot: Option<&FileListSnapshot>,
+    cancellation: Option<&OperationCancellation>,
+    probe_script_headers: bool,
+) -> DirectoryScanOutput {
+    let mut output = scan_file_list_root_controlled_with_probe(
+        root_id,
+        root_path,
+        options,
+        extensions,
+        cancellation,
+        probe_script_headers,
+    );
+    let Some(previous_snapshot) = previous_snapshot else {
+        return output;
+    };
+    if matches!(output.root.status, RootStatus::Ready | RootStatus::Missing) {
+        return output;
+    }
+
+    output.children = previous_snapshot.children.clone().unwrap_or_default();
+    output.directory_states = previous_snapshot.directory_states.clone();
+    output.truncated = previous_snapshot.truncated;
+    output.root.item_count = count_entries(&output.children);
+    output.root.is_dirty = true;
+    output.change_summary = Some(ScanChangeSummary::default());
+    output
+}
+
 pub fn scan_file_list_root_with_dirty_directories(
     root_id: &RootId,
     root_path: &Path,
@@ -281,12 +333,14 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
             .iter()
             .any(|directory| directory == &normalized_root_path)
     {
-        return scan_file_list_root_controlled(
+        return scan_file_list_root_transactional_controlled(
             root_id,
             root_path,
             options,
             extensions,
+            Some(previous_snapshot),
             cancellation,
+            true,
         );
     }
 
@@ -300,12 +354,14 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
 
     for dirty_directory in &dirty_directories {
         if !directory_exists_in_entries(&children, dirty_directory) {
-            return scan_file_list_root_controlled(
+            return scan_file_list_root_transactional_controlled(
                 root_id,
                 root_path,
                 options,
                 extensions,
+                Some(previous_snapshot),
                 cancellation,
+                true,
             );
         }
 
@@ -338,9 +394,17 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
                     root_error = output.root_error;
                 }
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 remove_directory_entry(&mut children, dirty_directory);
                 remove_directory_states_under(&mut directory_states, dirty_directory);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_states_under(&mut directory_states, dirty_directory);
+            }
+            Err(error) => {
+                let (_, error) = root_io_error(&error, "dirty_directory_metadata_failed");
+                root_error.get_or_insert(error);
             }
         }
     }
@@ -467,9 +531,17 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
                     root_error = output.root_error;
                 }
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 remove_directory_entry(&mut children, dirty_directory);
                 remove_directory_states_under(&mut directory_states, dirty_directory);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_states_under(&mut directory_states, dirty_directory);
+            }
+            Err(error) => {
+                let (_, error) = root_io_error(&error, "dirty_directory_metadata_failed");
+                root_error.get_or_insert(error);
             }
         }
     }
@@ -566,6 +638,7 @@ fn scan_file_list_directory(
         cancelled: false,
         root_error: None,
         cancellation,
+        probe_script_headers: true,
     };
     let resolved_directory = normalize_path(source_directory);
     let children = scan_directory(display_directory, source_directory, depth, &mut state);
@@ -601,6 +674,7 @@ struct FileListWalkState<'a> {
     cancelled: bool,
     root_error: Option<RootError>,
     cancellation: Option<&'a OperationCancellation>,
+    probe_script_headers: bool,
 }
 
 fn scan_directory(
@@ -625,16 +699,22 @@ fn scan_directory(
                 resolved_directory,
                 (path_error_status(&error), error.to_string()),
             );
-            if depth == 0 {
-                let (_, root_error) = root_io_error(&error, "read_directory_failed");
-                state.root_error = Some(root_error);
-            }
+            let (_, root_error) = root_io_error(&error, "read_directory_failed");
+            state.root_error.get_or_insert(root_error);
             return Some(Vec::new());
         }
     };
 
     let mut children = Vec::new();
-    for entry in entries.flatten() {
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                let (_, root_error) = root_io_error(&error, "read_directory_entry_failed");
+                state.root_error.get_or_insert(root_error);
+                continue;
+            }
+        };
         if should_stop(depth, state) {
             break;
         }
@@ -755,7 +835,17 @@ fn scan_directory(
         }
 
         if metadata.is_file() && state.extensions.contains_path(&resolved.resolved_path) {
-            let file_info = detect_script_info_for_file_list(&resolved.resolved_path);
+            let file_info = if state.probe_script_headers {
+                detect_script_info_for_file_list(&resolved.resolved_path)
+            } else {
+                FileListScriptInfo {
+                    script: detect_script_file(&resolved.resolved_path, None),
+                    capability: scriptmeta_edit_capability_from_file_list_probe(
+                        &resolved.resolved_path,
+                        None,
+                    ),
+                }
+            };
             let identity = file_identity(&resolved.resolved_path, &metadata);
             children.push(FileSystemEntry {
                 display_path: resolved.display_path,

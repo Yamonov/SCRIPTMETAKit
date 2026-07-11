@@ -21,6 +21,9 @@ fn default_config_sets_scan_and_update_timeouts() {
     assert!(config.supported_extensions.contains_extension("scptd"));
     assert_eq!(config.update_check.request_timeout_millis, Some(15_000));
     assert_eq!(config.update_check.resource_timeout_millis, Some(15_000));
+    assert_eq!(config.update_check.retry_initial_delay_millis, 500);
+    assert_eq!(config.update_check.retry_backoff_multiplier, 3);
+    assert_eq!(config.update_check.max_retry_delay_millis, 30_000);
 }
 
 #[test]
@@ -438,6 +441,68 @@ fn memory_cache_can_be_disabled_without_hiding_scan_result() {
             .is_none()
     );
     assert!(engine.catalog_snapshot().is_none());
+}
+
+#[test]
+fn memory_node_limit_evicts_one_root_without_clearing_every_cache() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first = temp.path().join("First");
+    let second = temp.path().join("Second");
+    std::fs::create_dir_all(&first).expect("first root");
+    std::fs::create_dir_all(&second).expect("second root");
+    std::fs::write(
+        first.join("First.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.first\n// SCRIPTMETA-END\n",
+    )
+    .expect("first script");
+    std::fs::write(
+        second.join("Second.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.second\n// SCRIPTMETA-END\n",
+    )
+    .expect("second script");
+
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "RootEviction");
+    config.cache.max_memory_nodes = 2;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("first", &first),
+            scriptmetakit::RootRegistration::file_list_and_metadata("second", &second),
+        ])
+        .expect("roots");
+
+    let scanned = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("scan");
+    assert_eq!(scanned.file_list_snapshots.len(), 2);
+
+    let cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListAndMetadata,
+    ));
+    assert_eq!(cached.file_list_snapshots.len(), 1);
+    assert_eq!(
+        cached
+            .catalog_snapshot
+            .as_ref()
+            .expect("catalog")
+            .file_items
+            .len(),
+        1
+    );
+    assert_eq!(
+        cached
+            .roots
+            .iter()
+            .filter(|root| root.status == scriptmetakit::RootStatus::NotLoaded)
+            .count(),
+        1
+    );
+    assert!(
+        engine.export_cache(scriptmetakit::CacheScope::All).is_err(),
+        "a partial in-memory cache must not overwrite a complete persistent cache"
+    );
 }
 
 #[test]
@@ -3249,6 +3314,141 @@ fn scan_result_reports_permission_denied_file_issue() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dirty_file_list_refresh_preserves_previous_subtree_after_nested_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let blocked_directory = temp.path().join("Blocked");
+    std::fs::create_dir(&blocked_directory).expect("blocked directory");
+    let script_path = blocked_directory.join("Example.jsx");
+    std::fs::write(
+        &script_path,
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.blocked\n// SCRIPTMETA-END\n",
+    )
+    .expect("script");
+
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "NestedReadError"),
+    )
+    .expect("engine");
+    let initial = engine
+        .scan_root_paths(
+            vec![temp.path().to_path_buf()],
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        )
+        .expect("initial scan");
+    assert!(
+        initial
+            .flattened_file_entries()
+            .any(|entry| entry.display_path == script_path)
+    );
+
+    let original_permissions = std::fs::metadata(&blocked_directory)
+        .expect("metadata")
+        .permissions();
+    let mut blocked_permissions = original_permissions.clone();
+    blocked_permissions.set_mode(0o000);
+    std::fs::set_permissions(&blocked_directory, blocked_permissions).expect("chmod 000");
+
+    engine
+        .mark_changed_paths(scriptmetakit::RawChangeBatch {
+            paths: vec![blocked_directory.clone()],
+            overflowed: false,
+        })
+        .expect("mark changed");
+    let refreshed = engine
+        .refresh_dirty_roots(scriptmetakit::RefreshRequest {
+            mode: scriptmetakit::ScanMode::FileListAndMetadata,
+        })
+        .expect("refresh");
+
+    std::fs::set_permissions(&blocked_directory, original_permissions)
+        .expect("restore permissions");
+
+    assert_eq!(
+        refreshed.operation.status,
+        scriptmetakit::OperationStatus::Partial
+    );
+    assert!(
+        refreshed
+            .roots
+            .iter()
+            .any(|root| { root.status == scriptmetakit::RootStatus::Unreadable && root.is_dirty }),
+        "unexpected roots: {:?}",
+        refreshed.roots
+    );
+    assert!(
+        refreshed
+            .flattened_file_entries()
+            .any(|entry| entry.display_path == script_path),
+        "the previous subtree must remain visible after a transient read failure"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn full_metadata_rescan_preserves_last_good_catalog_after_permission_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let container = temp.path().join("Container");
+    let root = container.join("Scripts");
+    std::fs::create_dir_all(&root).expect("root");
+    let script = root.join("Example.jsx");
+    std::fs::write(
+        &script,
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.stale\n// SCRIPTMETA-END\n",
+    )
+    .expect("script");
+
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "TransactionalMetadata"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", &root),
+        ])
+        .expect("roots");
+    let initial = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("initial scan");
+    assert_eq!(
+        initial.catalog_snapshot.expect("catalog").file_items.len(),
+        1
+    );
+
+    let original_permissions = std::fs::metadata(&container)
+        .expect("container metadata")
+        .permissions();
+    let mut blocked_permissions = original_permissions.clone();
+    blocked_permissions.set_mode(0o000);
+    std::fs::set_permissions(&container, blocked_permissions).expect("block container");
+
+    let refreshed = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("failed scan still returns stale result");
+
+    std::fs::set_permissions(&container, original_permissions).expect("restore permissions");
+    let catalog = refreshed.catalog_snapshot.expect("stale catalog");
+    assert_eq!(catalog.file_items.len(), 1);
+    assert_eq!(catalog.file_items[0].script_id, "com.example.stale");
+    assert!(
+        refreshed
+            .roots
+            .iter()
+            .any(|root| root.status == scriptmetakit::RootStatus::Unreadable && root.is_dirty),
+        "unexpected roots: {:?}",
+        refreshed.roots
+    );
+}
+
 #[test]
 fn update_check_cancellation_returns_partial_result() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -3320,6 +3520,57 @@ fn update_check_cancellation_returns_partial_result() {
         .get(&second_path.to_string_lossy().into_owned())
         .expect("cancelled failure");
     assert_eq!(failure.code, "operation_cancelled");
+}
+
+#[test]
+fn cancellation_before_composite_scan_prevents_follow_up_update_check() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let distribution = temp.path().join("distribution.txt");
+    std::fs::write(
+        &distribution,
+        "SCRIPTMETA-DIST-BEGIN\nScript-ID=com.example.composite.cancel\nLatest-Version=2.0.0\nSCRIPTMETA-DIST-END\n",
+    )
+    .expect("distribution");
+    let script = temp.path().join("Example.jsx");
+    let distribution_url = url::Url::from_file_path(&distribution).expect("distribution URL");
+    std::fs::write(
+        &script,
+        format!(
+            "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.composite.cancel\n// Version=1.0.0\n// Meta-URL={}\n// SCRIPTMETA-END\n",
+            distribution_url
+        ),
+    )
+    .expect("script");
+
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "CompositeCancellation"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", temp.path()),
+        ])
+        .expect("roots");
+    let cancellation = engine.cancellation_token();
+    let reservation = cancellation.reserve_next_operation();
+    cancellation.cancel_current_or_reserved();
+
+    let (scan_result, update_result) = engine
+        .scan_roots_and_check_updates(
+            scriptmetakit::ScanRequest {
+                root_ids: vec![],
+                mode: scriptmetakit::ScanMode::FileListAndMetadata,
+            },
+            true,
+        )
+        .expect("composite scan");
+    drop(reservation);
+
+    assert_eq!(
+        scan_result.operation.status,
+        scriptmetakit::OperationStatus::Cancelled
+    );
+    assert!(update_result.is_none());
 }
 
 #[test]
@@ -3670,8 +3921,20 @@ fn script_item_for_update(
 }
 
 #[cfg(feature = "blocking-http")]
+fn http_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static HTTP_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    HTTP_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(feature = "blocking-http")]
 #[test]
 fn checks_http_update_metadata() {
+    let _http_test_guard = http_test_guard();
     let response_body = r#"
 SCRIPTMETA-DIST-BEGIN
 Script-ID: com.example.http
@@ -3722,6 +3985,7 @@ SCRIPTMETA-DIST-END
 #[cfg(feature = "blocking-http")]
 #[test]
 fn retries_http_update_metadata_after_transient_failure() {
+    let _http_test_guard = http_test_guard();
     let response_body = r#"
 SCRIPTMETA-DIST-BEGIN
 Script-ID: com.example.http.retry
@@ -3733,6 +3997,7 @@ SCRIPTMETA-DIST-END
     let script_path = temp.path().join("Retry.jsx");
     let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "Retry");
     config.update_check.retry_attempts = 1;
+    config.update_check.retry_initial_delay_millis = 1;
     let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![script_item_for_update(
@@ -3755,38 +4020,574 @@ SCRIPTMETA-DIST-END
 }
 
 #[cfg(feature = "blocking-http")]
-fn spawn_http_once(body: &'static str) -> url::Url {
+#[test]
+fn batch_update_reuses_one_http_source_for_items_with_the_same_meta_url() {
+    let _http_test_guard = http_test_guard();
+    let response_body = r#"
+SCRIPTMETA-DIST-BEGIN
+Script-ID: com.example.shared.first
+Latest-Version: 2.0.0
+Script-ID: com.example.shared.second
+Latest-Version: 3.0.0
+SCRIPTMETA-DIST-END
+"#;
+    let url = spawn_http_once(response_body);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_path = temp.path().join("First.jsx");
+    let second_path = temp.path().join("Second.jsx");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "SharedUpdateSource"),
+    )
+    .expect("engine");
+
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![
+            script_item_for_update(
+                "com.example.shared.first",
+                "1.0.0",
+                &first_path,
+                url.clone(),
+            ),
+            script_item_for_update("com.example.shared.second", "1.0.0", &second_path, url),
+        ],
+    }))
+    .expect("update check");
+
+    assert!(
+        result
+            .statuses_by_item_id
+            .values()
+            .all(|status| { *status == scriptmetakit::UpdateStatus::UpdateAvailable })
+    );
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn batch_update_shares_terminal_http_failure_and_retry_budget_by_meta_url() {
+    let _http_test_guard = http_test_guard();
+    use std::sync::atomic::Ordering;
+
+    let (url, requests, stop, server) = spawn_counted_http_error();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_path = temp.path().join("FirstFailure.jsx");
+    let second_path = temp.path().join("SecondFailure.jsx");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "SharedFailure");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 1;
+    config.update_check.retry_backoff_multiplier = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![
+            script_item_for_update(
+                "com.example.shared.failure.first",
+                "1.0.0",
+                &first_path,
+                url.clone(),
+            ),
+            script_item_for_update(
+                "com.example.shared.failure.second",
+                "1.0.0",
+                &second_path,
+                url,
+            ),
+        ],
+    }))
+    .expect("failed update check still returns a result");
+
+    stop.store(true, Ordering::Release);
+    server.join().expect("HTTP server");
+    assert_eq!(requests.load(Ordering::Acquire), 3);
+    assert_eq!(result.failures_by_item_id.len(), 2);
+    assert!(
+        result
+            .statuses_by_item_id
+            .values()
+            .all(|status| *status == scriptmetakit::UpdateStatus::Failed)
+    );
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn terminal_http_404_is_not_retried() {
+    let _http_test_guard = http_test_guard();
+    use std::sync::atomic::Ordering;
+
+    let (url, requests, stop, server) = spawn_counted_http_status("404 Not Found");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("NotFound.jsx");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "Terminal404");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![script_item_for_update(
+            "com.example.terminal.404",
+            "1.0.0",
+            &script_path,
+            url,
+        )],
+    }))
+    .expect("failed update check still returns a result");
+
+    stop.store(true, Ordering::Release);
+    server.join().expect("HTTP server");
+    assert_eq!(requests.load(Ordering::Acquire), 1);
+    assert_eq!(result.failures_by_item_id.len(), 1);
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn transient_http_timeout_uses_only_the_configured_request_budget() {
+    let _http_test_guard = http_test_guard();
+    use std::sync::atomic::Ordering;
+
+    let (url, requests, stop, server) = spawn_counted_stalled_http();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "TimeoutBudget");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 1;
+    config.update_check.retry_backoff_multiplier = 1;
+    config.update_check.request_timeout_millis = Some(30);
+    config.update_check.resource_timeout_millis = Some(30);
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![script_item_for_update(
+            "com.example.timeout.budget",
+            "1.0.0",
+            &temp.path().join("Timeout.jsx"),
+            url,
+        )],
+    }))
+    .expect("failed update check still returns a result");
+
+    stop.store(true, Ordering::Release);
+    server.join().expect("HTTP server");
+    assert_eq!(requests.load(Ordering::Acquire), 3);
+    assert_eq!(result.failures_by_item_id.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_denied_file_meta_url_is_terminal_without_retry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("SCRIPTMETA.txt");
+    std::fs::write(
+        &source,
+        "SCRIPTMETA-DIST-BEGIN\nScript-ID: com.example.permission\nLatest-Version: 2.0.0\nSCRIPTMETA-DIST-END\n",
+    )
+    .expect("source");
+    let original_permissions = std::fs::metadata(&source).expect("metadata").permissions();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000))
+        .expect("block source");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "PermissionTerminal");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let mut retries = 0;
+    let result = pollster::block_on(engine.check_updates_with_progress(
+        scriptmetakit::UpdateCheckRequest {
+            items: vec![script_item_for_update(
+                "com.example.permission",
+                "1.0.0",
+                &temp.path().join("Permission.jsx"),
+                url::Url::from_file_path(&source).expect("file URL"),
+            )],
+        },
+        |progress| {
+            if progress.phase == scriptmetakit::UpdateCheckProgressPhase::Retrying {
+                retries += 1;
+            }
+        },
+    ))
+    .expect("failed update check still returns a result");
+    std::fs::set_permissions(&source, original_permissions).expect("restore source");
+
+    assert_eq!(retries, 0);
+    assert_eq!(result.failures_by_item_id.len(), 1);
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn retry_after_zero_is_respected_within_the_shared_retry_budget() {
+    let _http_test_guard = http_test_guard();
+    use std::sync::atomic::Ordering;
+
+    let (url, requests, stop, server) =
+        spawn_counted_http_response("429 Too Many Requests", "Retry-After: 0\r\n", "");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "RetryAfter");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 1;
+    config.update_check.retry_backoff_multiplier = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![script_item_for_update(
+            "com.example.retry.after",
+            "1.0.0",
+            &temp.path().join("RetryAfter.jsx"),
+            url,
+        )],
+    }))
+    .expect("failed update check still returns a result");
+
+    stop.store(true, Ordering::Release);
+    server.join().expect("HTTP server");
+    assert_eq!(requests.load(Ordering::Acquire), 3);
+    assert_eq!(result.failures_by_item_id.len(), 1);
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn retry_after_above_the_configured_limit_does_not_repeat_the_request() {
+    let _http_test_guard = http_test_guard();
+    use std::sync::atomic::Ordering;
+
+    let (url, requests, stop, server) =
+        spawn_counted_http_response("503 Service Unavailable", "Retry-After: 60\r\n", "");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "RetryAfterLimit");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 1;
+    config.update_check.max_retry_delay_millis = 50;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![script_item_for_update(
+            "com.example.retry.after.limit",
+            "1.0.0",
+            &temp.path().join("RetryAfterLimit.jsx"),
+            url,
+        )],
+    }))
+    .expect("failed update check still returns a result");
+
+    stop.store(true, Ordering::Release);
+    server.join().expect("HTTP server");
+    assert_eq!(requests.load(Ordering::Acquire), 1);
+    assert_eq!(result.failures_by_item_id.len(), 1);
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn downstream_latest_url_requests_are_singleflighted() {
+    let _http_test_guard = http_test_guard();
+    use std::sync::atomic::Ordering;
+
+    let body = r#"
+SCRIPTMETA-DIST-BEGIN
+Script-ID: com.example.converged.first
+Latest-Version: 2.0.0
+Script-ID: com.example.converged.second
+Latest-Version: 3.0.0
+SCRIPTMETA-DIST-END
+"#;
+    let (downstream_url, requests, stop, server) =
+        spawn_counted_http_response("200 OK", "Content-Type: text/plain\r\n", body);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_source = temp.path().join("First-SCRIPTMETA.txt");
+    let second_source = temp.path().join("Second-SCRIPTMETA.txt");
+    std::fs::write(
+        &first_source,
+        format!(
+            "SCRIPTMETA-DIST-BEGIN\nScript-ID: com.example.converged.first\nLatest-URL: {downstream_url}\nSCRIPTMETA-DIST-END\n"
+        ),
+    )
+    .expect("first source");
+    std::fs::write(
+        &second_source,
+        format!(
+            "SCRIPTMETA-DIST-BEGIN\nScript-ID: com.example.converged.second\nLatest-URL: {downstream_url}\nSCRIPTMETA-DIST-END\n"
+        ),
+    )
+    .expect("second source");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "DownstreamSingleflight");
+    config.update_check.max_concurrent_meta_url_checks = 2;
+    config.update_check.retry_attempts = 0;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+        items: vec![
+            script_item_for_update(
+                "com.example.converged.first",
+                "1.0.0",
+                &temp.path().join("First.jsx"),
+                url::Url::from_file_path(first_source).expect("first URL"),
+            ),
+            script_item_for_update(
+                "com.example.converged.second",
+                "1.0.0",
+                &temp.path().join("Second.jsx"),
+                url::Url::from_file_path(second_source).expect("second URL"),
+            ),
+        ],
+    }))
+    .expect("update check");
+
+    stop.store(true, Ordering::Release);
+    server.join().expect("HTTP server");
+    assert_eq!(requests.load(Ordering::Acquire), 1);
+    assert_eq!(
+        result.statuses_by_item_id.len(),
+        2,
+        "unexpected singleflight result: {result:#?}"
+    );
+    assert!(
+        result
+            .statuses_by_item_id
+            .values()
+            .all(|status| *status == scriptmetakit::UpdateStatus::UpdateAvailable),
+        "unexpected singleflight result: {result:#?}"
+    );
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn repeated_update_check_uses_http_validator_and_cached_body() {
+    let _http_test_guard = http_test_guard();
+    use std::sync::atomic::Ordering;
+
+    let body = r#"
+SCRIPTMETA-DIST-BEGIN
+Script-ID: com.example.conditional
+Latest-Version: 2.0.0
+SCRIPTMETA-DIST-END
+"#;
+    for validator_header in [
+        "ETag: \"metadata-v1\"\r\n",
+        "Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+    ] {
+        let (url, requests, body_responses, stop, server) =
+            spawn_conditional_http_response(validator_header, body);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "ConditionalHTTP");
+        config.update_check.retry_attempts = 0;
+        let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+
+        for _ in 0..2 {
+            let result =
+                pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+                    items: vec![script_item_for_update(
+                        "com.example.conditional",
+                        "1.0.0",
+                        &temp.path().join("Conditional.jsx"),
+                        url.clone(),
+                    )],
+                }))
+                .expect("conditional update check");
+            assert!(
+                result
+                    .statuses_by_item_id
+                    .values()
+                    .all(|status| *status == scriptmetakit::UpdateStatus::UpdateAvailable),
+                "unexpected conditional HTTP result: {result:#?}"
+            );
+        }
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("HTTP server");
+        assert_eq!(requests.load(Ordering::Acquire), 2);
+        assert_eq!(
+            body_responses.load(Ordering::Acquire),
+            1,
+            "validator was not reused: {validator_header:?}"
+        );
+    }
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn update_retry_backoff_is_cancelled_without_an_extra_request() {
+    let _http_test_guard = http_test_guard();
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    let (url, requests, stop, server) = spawn_counted_http_error();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("CancelBackoff.jsx");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "CancelBackoff");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 10_000;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let cancellation = engine.cancellation_token();
+    let started = std::time::Instant::now();
+
+    let result = pollster::block_on(engine.check_updates_with_progress(
+        scriptmetakit::UpdateCheckRequest {
+            items: vec![script_item_for_update(
+                "com.example.cancel.backoff",
+                "1.0.0",
+                &script_path,
+                url,
+            )],
+        },
+        |progress| {
+            if progress.phase == scriptmetakit::UpdateCheckProgressPhase::Retrying {
+                cancellation.cancel();
+            }
+        },
+    ))
+    .expect("cancelled update check returns a result");
+
+    stop.store(true, Ordering::Release);
+    server.join().expect("HTTP server");
+    assert_eq!(requests.load(Ordering::Acquire), 1);
+    assert_eq!(
+        result.operation.status,
+        scriptmetakit::OperationStatus::Cancelled
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn batch_update_shares_terminal_file_failure_and_retry_progress_by_meta_url() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_source = temp.path().join("Missing-SCRIPTMETA.txt");
+    let source_url = url::Url::from_file_path(&missing_source).expect("file URL");
+    let first_path = temp.path().join("FirstMissing.jsx");
+    let second_path = temp.path().join("SecondMissing.jsx");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "SharedFileFailure");
+    config.update_check.retry_attempts = 2;
+    config.update_check.retry_initial_delay_millis = 1;
+    config.update_check.retry_backoff_multiplier = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let mut retry_progress_count = 0usize;
+
+    let result = pollster::block_on(engine.check_updates_with_progress(
+        scriptmetakit::UpdateCheckRequest {
+            items: vec![
+                script_item_for_update(
+                    "com.example.shared.file.first",
+                    "1.0.0",
+                    &first_path,
+                    source_url.clone(),
+                ),
+                script_item_for_update(
+                    "com.example.shared.file.second",
+                    "1.0.0",
+                    &second_path,
+                    source_url,
+                ),
+            ],
+        },
+        |progress| {
+            if progress.phase == scriptmetakit::UpdateCheckProgressPhase::Retrying {
+                retry_progress_count += 1;
+            }
+        },
+    ))
+    .expect("failed update check still returns a result");
+
+    assert_eq!(retry_progress_count, 2);
+    assert_eq!(result.failures_by_item_id.len(), 2);
+}
+
+#[cfg(feature = "blocking-http")]
+#[test]
+fn cancellation_interrupts_an_active_http_request() {
+    let _http_test_guard = http_test_guard();
     use std::{
-        io::{Read, Write},
-        net::TcpListener,
         thread,
+        time::{Duration, Instant},
     };
+
+    let (url, request_started) = spawn_stalled_http();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("Cancelled.jsx");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "CancelledHTTP");
+    config.update_check.request_timeout_millis = Some(10_000);
+    config.update_check.resource_timeout_millis = Some(10_000);
+    config.update_check.retry_attempts = 0;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let cancellation = engine.cancellation_token();
+
+    let update_thread = thread::spawn(move || {
+        pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
+            items: vec![script_item_for_update(
+                "com.example.http.cancelled",
+                "1.0.0",
+                &script_path,
+                url,
+            )],
+        }))
+    });
+    request_started
+        .recv_timeout(Duration::from_secs(2))
+        .expect("HTTP request started");
+
+    let cancelled_at = Instant::now();
+    cancellation.cancel();
+    let result = update_thread
+        .join()
+        .expect("update thread")
+        .expect("cancelled update result");
+
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(1),
+        "active HTTP cancellation took {:?}",
+        cancelled_at.elapsed()
+    );
+    assert_eq!(
+        result.operation.status,
+        scriptmetakit::OperationStatus::Cancelled
+    );
+}
+
+#[cfg(feature = "blocking-http")]
+fn read_http_request_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+
+    const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+    let mut request = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    while request.len() < MAX_REQUEST_HEADER_BYTES {
+        let read = stream.read(&mut chunk).unwrap_or_default();
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    request
+}
+
+#[cfg(feature = "blocking-http")]
+fn has_complete_http_request_headers(request: &[u8]) -> bool {
+    request.windows(4).any(|window| window == b"\r\n\r\n")
+}
+
+#[cfg(feature = "blocking-http")]
+fn spawn_http_once(body: &'static str) -> url::Url {
+    use std::{io::Write, net::TcpListener, thread};
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let address = listener.local_addr().expect("local addr");
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read_http_request_headers(&mut stream);
+            if !has_complete_http_request_headers(&request) {
+                continue;
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            break;
+        }
     });
     url::Url::parse(&format!("http://{address}/SCRIPTMETA.txt")).expect("server url")
 }
 
 #[cfg(feature = "blocking-http")]
 fn spawn_http_fail_then_success(body: &'static str) -> url::Url {
-    use std::{
-        io::{Read, Write},
-        net::TcpListener,
-        thread,
-    };
+    use std::{io::Write, net::TcpListener, thread};
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let address = listener.local_addr().expect("local addr");
@@ -3794,17 +4595,252 @@ fn spawn_http_fail_then_success(body: &'static str) -> url::Url {
         if let Ok((stream, _)) = listener.accept() {
             drop(stream);
         }
-        let (mut stream, _) = listener.accept().expect("accept retry");
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept retry");
+            let request = read_http_request_headers(&mut stream);
+            if !has_complete_http_request_headers(&request) {
+                continue;
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            break;
+        }
     });
     url::Url::parse(&format!("http://{address}/SCRIPTMETA.txt")).expect("server url")
+}
+
+#[cfg(feature = "blocking-http")]
+fn spawn_counted_http_error() -> (
+    url::Url,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    spawn_counted_http_status("503 Service Unavailable")
+}
+
+#[cfg(feature = "blocking-http")]
+fn spawn_counted_http_status(
+    status: &'static str,
+) -> (
+    url::Url,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    spawn_counted_http_response(status, "", "")
+}
+
+#[cfg(feature = "blocking-http")]
+fn spawn_counted_http_response(
+    status: &'static str,
+    headers: &'static str,
+    body: &'static str,
+) -> (
+    url::Url,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::{
+        io::Write,
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking test server");
+    let address = listener.local_addr().expect("local addr");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_requests = Arc::clone(&requests);
+    let server_stop = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_http_request_headers(&mut stream);
+                    if !has_complete_http_request_headers(&request) {
+                        continue;
+                    }
+                    server_requests.fetch_add(1, Ordering::AcqRel);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write error response");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept error: {error}"),
+            }
+        }
+    });
+    (
+        url::Url::parse(&format!("http://{address}/SCRIPTMETA.txt")).expect("server url"),
+        requests,
+        stop,
+        server,
+    )
+}
+
+#[cfg(feature = "blocking-http")]
+fn spawn_conditional_http_response(
+    validator_header: &'static str,
+    body: &'static str,
+) -> (
+    url::Url,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::{
+        io::Write,
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind conditional test server");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking conditional test server");
+    let address = listener.local_addr().expect("local addr");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let body_responses = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_requests = Arc::clone(&requests);
+    let server_body_responses = Arc::clone(&body_responses);
+    let server_stop = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_http_request_headers(&mut stream);
+                    if !has_complete_http_request_headers(&request) {
+                        continue;
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    server_requests.fetch_add(1, Ordering::AcqRel);
+                    let conditional = request.contains("if-none-match: \"metadata-v1\"")
+                        || request.contains("if-modified-since:");
+                    let response = if conditional {
+                        format!("HTTP/1.0 304 Not Modified\r\n{validator_header}\r\n")
+                    } else {
+                        server_body_responses.fetch_add(1, Ordering::AcqRel);
+                        format!(
+                            "HTTP/1.1 200 OK\r\n{validator_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write conditional response");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept error: {error}"),
+            }
+        }
+    });
+    (
+        url::Url::parse(&format!("http://{address}/SCRIPTMETA.txt")).expect("server url"),
+        requests,
+        body_responses,
+        stop,
+        server,
+    )
+}
+
+#[cfg(feature = "blocking-http")]
+fn spawn_stalled_http() -> (url::Url, std::sync::mpsc::Receiver<()>) {
+    use std::{io::Read, net::TcpListener, sync::mpsc, thread, time::Duration};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled test server");
+    let address = listener.local_addr().expect("local addr");
+    let (started_sender, started_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept stalled request");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        let _ = started_sender.send(());
+        thread::sleep(Duration::from_secs(3));
+    });
+    (
+        url::Url::parse(&format!("http://{address}/SCRIPTMETA.txt")).expect("server url"),
+        started_receiver,
+    )
+}
+
+#[cfg(feature = "blocking-http")]
+fn spawn_counted_stalled_http() -> (
+    url::Url,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::{
+        io::Read,
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled test server");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_requests = Arc::clone(&requests);
+    let server_stop = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    server_requests.fetch_add(1, Ordering::AcqRel);
+                    thread::spawn(move || {
+                        let mut request = [0_u8; 1024];
+                        let _ = stream.read(&mut request);
+                        thread::sleep(Duration::from_millis(200));
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept error: {error}"),
+            }
+        }
+    });
+    (
+        url::Url::parse(&format!("http://{address}/SCRIPTMETA.txt")).expect("URL"),
+        requests,
+        stop,
+        server,
+    )
 }

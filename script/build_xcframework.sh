@@ -73,6 +73,10 @@ if [[ " ${ARCHITECTURES} " != *" arm64 "* || " ${ARCHITECTURES} " != *" x86_64 "
 fi
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_create_default$'
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_resolve_registered_path$'
+nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_write_script_metadata_file_if_unchanged$'
+nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_file_list_directory_state_ranges$'
+nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_set_operational_policy$'
+nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_start_watching_with_callback$'
 cmp \
   "${ROOT}/scriptmetakit_ffi/include/scriptmetakit_ffi.h" \
   "${STAGED_XCFRAMEWORK_PATH}/macos-arm64_x86_64/Headers/scriptmetakit_ffi.h"
@@ -104,18 +108,30 @@ cat > "${STAGED_MANIFEST_PATH}" <<MANIFEST
 }
 MANIFEST
 
-BACKUP_PATH="${OUT_DIR}/.ScriptMetaKitFFI.xcframework.previous.$$"
+PREVIOUS_XCFRAMEWORK_PATH="${OUT_DIR}/.ScriptMetaKitFFI.xcframework.previous.$$"
+PREVIOUS_MANIFEST_PATH="${OUT_DIR}/.ScriptMetaKitFFI.manifest.previous.$$"
 if [[ -e "${XCFRAMEWORK_PATH}" ]]; then
-  mv "${XCFRAMEWORK_PATH}" "${BACKUP_PATH}"
+  mv "${XCFRAMEWORK_PATH}" "${PREVIOUS_XCFRAMEWORK_PATH}"
 fi
-if ! mv "${STAGED_XCFRAMEWORK_PATH}" "${XCFRAMEWORK_PATH}"; then
-  if [[ -e "${BACKUP_PATH}" ]]; then
-    mv "${BACKUP_PATH}" "${XCFRAMEWORK_PATH}"
+if [[ -e "${MANIFEST_PATH}" ]]; then
+  mv "${MANIFEST_PATH}" "${PREVIOUS_MANIFEST_PATH}"
+fi
+
+if ! mv "${STAGED_XCFRAMEWORK_PATH}" "${XCFRAMEWORK_PATH}" \
+  || ! mv "${STAGED_MANIFEST_PATH}" "${MANIFEST_PATH}"; then
+  rm -rf "${XCFRAMEWORK_PATH}"
+  rm -f "${MANIFEST_PATH}"
+  if [[ -e "${PREVIOUS_XCFRAMEWORK_PATH}" ]]; then
+    mv "${PREVIOUS_XCFRAMEWORK_PATH}" "${XCFRAMEWORK_PATH}"
+  fi
+  if [[ -e "${PREVIOUS_MANIFEST_PATH}" ]]; then
+    mv "${PREVIOUS_MANIFEST_PATH}" "${MANIFEST_PATH}"
   fi
   exit 1
 fi
-rm -rf "${BACKUP_PATH}"
-mv "${STAGED_MANIFEST_PATH}" "${MANIFEST_PATH}"
+
+rm -rf "${PREVIOUS_XCFRAMEWORK_PATH}"
+rm -f "${PREVIOUS_MANIFEST_PATH}"
 
 echo "Created ${XCFRAMEWORK_PATH}"
 echo "Manifest ${MANIFEST_PATH}"

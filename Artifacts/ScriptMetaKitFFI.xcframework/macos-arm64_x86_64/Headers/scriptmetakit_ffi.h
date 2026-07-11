@@ -15,6 +15,7 @@ typedef enum SmkStatus {
     SMK_STATUS_INVALID_ARGUMENT = 3,
     SMK_STATUS_ENGINE_ERROR = 4,
     SMK_STATUS_PANIC = 5,
+    SMK_STATUS_CONFLICT = 6,
 } SmkStatus;
 
 typedef struct SmkEngine SmkEngine;
@@ -40,6 +41,19 @@ typedef struct SmkRootSnapshot {
     SmkUtf8Slice error_code;
     SmkUtf8Slice error_message;
 } SmkRootSnapshot;
+
+typedef struct SmkOperationalPolicy {
+    size_t max_concurrent_meta_url_checks;
+    size_t retry_attempts;
+    uint64_t retry_initial_delay_millis;
+    uint32_t retry_backoff_multiplier;
+    uint64_t max_retry_delay_millis;
+    uint64_t request_timeout_millis;
+    uint64_t resource_timeout_millis;
+    uint64_t watcher_debounce_delay_millis;
+    uint64_t watcher_max_delivery_delay_millis;
+    size_t watcher_max_pending_paths;
+} SmkOperationalPolicy;
 
 typedef struct SmkRootRegistration {
     SmkUtf8Slice root_id;
@@ -161,6 +175,21 @@ typedef struct SmkFileListSnapshot {
     size_t child_count;
     uint8_t truncated;
 } SmkFileListSnapshot;
+
+typedef struct SmkFileListDirectoryStateRange {
+    size_t first_directory_state_index;
+    size_t directory_state_count;
+} SmkFileListDirectoryStateRange;
+
+typedef struct SmkDirectoryStateEntry {
+    SmkUtf8Slice path;
+    uint8_t has_modification_time_millis;
+    uint64_t modification_time_millis;
+    size_t child_count;
+    uint64_t child_fingerprint;
+    uint8_t has_identity;
+    SmkFileIdentity identity;
+} SmkDirectoryStateEntry;
 
 typedef struct SmkCandidateRecord {
     SmkUtf8Slice root_id;
@@ -312,6 +341,16 @@ typedef struct SmkFileListSnapshotSlice {
     const SmkFileListSnapshot *ptr;
     size_t len;
 } SmkFileListSnapshotSlice;
+
+typedef struct SmkFileListDirectoryStateRangeSlice {
+    const SmkFileListDirectoryStateRange *ptr;
+    size_t len;
+} SmkFileListDirectoryStateRangeSlice;
+
+typedef struct SmkDirectoryStateEntrySlice {
+    const SmkDirectoryStateEntry *ptr;
+    size_t len;
+} SmkDirectoryStateEntrySlice;
 
 typedef struct SmkFileEntrySlice {
     const SmkFileEntry *ptr;
@@ -618,6 +657,11 @@ SmkStatus smk_engine_set_decompile_compiled_osa_during_scan(SmkEngine *engine, u
 
 SmkStatus smk_engine_set_native_event_latency_millis(SmkEngine *engine, uint64_t latency_millis);
 
+SmkStatus smk_engine_set_operational_policy(
+    SmkEngine *engine,
+    const SmkOperationalPolicy *policy
+);
+
 SmkStatus smk_engine_set_root_preflight_options(
     SmkEngine *engine,
     uint8_t reject_trash_roots,
@@ -631,6 +675,11 @@ SmkStatus smk_engine_set_root_preflight_options(
 );
 
 SmkStatus smk_engine_cancel_current_operation(SmkEngine *engine);
+
+/* Internal Swift Task hand-off support. Pair reserve with finish. */
+SmkStatus smk_engine_reserve_next_operation(SmkEngine *engine);
+SmkStatus smk_engine_finish_operation_reservation(SmkEngine *engine);
+SmkStatus smk_engine_cancel_current_or_reserved_operation(SmkEngine *engine);
 
 SmkStatus smk_engine_scan_folder(
     SmkEngine *engine,
@@ -804,6 +853,11 @@ SmkStatus smk_engine_start_watching_with_callback(
 );
 SmkStatus smk_engine_stop_watching(SmkEngine *engine);
 
+SmkStatus smk_engine_watcher_requires_restart(
+    SmkEngine *engine,
+    uint8_t *out_requires_restart
+);
+
 SmkStatus smk_engine_poll_watcher_scan(
     SmkEngine *engine,
     uint8_t *out_changed,
@@ -841,6 +895,16 @@ SmkStatus smk_scan_result_file_lists(
 SmkStatus smk_scan_result_file_entries(
     const SmkScanResult *result,
     SmkFileEntrySlice *out_file_entries
+);
+
+SmkStatus smk_scan_result_file_list_directory_state_ranges(
+    const SmkScanResult *result,
+    SmkFileListDirectoryStateRangeSlice *out_ranges
+);
+
+SmkStatus smk_scan_result_directory_states(
+    const SmkScanResult *result,
+    SmkDirectoryStateEntrySlice *out_directory_states
 );
 
 SmkStatus smk_scan_result_items(
@@ -938,6 +1002,13 @@ void smk_scan_result_free(SmkScanResult *result);
 SmkStatus smk_engine_write_script_metadata_file(
     SmkEngine *engine,
     const SmkScriptMetadataWriteRequest *request,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_write_script_metadata_file_if_unchanged(
+    SmkEngine *engine,
+    const SmkScriptMetadataWriteRequest *request,
+    SmkUtf8Slice expected_source_fingerprint,
     SmkEditResult **out_result
 );
 

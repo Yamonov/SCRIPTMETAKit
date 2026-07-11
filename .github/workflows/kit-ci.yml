@@ -1,0 +1,40 @@
+name: SCRIPTMETAKit macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: clippy,rustfmt
+      - name: Rust formatting
+        run: cargo fmt --all --check
+      - name: Rust default feature boundary
+        run: cargo check --workspace --no-default-features
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust unit tests
+        run: cargo test --workspace --all-features --lib
+      - name: Rust package tests
+        run: cargo test -p scriptmetakit --all-features --test package_smoke -- --test-threads=1
+      - name: Rust FFI tests
+        run: cargo test -p scriptmetakit_ffi --all-features --test ffi_smoke
+      - name: Build binary XCFramework
+        run: ./script/build_xcframework.sh
+      - name: Reject local build paths in the binary
+        run: |
+          if strings Artifacts/ScriptMetaKitFFI.xcframework/macos-arm64_x86_64/libscriptmetakit_ffi.dylib | grep -F "$GITHUB_WORKSPACE"; then
+            echo "XCFramework contains the checkout path"
+            exit 1
+          fi
+      - name: Swift 5 language compatibility
+        run: swift test -Xswiftc -swift-version -Xswiftc 5
+      - name: Swift 6 strict concurrency
+        run: swift test -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -strict-concurrency=complete

@@ -8,8 +8,9 @@ use std::{
 
 use scriptmetakit_ffi::{
     SmkDistributionMetadataDraft, SmkDistributionResolutionEntrySlice, SmkEditResult, SmkEngine,
-    SmkFileEntryChangeSlice, SmkFileEntrySlice, SmkFileIssueSlice, SmkFileListSnapshotSlice,
-    SmkOperationInfo, SmkRootRegistration, SmkRootSnapshotSlice, SmkScanChangeInfo, SmkScanResult,
+    SmkFileEntryChangeSlice, SmkFileEntrySlice, SmkFileIssueSlice,
+    SmkFileListDirectoryStateRangeSlice, SmkFileListSnapshotSlice, SmkOperationInfo,
+    SmkRootRegistration, SmkRootSnapshotSlice, SmkScanChangeInfo, SmkScanResult,
     SmkScriptItemSlice, SmkScriptMetaBackupGenerationSlice, SmkScriptMetaBackupRecord,
     SmkScriptMetadataDraft, SmkScriptMetadataEditPreviewResult, SmkScriptMetadataFileWriteResult,
     SmkScriptMetadataWriteRequest, SmkStatus, SmkUpdateCheckInfo, SmkUpdateProgress,
@@ -17,17 +18,21 @@ use scriptmetakit_ffi::{
     smk_edit_result_backup_generations, smk_edit_result_backup_record,
     smk_edit_result_file_write_result, smk_edit_result_free,
     smk_edit_result_metadata_edit_preview_result, smk_edit_result_text,
-    smk_engine_cancel_current_operation, smk_engine_check_update_item,
-    smk_engine_check_updates_for_items, smk_engine_create_default, smk_engine_free,
+    smk_engine_cancel_current_operation, smk_engine_cancel_current_or_reserved_operation,
+    smk_engine_check_update_item, smk_engine_check_updates_for_items, smk_engine_create_default,
+    smk_engine_finish_operation_reservation, smk_engine_free,
     smk_engine_generate_edit_password_sha256, smk_engine_last_error,
     smk_engine_read_script_metadata_edit_preview_file, smk_engine_render_distribution_metadata,
-    smk_engine_restore_scriptmeta_backup, smk_engine_scan_folder, smk_engine_scan_folders,
+    smk_engine_reserve_next_operation, smk_engine_restore_scriptmeta_backup,
+    smk_engine_save_cache_file, smk_engine_scan_folder, smk_engine_scan_folders,
     smk_engine_scan_folders_with_progress, smk_engine_scan_registered_roots, smk_engine_scan_roots,
     smk_engine_scriptmeta_backup_generations, smk_engine_set_resolve_macos_alias,
     smk_engine_set_roots, smk_engine_set_visible_root, smk_engine_verify_edit_password_sha256,
-    smk_engine_write_script_metadata_file, smk_normalize_version_string,
+    smk_engine_watcher_requires_restart, smk_engine_write_script_metadata_file,
+    smk_engine_write_script_metadata_file_if_unchanged, smk_normalize_version_string,
     smk_scan_result_change_info, smk_scan_result_file_entries, smk_scan_result_file_entry_changes,
-    smk_scan_result_file_issues, smk_scan_result_file_items, smk_scan_result_file_lists,
+    smk_scan_result_file_issues, smk_scan_result_file_items,
+    smk_scan_result_file_list_directory_state_ranges, smk_scan_result_file_lists,
     smk_scan_result_free, smk_scan_result_items, smk_scan_result_operation_info,
     smk_scan_result_roots, smk_scan_result_update_info, smk_scan_result_update_resolutions,
     smk_scan_result_update_statuses, smk_validate_edit_password_sha256_format,
@@ -321,6 +326,58 @@ fn configures_alias_resolution_through_ffi() {
 }
 
 #[test]
+fn ffi_cancellation_is_limited_to_the_current_or_reserved_operation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Example.jsx"), "alert('ok');\n").expect("script");
+    let path = temp.path().to_string_lossy().into_owned();
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+
+    let scan = |engine: *mut SmkEngine| {
+        let mut result: *mut SmkScanResult = ptr::null_mut();
+        assert_eq!(
+            unsafe { smk_engine_scan_folder(engine, path.as_ptr(), path.len(), &mut result) },
+            SmkStatus::Ok
+        );
+        assert!(!result.is_null());
+        let mut operation = SmkOperationInfo::default();
+        assert_eq!(
+            unsafe { smk_scan_result_operation_info(result, &mut operation) },
+            SmkStatus::Ok
+        );
+        unsafe { smk_scan_result_free(result) };
+        operation.cancelled
+    };
+
+    assert_eq!(scan(engine), 0);
+    assert_eq!(
+        unsafe { smk_engine_cancel_current_operation(engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(scan(engine), 0, "idle cancel must not affect the next scan");
+
+    assert_eq!(
+        unsafe { smk_engine_reserve_next_operation(engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_cancel_current_or_reserved_operation(engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(scan(engine), 1, "the reserved scan must be cancelled");
+    assert_eq!(
+        unsafe { smk_engine_finish_operation_reservation(engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(scan(engine), 0, "reservation cancel must not leak");
+
+    unsafe { smk_engine_free(engine) };
+}
+
+#[test]
 fn reads_script_metadata_edit_preview_through_ffi() {
     let temp = tempfile::tempdir().expect("tempdir");
     let script_path = temp.path().join("Preview.jsx");
@@ -593,6 +650,23 @@ fn keeps_file_list_direct_children_contiguous() {
     assert_eq!(file_lists.len, 1);
     // SAFETY: `file_lists` is borrowed from `scan_result` and the result is still alive.
     let file_lists = unsafe { slice::from_raw_parts(file_lists.ptr, file_lists.len) };
+
+    let mut directory_state_ranges = SmkFileListDirectoryStateRangeSlice::default();
+    // SAFETY: `scan_result` is live and `directory_state_ranges` is writable.
+    assert_eq!(
+        unsafe {
+            smk_scan_result_file_list_directory_state_ranges(
+                scan_result,
+                &mut directory_state_ranges,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(directory_state_ranges.len, file_lists.len());
+    // SAFETY: `directory_state_ranges` is borrowed from the live scan result.
+    let directory_state_ranges =
+        unsafe { slice::from_raw_parts(directory_state_ranges.ptr, directory_state_ranges.len) };
+    assert!(directory_state_ranges[0].directory_state_count > 0);
 
     let mut file_entries = SmkFileEntrySlice {
         ptr: ptr::null(),
@@ -1190,6 +1264,45 @@ fn reports_file_changes_through_reused_engine() {
 }
 
 #[test]
+fn identical_cache_save_skips_rewriting_the_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Example.jsx"), "alert('ok');").expect("script");
+    let cache_path = temp.path().join("cache.json");
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    let root = temp.path().to_string_lossy().into_owned();
+    let mut scan_result: *mut SmkScanResult = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_scan_folders(engine, &utf8_slice(&root), 1, 0, &mut scan_result) },
+        SmkStatus::Ok
+    );
+    unsafe { smk_scan_result_free(scan_result) };
+    let cache = cache_path.to_string_lossy().into_owned();
+    assert_eq!(
+        unsafe { smk_engine_save_cache_file(engine, 0, utf8_slice(&cache)) },
+        SmkStatus::Ok
+    );
+    let first_modified = std::fs::metadata(&cache_path)
+        .expect("first cache")
+        .modified()
+        .expect("first modified");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(
+        unsafe { smk_engine_save_cache_file(engine, 0, utf8_slice(&cache)) },
+        SmkStatus::Ok
+    );
+    let second_modified = std::fs::metadata(&cache_path)
+        .expect("second cache")
+        .modified()
+        .expect("second modified");
+    assert_eq!(first_modified, second_modified);
+    unsafe { smk_engine_free(engine) };
+}
+
+#[test]
 fn preserves_update_result_through_non_update_ffi_scan() {
     let temp = tempfile::tempdir().expect("tempdir");
     let dist_path = temp.path().join("SCRIPTMETA.txt");
@@ -1305,15 +1418,36 @@ fn starts_and_polls_native_watcher_through_ffi() {
     // SAFETY: `engine` is live and already has roots from the scan above.
     assert_eq!(unsafe { smk_engine_start_watching(engine) }, SmkStatus::Ok);
 
-    let mut changed = 1_u8;
+    let mut requires_restart = 1_u8;
+    assert_eq!(
+        unsafe { smk_engine_watcher_requires_restart(engine, &mut requires_restart) },
+        SmkStatus::Ok
+    );
+    assert_eq!(requires_restart, 0);
+    assert_eq!(
+        unsafe { smk_engine_set_visible_root(engine, SmkUtf8Slice::default(), 0) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_watcher_requires_restart(engine, &mut requires_restart) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        requires_restart, 0,
+        "clearing visible root under AllRegistered must not restart the watcher"
+    );
+
+    let mut changed = 0_u8;
     let mut changed_result: *mut SmkScanResult = ptr::null_mut();
     // SAFETY: `engine` is live and output pointers are writable.
     assert_eq!(
         unsafe { smk_engine_poll_watcher_scan(engine, &mut changed, &mut changed_result) },
         SmkStatus::Ok
     );
-    assert_eq!(changed, 0);
-    assert!(changed_result.is_null());
+    assert_eq!(changed, 1);
+    assert!(!changed_result.is_null());
+    // SAFETY: result handle was returned by this FFI crate and is still live.
+    unsafe { smk_scan_result_free(changed_result) };
 
     // SAFETY: `engine` is live.
     assert_eq!(unsafe { smk_engine_stop_watching(engine) }, SmkStatus::Ok);
@@ -1377,6 +1511,23 @@ fn notifies_when_native_watcher_receives_change() {
         },
         SmkStatus::Ok
     );
+
+    let mut initial_changed = 0_u8;
+    let mut initial_result: *mut SmkScanResult = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            smk_engine_poll_watcher_scan_dirty_only(
+                engine,
+                &mut initial_changed,
+                &mut initial_result,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(initial_changed, 1);
+    assert!(!initial_result.is_null());
+    unsafe { smk_scan_result_free(initial_result) };
+    notification_count.store(0, Ordering::SeqCst);
 
     thread::sleep(Duration::from_millis(250));
     std::fs::write(temp.path().join("Added.jsx"), "alert('added');").expect("added");
@@ -1480,6 +1631,28 @@ fn writes_script_metadata_and_restores_backup_through_ffi() {
         name: utf8_slice(name),
         ..SmkScriptMetadataDraft::default()
     };
+    let stale_fingerprint = "not-the-current-source-fingerprint";
+    let stale_request = SmkScriptMetadataWriteRequest {
+        file_path: utf8_slice(&file_path),
+        backup_root_path: SmkUtf8Slice::default(),
+        write_mode: 0,
+        draft,
+    };
+    let mut stale_result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: `engine` is live, request slices are valid for this call, and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_write_script_metadata_file_if_unchanged(
+                engine,
+                &stale_request,
+                utf8_slice(stale_fingerprint),
+                &mut stale_result,
+            )
+        },
+        SmkStatus::Conflict
+    );
+    assert!(stale_result.is_null());
+
     let request = SmkScriptMetadataWriteRequest {
         file_path: utf8_slice(&file_path),
         backup_root_path: utf8_slice(&backup_root_path),

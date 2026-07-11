@@ -3,6 +3,7 @@ import Foundation
 public nonisolated enum ScriptMetaKitError: LocalizedError {
     case engineCreationFailed(Int32)
     case operationFailed(Int32, String)
+    case sourceConflict(String)
 
     public var errorDescription: String? {
         switch self {
@@ -10,6 +11,8 @@ public nonisolated enum ScriptMetaKitError: LocalizedError {
             "SCRIPTMETAKit engineを作成できませんでした。status=\(status)"
         case .operationFailed(_, let message):
             message.isEmpty ? "SCRIPTMETAKit FFI呼び出しに失敗しました。" : message
+        case .sourceConflict(let message):
+            message.isEmpty ? "The script changed after it was loaded." : message
         }
     }
 }
@@ -41,6 +44,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         _ operation: @escaping @Sendable (ScriptMetaKitFFIEngineBox) throws -> Result
     ) async throws -> Result {
         let ticket = ScriptMetaKitOperationTicket()
+        engineBox.registerOperationTicket(ticket)
         let task = Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.runOperation(ticket: ticket) {
                 try operation(engineBox)
@@ -52,8 +56,10 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
             try Task.checkCancellation()
             return result
         } onCancel: { [engineBox] in
-            if ticket.requestCancellation() {
-                engineBox.cancelCurrentOperation()
+            let shouldCancelActiveOperation = ticket.requestCancellation()
+            engineBox.notifyOperationWaiters()
+            if shouldCancelActiveOperation {
+                engineBox.cancelCurrentOrReservedOperation()
             }
         }
     }
@@ -160,7 +166,14 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         engineBox.cancelCurrentOperation()
     }
 
-    public func shutdown() async {
+    func cancelCurrentOrPendingOperationForTermination() {
+        engineBox.cancelCurrentOrPendingOperation()
+    }
+
+    public func shutdown(cancelCurrentOperation: Bool = false) async {
+        if cancelCurrentOperation {
+            engineBox.cancelCurrentOrPendingOperation()
+        }
         _ = try? await runOperation { engineBox in
             engineBox.shutdown()
         }
@@ -217,7 +230,10 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         }
     }
 
-    public func stopWatching() async {
+    public func stopWatching(cancelCurrentOperation: Bool = false) async {
+        if cancelCurrentOperation {
+            engineBox.cancelCurrentOrPendingOperation()
+        }
         _ = try? await runOperation { engineBox in
             engineBox.stopWatching()
         }
@@ -238,6 +254,12 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     public func setNativeEventLatencyMillis(_ latencyMillis: UInt64) async throws {
         try await runOperation { engineBox in
             try engineBox.setNativeEventLatencyMillis(latencyMillis)
+        }
+    }
+
+    public func setOperationalPolicy(_ policy: ScriptMetaKitOperationalPolicy) async throws {
+        try await runOperation { engineBox in
+            try engineBox.setOperationalPolicy(policy)
         }
     }
 
@@ -263,14 +285,16 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         fileURL: URL,
         draft: ScriptMetadataDraft,
         mode: ScriptMetaWriteMode = .insertOrReplace,
-        backupRootURL: URL? = nil
+        backupRootURL: URL? = nil,
+        expectedSourceFingerprint: String? = nil
     ) async throws -> ScriptMetadataFileWriteResult {
         try await runOperation { engineBox in
             try engineBox.writeScriptMetadata(
                 fileURL: fileURL,
                 draft: draft,
                 mode: mode,
-                backupRootURL: backupRootURL
+                backupRootURL: backupRootURL,
+                expectedSourceFingerprint: expectedSourceFingerprint
             )
         }
     }
@@ -372,6 +396,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
 
 private nonisolated let smkStatusOK: Int32 = 0
 private nonisolated let smkStatusInvalidArgument: Int32 = 3
+private nonisolated let smkStatusConflict: Int32 = 6
 
 private nonisolated struct SmkUtf8Slice {
     var ptr: UnsafePointer<UInt8>?
@@ -392,6 +417,19 @@ private nonisolated struct SmkRootRegistration {
     var cachePolicy: UInt32
     var refreshPolicy: UInt32
     var priority: UInt32
+}
+
+private nonisolated struct SmkOperationalPolicy {
+    var maxConcurrentMetaURLChecks: Int
+    var retryAttempts: Int
+    var retryInitialDelayMillis: UInt64
+    var retryBackoffMultiplier: UInt32
+    var maxRetryDelayMillis: UInt64
+    var requestTimeoutMillis: UInt64
+    var resourceTimeoutMillis: UInt64
+    var watcherDebounceDelayMillis: UInt64
+    var watcherMaxDeliveryDelayMillis: UInt64
+    var watcherMaxPendingPaths: Int
 }
 
 private nonisolated struct SmkRegisteredRootSignature {
@@ -475,6 +513,21 @@ private nonisolated struct SmkFileListSnapshot {
     var firstChildIndex: Int
     var childCount: Int
     var truncated: UInt8
+}
+
+private nonisolated struct SmkFileListDirectoryStateRange {
+    var firstDirectoryStateIndex: Int
+    var directoryStateCount: Int
+}
+
+private nonisolated struct SmkDirectoryStateEntry {
+    var path: SmkUtf8Slice
+    var hasModificationTimeMillis: UInt8
+    var modificationTimeMillis: UInt64
+    var childCount: Int
+    var childFingerprint: UInt64
+    var hasIdentity: UInt8
+    var identity: SmkFileIdentity
 }
 
 private nonisolated struct SmkScriptItem {
@@ -748,6 +801,26 @@ private nonisolated struct SmkFileListSnapshotSlice {
     var len: Int
 
     init(ptr: UnsafePointer<SmkFileListSnapshot>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
+private nonisolated struct SmkFileListDirectoryStateRangeSlice {
+    var ptr: UnsafePointer<SmkFileListDirectoryStateRange>?
+    var len: Int
+
+    init(ptr: UnsafePointer<SmkFileListDirectoryStateRange>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
+private nonisolated struct SmkDirectoryStateEntrySlice {
+    var ptr: UnsafePointer<SmkDirectoryStateEntry>?
+    var len: Int
+
+    init(ptr: UnsafePointer<SmkDirectoryStateEntry>? = nil, len: Int = 0) {
         self.ptr = ptr
         self.len = len
     }
@@ -1154,6 +1227,12 @@ private nonisolated func smk_engine_set_decompile_compiled_osa_during_scan(_ eng
 @_silgen_name("smk_engine_set_native_event_latency_millis")
 private nonisolated func smk_engine_set_native_event_latency_millis(_ engine: OpaquePointer?, _ latencyMillis: UInt64) -> Int32
 
+@_silgen_name("smk_engine_set_operational_policy")
+private nonisolated func smk_engine_set_operational_policy(
+    _ engine: OpaquePointer?,
+    _ policy: UnsafePointer<SmkOperationalPolicy>?
+) -> Int32
+
 @_silgen_name("smk_engine_set_root_preflight_options")
 private nonisolated func smk_engine_set_root_preflight_options(
     _ engine: OpaquePointer?,
@@ -1169,6 +1248,15 @@ private nonisolated func smk_engine_set_root_preflight_options(
 
 @_silgen_name("smk_engine_cancel_current_operation")
 private nonisolated func smk_engine_cancel_current_operation(_ engine: OpaquePointer?) -> Int32
+
+@_silgen_name("smk_engine_reserve_next_operation")
+private nonisolated func smk_engine_reserve_next_operation(_ engine: OpaquePointer?) -> Int32
+
+@_silgen_name("smk_engine_finish_operation_reservation")
+private nonisolated func smk_engine_finish_operation_reservation(_ engine: OpaquePointer?) -> Int32
+
+@_silgen_name("smk_engine_cancel_current_or_reserved_operation")
+private nonisolated func smk_engine_cancel_current_or_reserved_operation(_ engine: OpaquePointer?) -> Int32
 
 @_silgen_name("smk_engine_set_roots")
 private nonisolated func smk_engine_set_roots(
@@ -1398,6 +1486,12 @@ private nonisolated func smk_engine_start_watching_with_callback(
 @_silgen_name("smk_engine_stop_watching")
 private nonisolated func smk_engine_stop_watching(_ engine: OpaquePointer?) -> Int32
 
+@_silgen_name("smk_engine_watcher_requires_restart")
+private nonisolated func smk_engine_watcher_requires_restart(
+    _ engine: OpaquePointer?,
+    _ outRequiresRestart: UnsafeMutablePointer<UInt8>
+) -> Int32
+
 @_silgen_name("smk_engine_poll_watcher_scan")
 private nonisolated func smk_engine_poll_watcher_scan(
     _ engine: OpaquePointer?,
@@ -1429,6 +1523,18 @@ private nonisolated func smk_scan_result_file_lists(_ result: OpaquePointer?, _ 
 
 @_silgen_name("smk_scan_result_file_entries")
 private nonisolated func smk_scan_result_file_entries(_ result: OpaquePointer?, _ outFileEntries: UnsafeMutablePointer<SmkFileEntrySlice>) -> Int32
+
+@_silgen_name("smk_scan_result_file_list_directory_state_ranges")
+private nonisolated func smk_scan_result_file_list_directory_state_ranges(
+    _ result: OpaquePointer?,
+    _ outRanges: UnsafeMutablePointer<SmkFileListDirectoryStateRangeSlice>
+) -> Int32
+
+@_silgen_name("smk_scan_result_directory_states")
+private nonisolated func smk_scan_result_directory_states(
+    _ result: OpaquePointer?,
+    _ outDirectoryStates: UnsafeMutablePointer<SmkDirectoryStateEntrySlice>
+) -> Int32
 
 @_silgen_name("smk_scan_result_items")
 private nonisolated func smk_scan_result_items(_ result: OpaquePointer?, _ outItems: UnsafeMutablePointer<SmkScriptItemSlice>) -> Int32
@@ -1494,6 +1600,14 @@ private nonisolated func smk_scan_result_free(_ result: OpaquePointer?)
 private nonisolated func smk_engine_write_script_metadata_file(
     _ engine: OpaquePointer?,
     _ request: UnsafePointer<SmkScriptMetadataWriteRequest>?,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
+@_silgen_name("smk_engine_write_script_metadata_file_if_unchanged")
+private nonisolated func smk_engine_write_script_metadata_file_if_unchanged(
+    _ engine: OpaquePointer?,
+    _ request: UnsafePointer<SmkScriptMetadataWriteRequest>?,
+    _ expectedSourceFingerprint: SmkUtf8Slice,
     _ outResult: UnsafeMutablePointer<OpaquePointer?>
 ) -> Int32
 
@@ -1682,7 +1796,10 @@ private nonisolated final class ScriptMetaKitOperationTicket: @unchecked Sendabl
 }
 
 private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
-    private let operationGate = NSLock()
+    private let operationCondition = NSCondition()
+    private var operationIsActive = false
+    private var operationTickets: [ScriptMetaKitOperationTicket] = []
+    private var activeOperationTicket: ScriptMetaKitOperationTicket?
     private let lock = NSLock()
     private let cancellationLock = NSLock()
     private var engine: ScriptMetaKitFFIEngine?
@@ -1697,19 +1814,74 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         ticket: ScriptMetaKitOperationTicket,
         _ operation: () throws -> Result
     ) throws -> Result {
-        while operationGate.try() == false {
+        defer { unregisterOperationTicket(ticket) }
+        operationCondition.lock()
+        while operationIsActive {
             if ticket.isCancellationRequested {
+                operationCondition.unlock()
                 throw CancellationError()
             }
-            Thread.sleep(forTimeInterval: 0.005)
+            operationCondition.wait()
         }
-        defer { operationGate.unlock() }
+        if ticket.isCancellationRequested {
+            operationCondition.unlock()
+            throw CancellationError()
+        }
+        operationIsActive = true
+        activeOperationTicket = ticket
+        operationCondition.unlock()
+        defer {
+            operationCondition.lock()
+            operationIsActive = false
+            activeOperationTicket = nil
+            operationCondition.broadcast()
+            operationCondition.unlock()
+        }
 
+        let reservationEngine = try prepareOperationCancellation()
+        defer { reservationEngine.finishOperationReservation() }
         guard ticket.activate() else {
             throw CancellationError()
         }
         defer { ticket.finish() }
         return try operation()
+    }
+
+    func registerOperationTicket(_ ticket: ScriptMetaKitOperationTicket) {
+        operationCondition.lock()
+        operationTickets.append(ticket)
+        operationCondition.unlock()
+    }
+
+    private func unregisterOperationTicket(_ ticket: ScriptMetaKitOperationTicket) {
+        operationCondition.lock()
+        operationTickets.removeAll { $0 === ticket }
+        operationCondition.unlock()
+    }
+
+    func cancelCurrentOrPendingOperation() {
+        operationCondition.lock()
+        let ticket = activeOperationTicket ?? operationTickets.first
+        let shouldCancelNativeOperation = ticket?.requestCancellation() ?? false
+        operationCondition.broadcast()
+        operationCondition.unlock()
+        if shouldCancelNativeOperation {
+            cancelCurrentOrReservedOperation()
+        }
+    }
+
+    func notifyOperationWaiters() {
+        operationCondition.lock()
+        operationCondition.broadcast()
+        operationCondition.unlock()
+    }
+
+    private func prepareOperationCancellation() throws -> ScriptMetaKitFFIEngine {
+        lock.lock()
+        defer { lock.unlock() }
+        let engine = try ensureEngineLocked()
+        try engine.reserveNextOperation()
+        return engine
     }
 
     private func ensureEngineLocked() throws -> ScriptMetaKitFFIEngine {
@@ -1729,6 +1901,13 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         let engine = cancellationEngine
         cancellationLock.unlock()
         engine?.cancelCurrentOperation()
+    }
+
+    public func cancelCurrentOrReservedOperation() {
+        cancellationLock.lock()
+        let engine = cancellationEngine
+        cancellationLock.unlock()
+        engine?.cancelCurrentOrReservedOperation()
     }
 
     public func shutdown() {
@@ -1876,6 +2055,7 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
 
     private func restartWatcherIfNeeded() throws {
         guard let sink = watchNotificationSink, let engine else { return }
+        guard try engine.watcherRequiresRestart() else { return }
         engine.stopWatching()
         do {
             try engine.startWatching(notificationSink: sink)
@@ -1904,6 +2084,13 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         try restartWatcherIfNeeded()
     }
 
+    public func setOperationalPolicy(_ policy: ScriptMetaKitOperationalPolicy) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureEngineLocked().setOperationalPolicy(policy)
+        try restartWatcherIfNeeded()
+    }
+
     public func setRootPreflightOptions(_ options: ScriptMetaRootPreflightOptions) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -1926,7 +2113,8 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         fileURL: URL,
         draft: ScriptMetadataDraft,
         mode: ScriptMetaWriteMode,
-        backupRootURL: URL?
+        backupRootURL: URL?,
+        expectedSourceFingerprint: String?
     ) throws -> ScriptMetadataFileWriteResult {
         lock.lock()
         defer { lock.unlock() }
@@ -1934,7 +2122,8 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
             fileURL: fileURL,
             draft: draft,
             mode: mode,
-            backupRootURL: backupRootURL
+            backupRootURL: backupRootURL,
+            expectedSourceFingerprint: expectedSourceFingerprint
         )
     }
 
@@ -2438,6 +2627,27 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         }
     }
 
+    public func setOperationalPolicy(_ policy: ScriptMetaKitOperationalPolicy) throws {
+        var ffiPolicy = SmkOperationalPolicy(
+            maxConcurrentMetaURLChecks: policy.maxConcurrentMetaURLChecks,
+            retryAttempts: policy.retryAttempts,
+            retryInitialDelayMillis: policy.retryInitialDelayMillis,
+            retryBackoffMultiplier: policy.retryBackoffMultiplier,
+            maxRetryDelayMillis: policy.maxRetryDelayMillis,
+            requestTimeoutMillis: policy.requestTimeoutMillis,
+            resourceTimeoutMillis: policy.resourceTimeoutMillis,
+            watcherDebounceDelayMillis: policy.watcherDebounceDelayMillis,
+            watcherMaxDeliveryDelayMillis: policy.watcherMaxDeliveryDelayMillis,
+            watcherMaxPendingPaths: policy.watcherMaxPendingPaths
+        )
+        let status = withUnsafePointer(to: &ffiPolicy) {
+            smk_engine_set_operational_policy(handle, $0)
+        }
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
     public func setRootPreflightOptions(_ options: ScriptMetaRootPreflightOptions) throws {
         guard options.maxScannedItems >= 0,
               options.minScannedFileCountForLargeRoot >= 0,
@@ -2488,11 +2698,27 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         _ = smk_engine_cancel_current_operation(handle)
     }
 
+    public func reserveNextOperation() throws {
+        let status = smk_engine_reserve_next_operation(handle)
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
+    public func finishOperationReservation() {
+        _ = smk_engine_finish_operation_reservation(handle)
+    }
+
+    public func cancelCurrentOrReservedOperation() {
+        _ = smk_engine_cancel_current_or_reserved_operation(handle)
+    }
+
     public func writeScriptMetadata(
         fileURL: URL,
         draft: ScriptMetadataDraft,
         mode: ScriptMetaWriteMode,
-        backupRootURL: URL?
+        backupRootURL: URL?,
+        expectedSourceFingerprint: String?
     ) throws -> ScriptMetadataFileWriteResult {
         let arena = SmkInputStringArena()
         var request = SmkScriptMetadataWriteRequest(
@@ -2504,8 +2730,16 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         var result: OpaquePointer?
         let status = withExtendedLifetime(arena) {
             withUnsafePointer(to: &request) { requestPointer in
-                smk_engine_write_script_metadata_file(handle, requestPointer, &result)
+                smk_engine_write_script_metadata_file_if_unchanged(
+                    handle,
+                    requestPointer,
+                    arena.slice(expectedSourceFingerprint),
+                    &result
+                )
             }
+        }
+        if status == smkStatusConflict {
+            throw ScriptMetaKitError.sourceConflict(lastErrorMessage())
         }
         guard status == smkStatusOK, let result else {
             throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
@@ -2767,6 +3001,15 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         _ = smk_engine_stop_watching(handle)
     }
 
+    public func watcherRequiresRestart() throws -> Bool {
+        var requiresRestart: UInt8 = 0
+        let status = smk_engine_watcher_requires_restart(handle, &requiresRestart)
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+        return requiresRestart != 0
+    }
+
     public func pollWatchChanges(dirtyOnly: Bool = false) throws -> ScriptMetaScanResult? {
         var changed: UInt8 = 0
         var result: OpaquePointer?
@@ -2816,9 +3059,17 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
     try check(smk_scan_result_file_entries(result, &fileEntrySlice))
     let ffiFileEntries = buffer(from: fileEntrySlice)
 
+    var directoryStateSlice = SmkDirectoryStateEntrySlice()
+    try check(smk_scan_result_directory_states(result, &directoryStateSlice))
+    let ffiDirectoryStates = buffer(from: directoryStateSlice)
+
+    var directoryStateRangeSlice = SmkFileListDirectoryStateRangeSlice()
+    try check(smk_scan_result_file_list_directory_state_ranges(result, &directoryStateRangeSlice))
+    let ffiDirectoryStateRanges = buffer(from: directoryStateRangeSlice)
+
     var fileListSlice = SmkFileListSnapshotSlice()
     try check(smk_scan_result_file_lists(result, &fileListSlice))
-    let fileListSnapshots = buffer(from: fileListSlice).map { snapshot -> FileListSnapshot in
+    let fileListSnapshots = buffer(from: fileListSlice).enumerated().map { index, snapshot -> FileListSnapshot in
         let root = roots.indices.contains(snapshot.rootIndex)
             ? roots[snapshot.rootIndex]
             : RootSnapshot(
@@ -2831,6 +3082,9 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
                 itemCount: 0,
                 error: RootError(code: "invalid_root_index", message: "invalid root index returned by SCRIPTMETAKit")
             )
+        let directoryStateRange = ffiDirectoryStateRanges.indices.contains(index)
+            ? ffiDirectoryStateRanges[index]
+            : SmkFileListDirectoryStateRange(firstDirectoryStateIndex: 0, directoryStateCount: 0)
         return FileListSnapshot(
             root: root,
             children: fileEntries(
@@ -2838,7 +3092,11 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
                 firstIndex: snapshot.firstChildIndex,
                 count: snapshot.childCount
             ),
-            directoryStates: [:],
+            directoryStates: directoryStates(
+                from: ffiDirectoryStates,
+                firstIndex: directoryStateRange.firstDirectoryStateIndex,
+                count: directoryStateRange.directoryStateCount
+            ),
             truncated: snapshot.truncated != 0
         )
     }
@@ -3478,6 +3736,30 @@ private nonisolated func scriptMetaBackupGeneration(
     )
 }
 
+private nonisolated func directoryStates(
+    from ffiStates: UnsafeBufferPointer<SmkDirectoryStateEntry>,
+    firstIndex: Int,
+    count: Int
+) -> [String: DirectoryState] {
+    guard let range = safeRange(start: firstIndex, count: count, upperBound: ffiStates.count) else {
+        return [:]
+    }
+    return Dictionary(uniqueKeysWithValues: range.map { index in
+        let state = ffiStates[index]
+        return (
+            string(state.path),
+            DirectoryState(
+                modificationTimeMillis: state.hasModificationTimeMillis != 0
+                    ? state.modificationTimeMillis
+                    : nil,
+                childCount: state.childCount,
+                childFingerprint: state.childFingerprint,
+                identity: state.hasIdentity != 0 ? fileIdentity(from: state.identity) : nil
+            )
+        )
+    })
+}
+
 private nonisolated func fileEntries(
     from ffiEntries: UnsafeBufferPointer<SmkFileEntry>,
     firstIndex: Int,
@@ -3553,6 +3835,14 @@ private nonisolated func array(from slice: SmkFileListSnapshotSlice) -> [SmkFile
 }
 
 private nonisolated func buffer(from slice: SmkFileListSnapshotSlice) -> UnsafeBufferPointer<SmkFileListSnapshot> {
+    buffer(ptr: slice.ptr, len: slice.len)
+}
+
+private nonisolated func buffer(from slice: SmkFileListDirectoryStateRangeSlice) -> UnsafeBufferPointer<SmkFileListDirectoryStateRange> {
+    buffer(ptr: slice.ptr, len: slice.len)
+}
+
+private nonisolated func buffer(from slice: SmkDirectoryStateEntrySlice) -> UnsafeBufferPointer<SmkDirectoryStateEntry> {
     buffer(ptr: slice.ptr, len: slice.len)
 }
 

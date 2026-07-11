@@ -3,7 +3,11 @@ use std::{
     fs::{self, File},
     io::{self, Read, Take},
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -13,7 +17,9 @@ use uuid::Uuid;
 
 use crate::{
     RootId, TimestampMillis,
-    catalog::{FileIdentity, RootError, RootRegistration, RootSnapshot, RootStatus},
+    catalog::{
+        FileIdentity, FileListSnapshot, RootError, RootRegistration, RootSnapshot, RootStatus,
+    },
     core::{
         OperationCancellation, ParserOptions, ScriptMetaEditState, ScriptMetaItem,
         ScriptMetaItemRef, ScriptRuntimeKind, VersionOrdering, compare_versions,
@@ -34,7 +40,7 @@ use super::path_resolution::{
     PathKind, PathResolutionStatus, path_error_status, resolve_scannable_path,
 };
 use super::{
-    file_list::{file_identity, system_time_millis},
+    file_list::{FileSystemEntry, file_identity, system_time_millis},
     root_preflight::{root_content_preflight_issue, root_location_issue},
 };
 use crate::formats::compiled_osa::CompiledOsaErrorKind;
@@ -118,6 +124,13 @@ pub struct MetadataScanOutput {
     pub source_revision: Uuid,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MetadataScanSources<'a> {
+    pub previous_cache: Option<&'a CandidateCache>,
+    pub dirty_directories_by_root: Option<&'a BTreeMap<RootId, Vec<PathBuf>>>,
+    pub file_list_snapshots: Option<&'a [FileListSnapshot]>,
+}
+
 pub fn scan_metadata_roots<'a, I>(
     roots: I,
     options: &ScannerOptions,
@@ -167,8 +180,33 @@ pub(crate) fn scan_metadata_roots_scoped_controlled<'a, I>(
 where
     I: IntoIterator<Item = &'a RootRegistration>,
 {
+    scan_metadata_roots_scoped_with_file_lists_controlled(
+        roots,
+        options,
+        parser_options,
+        extensions,
+        MetadataScanSources {
+            previous_cache,
+            dirty_directories_by_root,
+            file_list_snapshots: None,
+        },
+        cancellation,
+    )
+}
+
+pub(crate) fn scan_metadata_roots_scoped_with_file_lists_controlled<'a, I>(
+    roots: I,
+    options: &ScannerOptions,
+    parser_options: &ParserOptions,
+    extensions: &ExtensionPolicy,
+    sources: MetadataScanSources<'_>,
+    cancellation: Option<&OperationCancellation>,
+) -> MetadataScanOutput
+where
+    I: IntoIterator<Item = &'a RootRegistration>,
+{
     let roots: Vec<_> = roots.into_iter().collect();
-    let reusable_records = reusable_records_by_identity_path(previous_cache, options);
+    let reusable_records = reusable_records_by_identity_path(sources.previous_cache, options);
     let rules = MetadataScanRules {
         scanner: options,
         parser: parser_options,
@@ -177,14 +215,28 @@ where
     let mut records = Vec::new();
     let mut root_snapshots = Vec::new();
 
-    for output in scan_metadata_root_outputs(
+    for mut output in scan_metadata_root_outputs(
         &roots,
         rules,
-        previous_cache,
+        sources.previous_cache,
         &reusable_records,
-        dirty_directories_by_root,
+        sources.dirty_directories_by_root,
+        sources.file_list_snapshots,
         cancellation,
     ) {
+        if !matches!(output.root.status, RootStatus::Ready | RootStatus::Missing)
+            && let Some(previous_cache) = sources
+                .previous_cache
+                .filter(|cache| cache.is_current_schema())
+        {
+            output.records = previous_metadata_records(previous_cache, &output.root.root_id);
+            output.root.item_count = output
+                .records
+                .iter()
+                .filter(|record| record.item.is_some())
+                .count();
+            output.root.is_dirty = true;
+        }
         root_snapshots.push(output.root);
         records.extend(output.records);
     }
@@ -227,6 +279,7 @@ fn scan_metadata_root_outputs<'a>(
     previous_cache: Option<&CandidateCache>,
     reusable_records: &BTreeMap<&'a Path, &'a CandidateRecord>,
     dirty_directories_by_root: Option<&BTreeMap<RootId, Vec<PathBuf>>>,
+    file_list_snapshots: Option<&[FileListSnapshot]>,
     cancellation: Option<&OperationCancellation>,
 ) -> Vec<MetadataRootScanOutput> {
     if roots.is_empty() {
@@ -240,49 +293,299 @@ fn scan_metadata_root_outputs<'a>(
             .map(|root| {
                 let dirty_directories =
                     dirty_directories_by_root.and_then(|dirty| dirty.get(&root.root_id));
-                scan_metadata_root(
+                scan_metadata_root_job(
                     root,
                     rules,
                     previous_cache,
                     reusable_records,
                     dirty_directories.map(Vec::as_slice),
+                    file_list_snapshots,
                     cancellation,
                 )
             })
             .collect();
     }
 
-    let mut outputs = Vec::with_capacity(roots.len());
-    for chunk_start in (0..roots.len()).step_by(parallelism) {
-        let chunk_end = (chunk_start + parallelism).min(roots.len());
-        let chunk = &roots[chunk_start..chunk_end];
-        let (sender, receiver) = mpsc::channel();
-        thread::scope(|scope| {
-            for (offset, root) in chunk.iter().enumerate() {
-                let sender = sender.clone();
-                let index = chunk_start + offset;
-                scope.spawn(move || {
+    let next_root_index = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..parallelism {
+            let next_root_index = &next_root_index;
+            let sender = sender.clone();
+            scope.spawn(move || {
+                loop {
+                    let index = next_root_index.fetch_add(1, Ordering::Relaxed);
+                    let Some(root) = roots.get(index) else {
+                        break;
+                    };
                     let dirty_directories =
                         dirty_directories_by_root.and_then(|dirty| dirty.get(&root.root_id));
-                    let output = scan_metadata_root(
+                    let output = scan_metadata_root_job(
                         root,
                         rules,
                         previous_cache,
                         reusable_records,
                         dirty_directories.map(Vec::as_slice),
+                        file_list_snapshots,
                         cancellation,
                     );
                     let _ = sender.send((index, output));
-                });
-            }
-            drop(sender);
+                }
+            });
+        }
+        drop(sender);
 
-            let mut chunk_outputs: Vec<_> = receiver.into_iter().collect();
-            chunk_outputs.sort_by_key(|(index, _)| *index);
-            outputs.extend(chunk_outputs.into_iter().map(|(_, output)| output));
-        });
+        let mut outputs: Vec<_> = receiver.into_iter().collect();
+        outputs.sort_by_key(|(index, _)| *index);
+        outputs.into_iter().map(|(_, output)| output).collect()
+    })
+}
+
+fn scan_metadata_root_job<'a>(
+    root: &'a RootRegistration,
+    rules: MetadataScanRules<'a>,
+    previous_cache: Option<&CandidateCache>,
+    reusable_records: &BTreeMap<&'a Path, &'a CandidateRecord>,
+    dirty_directories: Option<&[PathBuf]>,
+    file_list_snapshots: Option<&[FileListSnapshot]>,
+    cancellation: Option<&OperationCancellation>,
+) -> MetadataRootScanOutput {
+    let shared_snapshot = file_list_snapshots.and_then(|snapshots| {
+        snapshots
+            .iter()
+            .find(|snapshot| snapshot.root.root_id == root.root_id)
+    });
+    if let Some(snapshot) = shared_snapshot {
+        if matches!(
+            snapshot.root.status,
+            RootStatus::Ready | RootStatus::Missing
+        ) {
+            return scan_metadata_root_from_file_list(
+                root,
+                rules,
+                previous_cache,
+                reusable_records,
+                snapshot,
+                dirty_directories,
+                cancellation,
+            );
+        }
+        let records = previous_cache
+            .map(|cache| previous_metadata_records(cache, &root.root_id))
+            .unwrap_or_default();
+        let mut root_snapshot = snapshot.root.clone();
+        root_snapshot.is_dirty = true;
+        root_snapshot.item_count = records
+            .iter()
+            .filter(|record| record.item.is_some())
+            .count();
+        return MetadataRootScanOutput {
+            root: root_snapshot,
+            records,
+        };
     }
-    outputs
+
+    scan_metadata_root(
+        root,
+        rules,
+        previous_cache,
+        reusable_records,
+        dirty_directories,
+        cancellation,
+    )
+}
+
+fn scan_metadata_root_from_file_list<'a>(
+    root: &'a RootRegistration,
+    rules: MetadataScanRules<'a>,
+    previous_cache: Option<&CandidateCache>,
+    reusable_records: &BTreeMap<&'a Path, &'a CandidateRecord>,
+    file_list_snapshot: &FileListSnapshot,
+    dirty_directories: Option<&[PathBuf]>,
+    cancellation: Option<&OperationCancellation>,
+) -> MetadataRootScanOutput {
+    if file_list_snapshot.root.status == RootStatus::Missing {
+        return MetadataRootScanOutput {
+            root: file_list_snapshot.root.clone(),
+            records: Vec::new(),
+        };
+    }
+
+    let options = rules.scanner;
+    let normalized_root_path = normalize_path(&root.path);
+    let normalized_dirty_directories = dirty_directories
+        .map(|directories| normalize_dirty_directories(directories, &normalized_root_path))
+        .filter(|directories| !directories.is_empty());
+    let dirty_refresh_context = normalized_dirty_directories
+        .as_deref()
+        .filter(|directories| {
+            !directories
+                .iter()
+                .any(|directory| directory == &normalized_root_path)
+        })
+        .and_then(|directories| {
+            previous_cache
+                .filter(|cache| cache.is_current_schema())
+                .map(|cache| (cache, directories))
+        });
+    let mut state = MetadataWalkState {
+        root,
+        root_path: Arc::new(root.path.clone()),
+        options,
+        parser_options: rules.parser,
+        extensions: rules.extensions,
+        reusable_records,
+        allow_record_reuse: dirty_directories.is_none(),
+        timeout: options
+            .scan_timeout_per_root_millis
+            .map(Duration::from_millis),
+        started: Instant::now(),
+        visited_directories: BTreeSet::new(),
+        visited_nodes: 0,
+        scanned_nodes: 0,
+        limit_hit: None,
+        timed_out: false,
+        cancelled: false,
+        root_error: None,
+        cancellation,
+    };
+    let mut records = Vec::new();
+    collect_metadata_from_file_list_entries(
+        file_list_snapshot.children.as_deref().unwrap_or_default(),
+        0,
+        dirty_refresh_context.map(|(_, directories)| directories),
+        &mut state,
+        &mut records,
+    );
+
+    let mut snapshot = RootSnapshot::new(root.root_id.clone(), root.path.clone());
+    snapshot.status = if state.cancelled {
+        snapshot.error = Some(cancelled_root_error());
+        RootStatus::Cancelled
+    } else if let Some(limit_hit) = state.limit_hit {
+        snapshot.error = Some(limit_hit.root_error(options));
+        RootStatus::Overflowed
+    } else if state.timed_out {
+        RootStatus::TimedOut
+    } else {
+        RootStatus::Ready
+    };
+    if let Some((previous_cache, dirty_directories)) = dirty_refresh_context {
+        if snapshot.status == RootStatus::Ready {
+            records = merge_dirty_metadata_records(
+                previous_cache,
+                &root.root_id,
+                dirty_directories,
+                records,
+            );
+        } else {
+            records = previous_metadata_records(previous_cache, &root.root_id);
+        }
+    }
+    snapshot.is_dirty = dirty_refresh_context.is_some() && snapshot.status != RootStatus::Ready;
+    snapshot.last_loaded_at = Some(now_timestamp_millis());
+    snapshot.item_count = records
+        .iter()
+        .filter(|record| record.item.is_some())
+        .count();
+
+    MetadataRootScanOutput {
+        root: snapshot,
+        records,
+    }
+}
+
+fn collect_metadata_from_file_list_entries(
+    entries: &[FileSystemEntry],
+    depth: usize,
+    dirty_directories: Option<&[PathBuf]>,
+    state: &mut MetadataWalkState<'_>,
+    records: &mut Vec<CandidateRecord>,
+) {
+    for entry in entries {
+        if !file_list_entry_intersects_directories(entry, dirty_directories) {
+            continue;
+        }
+        if should_stop(depth, state) {
+            return;
+        }
+        state.scanned_nodes = state.scanned_nodes.saturating_add(1);
+
+        if entry.is_directory {
+            collect_metadata_from_file_list_entries(
+                &entry.children,
+                depth + 1,
+                dirty_directories,
+                state,
+                records,
+            );
+            continue;
+        }
+        if is_script_package_path(&entry.display_path)
+            || is_script_package_path(&entry.resolved_path)
+            || !state.extensions.contains_path(&entry.resolved_path)
+        {
+            continue;
+        }
+
+        state.visited_nodes = state.visited_nodes.saturating_add(1);
+        if entry.file_size.is_none() || should_skip_resolution_error(entry.resolution_status) {
+            records.push(candidate_error_record(
+                &entry.display_path,
+                &entry.resolved_path,
+                entry.path_kind,
+                entry.resolution_status,
+                entry.resolution_message.clone(),
+                state,
+            ));
+            continue;
+        }
+
+        let metadata = match fs::metadata(&entry.resolved_path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) => {
+                records.push(candidate_error_record(
+                    &entry.display_path,
+                    &entry.resolved_path,
+                    entry.path_kind,
+                    path_error_status(&error),
+                    Some(error.to_string()),
+                    state,
+                ));
+                continue;
+            }
+        };
+
+        records.push(candidate_record_from_observation(
+            &entry.display_path,
+            &entry.resolved_path,
+            entry.path_kind,
+            entry.resolution_status,
+            entry.resolution_message.clone(),
+            Some(metadata.len()),
+            metadata.modified().ok().and_then(system_time_millis),
+            file_identity(&entry.resolved_path, &metadata),
+            state,
+        ));
+    }
+}
+
+fn file_list_entry_intersects_directories(
+    entry: &FileSystemEntry,
+    dirty_directories: Option<&[PathBuf]>,
+) -> bool {
+    let Some(dirty_directories) = dirty_directories else {
+        return true;
+    };
+    let resolved_path = normalize_path(&entry.resolved_path);
+    let display_path = normalize_path(&entry.display_path);
+    dirty_directories.iter().any(|directory| {
+        resolved_path.starts_with(directory)
+            || directory.starts_with(&resolved_path)
+            || display_path.starts_with(directory)
+            || directory.starts_with(&display_path)
+    })
 }
 
 fn scan_metadata_root<'a>(
@@ -495,7 +798,12 @@ fn scan_dirty_directories(
         }
         let metadata = match fs::metadata(dirty_directory) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                let (_, root_error) = root_io_error(&error, "dirty_directory_metadata_failed");
+                state.root_error.get_or_insert(root_error);
+                continue;
+            }
         };
         if !metadata.is_dir() {
             continue;
@@ -633,7 +941,17 @@ fn scan_directory(
         }
     };
 
-    for entry in entries.flatten() {
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                if state.root_error.is_none() {
+                    let (_, root_error) = root_io_error(&error, "read_directory_entry_failed");
+                    state.root_error = Some(root_error);
+                }
+                continue;
+            }
+        };
         if should_stop(depth, state) {
             return;
         }
@@ -742,15 +1060,40 @@ fn candidate_record(
     metadata: &fs::Metadata,
     state: &MetadataWalkState<'_>,
 ) -> CandidateRecord {
-    let file_size = Some(metadata.len());
-    let content_modified_at = metadata.modified().ok().and_then(system_time_millis);
-    let identity = file_identity(identity_path, metadata);
+    candidate_record_from_observation(
+        file_path,
+        identity_path,
+        path_kind,
+        resolution_status,
+        resolution_message,
+        Some(metadata.len()),
+        metadata.modified().ok().and_then(system_time_millis),
+        file_identity(identity_path, metadata),
+        state,
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn candidate_record_from_observation(
+    file_path: &Path,
+    identity_path: &Path,
+    path_kind: PathKind,
+    resolution_status: PathResolutionStatus,
+    resolution_message: Option<String>,
+    file_size: Option<u64>,
+    content_modified_at: Option<TimestampMillis>,
+    identity: Option<FileIdentity>,
+    state: &MetadataWalkState<'_>,
+) -> CandidateRecord {
     if let Some(record) = state.reusable_records.get(identity_path).filter(|record| {
         state.allow_record_reuse
             && state.options.reuse_unchanged_records
             && record.file_size == file_size
             && record.content_modified_at == content_modified_at
+            && match (&record.identity, &identity) {
+                (Some(previous), Some(current)) => previous == current,
+                _ => true,
+            }
     }) {
         let reused_capability = scriptmeta_edit_capability_from_cached_metadata(
             identity_path,
@@ -804,7 +1147,7 @@ fn candidate_record(
     let source_result = read_script_source(
         identity_path,
         state.parser_options.max_prefix_bytes,
-        metadata.len(),
+        file_size.unwrap_or_default(),
         compiled_osa_timeout_for_state(state),
         state.options.decompile_compiled_osa_during_scan,
     );
@@ -1163,13 +1506,19 @@ fn path_is_same_or_child(path: &Path, parent: &Path) -> bool {
 pub(crate) fn registered_root_signatures(
     roots: &[&RootRegistration],
 ) -> Vec<RegisteredRootSignature> {
-    roots
+    let mut signatures = roots
         .iter()
         .map(|root| RegisteredRootSignature {
             root_id: root.root_id.clone(),
             path: normalize_path(&root.path),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    signatures.sort_by(|lhs, rhs| {
+        lhs.root_id
+            .cmp(&rhs.root_id)
+            .then_with(|| lhs.path.cmp(&rhs.path))
+    });
+    signatures
 }
 
 pub(crate) fn file_items_from_cache(cache: &CandidateCache) -> Vec<ScriptMetaItemRef> {
@@ -1223,7 +1572,162 @@ fn should_replace_item(current: &ScriptMetaItem, candidate: &ScriptMetaItem) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::file_list::{
+        scan_file_list_root, scan_file_list_root_with_dirty_directories,
+    };
     use std::fs;
+
+    #[test]
+    fn shared_file_list_traversal_matches_independent_metadata_scan() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let nested = directory.path().join("Nested");
+        fs::create_dir(&nested).expect("nested directory");
+        fs::write(
+            nested.join("Shared.jsx"),
+            "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.shared-walk\n// Version=1.2.3\n// SCRIPTMETA-END\n",
+        )
+        .expect("script");
+        fs::write(directory.path().join("ignored.txt"), "ignored").expect("ignored file");
+
+        let root =
+            RootRegistration::file_list_and_metadata(RootId::from("shared-root"), directory.path());
+        let options = ScannerOptions::default();
+        let parser_options = ParserOptions::default();
+        let extensions = ExtensionPolicy::default();
+        let independent = scan_metadata_roots_scoped_controlled(
+            [&root],
+            &options,
+            &parser_options,
+            &extensions,
+            None,
+            None,
+            None,
+        );
+
+        let file_list = scan_file_list_root(&root.root_id, &root.path, &options, &extensions);
+        let file_list_snapshot = FileListSnapshot {
+            root: file_list.root,
+            children: Some(file_list.children),
+            directory_states: file_list.directory_states,
+            truncated: file_list.truncated,
+        };
+        let shared = scan_metadata_roots_scoped_with_file_lists_controlled(
+            [&root],
+            &options,
+            &parser_options,
+            &extensions,
+            MetadataScanSources {
+                previous_cache: None,
+                dirty_directories_by_root: None,
+                file_list_snapshots: Some(std::slice::from_ref(&file_list_snapshot)),
+            },
+            None,
+        );
+
+        assert_eq!(shared.roots.len(), independent.roots.len());
+        assert_eq!(shared.roots[0].root_id, independent.roots[0].root_id);
+        assert_eq!(shared.roots[0].path, independent.roots[0].path);
+        assert_eq!(shared.roots[0].status, independent.roots[0].status);
+        assert_eq!(shared.roots[0].item_count, independent.roots[0].item_count);
+        assert_eq!(shared.roots[0].error, independent.roots[0].error);
+        assert_eq!(shared.file_items, independent.file_items);
+        assert_eq!(shared.all_items, independent.all_items);
+        assert_eq!(
+            shared.candidate_cache.records,
+            independent.candidate_cache.records
+        );
+    }
+
+    #[test]
+    fn shared_dirty_file_list_traversal_matches_independent_metadata_refresh() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let nested = directory.path().join("Nested");
+        fs::create_dir(&nested).expect("nested directory");
+        let script = nested.join("Dirty.jsx");
+        fs::write(
+            &script,
+            "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.shared-dirty\n// Version=1.0.0\n// SCRIPTMETA-END\n",
+        )
+        .expect("initial script");
+
+        let root = RootRegistration::file_list_and_metadata(
+            RootId::from("shared-dirty-root"),
+            directory.path(),
+        );
+        let options = ScannerOptions::default();
+        let parser_options = ParserOptions::default();
+        let extensions = ExtensionPolicy::default();
+        let initial_metadata = scan_metadata_roots_scoped_controlled(
+            [&root],
+            &options,
+            &parser_options,
+            &extensions,
+            None,
+            None,
+            None,
+        );
+        let initial_file_list =
+            scan_file_list_root(&root.root_id, &root.path, &options, &extensions);
+        let initial_file_list = FileListSnapshot {
+            root: initial_file_list.root,
+            children: Some(initial_file_list.children),
+            directory_states: initial_file_list.directory_states,
+            truncated: initial_file_list.truncated,
+        };
+
+        fs::write(
+            &script,
+            "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.shared-dirty\n// Version=2.0.0\n// SCRIPTMETA-END\n",
+        )
+        .expect("updated script");
+        let dirty_directories = vec![nested];
+        let refreshed_file_list = scan_file_list_root_with_dirty_directories(
+            &root.root_id,
+            &root.path,
+            &options,
+            &extensions,
+            Some(&initial_file_list),
+            &dirty_directories,
+        );
+        let refreshed_file_list = FileListSnapshot {
+            root: refreshed_file_list.root,
+            children: Some(refreshed_file_list.children),
+            directory_states: refreshed_file_list.directory_states,
+            truncated: refreshed_file_list.truncated,
+        };
+        let dirty_by_root = BTreeMap::from([(root.root_id.clone(), dirty_directories)]);
+
+        let independent = scan_metadata_roots_scoped_controlled(
+            [&root],
+            &options,
+            &parser_options,
+            &extensions,
+            Some(&initial_metadata.candidate_cache),
+            Some(&dirty_by_root),
+            None,
+        );
+        let shared = scan_metadata_roots_scoped_with_file_lists_controlled(
+            [&root],
+            &options,
+            &parser_options,
+            &extensions,
+            MetadataScanSources {
+                previous_cache: Some(&initial_metadata.candidate_cache),
+                dirty_directories_by_root: Some(&dirty_by_root),
+                file_list_snapshots: Some(std::slice::from_ref(&refreshed_file_list)),
+            },
+            None,
+        );
+
+        assert_eq!(shared.roots[0].status, independent.roots[0].status);
+        assert_eq!(shared.roots[0].item_count, independent.roots[0].item_count);
+        assert_eq!(shared.file_items, independent.file_items);
+        assert_eq!(shared.all_items, independent.all_items);
+        assert_eq!(
+            shared.candidate_cache.records,
+            independent.candidate_cache.records
+        );
+    }
 
     #[test]
     fn metadata_node_limit_counts_non_script_entries() {

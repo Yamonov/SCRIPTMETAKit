@@ -12,7 +12,12 @@ pub use metadata::{
     ParserOptions, ScriptMetaEditCapability, ScriptMetaEditState, ScriptMetaItem,
     ScriptMetaItemRef, ScriptMetadata, ScriptRuntimeKind,
 };
-pub use operation::{FileIssue, OperationCancellation, OperationStatus, OperationSummary};
+#[cfg(feature = "blocking-http")]
+pub(crate) use operation::OperationCancellationListener;
+pub use operation::{
+    FileIssue, OperationCancellation, OperationCancellationReservation, OperationStatus,
+    OperationSummary,
+};
 pub(crate) use parser::{
     clean_metadata_line, has_script_metadata_block, has_script_metadata_block_with_options,
     select_distribution_metadata_for_script,

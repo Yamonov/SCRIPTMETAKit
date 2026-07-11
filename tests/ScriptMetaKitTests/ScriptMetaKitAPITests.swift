@@ -1,7 +1,71 @@
 import XCTest
-import ScriptMetaKit
+@testable import ScriptMetaKit
 
 final class ScriptMetaKitAPITests: XCTestCase {
+    func testOperationalPolicyPresetsAndCacheLimitArePublic() async throws {
+        XCTAssertEqual(ScriptMetaKitPersistentCacheStore.defaultMaximumCacheBytes, 64 * 1024 * 1024)
+        XCTAssertLessThan(
+            ScriptMetaKitOperationalPolicy.lowImpact.maxConcurrentMetaURLChecks,
+            ScriptMetaKitOperationalPolicy.balanced.maxConcurrentMetaURLChecks
+        )
+        XCTAssertLessThan(
+            ScriptMetaKitOperationalPolicy.interactive.watcherDebounceDelayMillis,
+            ScriptMetaKitOperationalPolicy.balanced.watcherDebounceDelayMillis
+        )
+
+        let engine = ScriptMetaKitEngine()
+        try await engine.setOperationalPolicy(.lowImpact)
+        var invalid = ScriptMetaKitOperationalPolicy.balanced
+        invalid.maxConcurrentMetaURLChecks = 0
+        do {
+            try await engine.setOperationalPolicy(invalid)
+            XCTFail("invalid operational policy was accepted")
+        } catch let ScriptMetaKitError.operationFailed(status, _) {
+            XCTAssertEqual(status, 3)
+        }
+    }
+
+    func testSafeEditSessionRejectsExternalChangeAndUnconditionalAPIIsExplicit() async throws {
+        let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.edit-session")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("sample.jsx")
+        let engine = ScriptMetaKitEngine()
+        let session = try await engine.beginScriptMetadataEditSession(fileURL: script)
+        try "alert('changed outside');\n".write(to: script, atomically: true, encoding: .utf8)
+        var draft = session.draft
+        draft.scriptID = "com.example.swiftapi.edit-session"
+        draft.version = "2.0.0"
+
+        do {
+            _ = try await engine.commitScriptMetadataEditSession(session, draft: draft)
+            XCTFail("stale edit session overwrote an external change")
+        } catch is ScriptMetaKitError {
+            // Expected.
+        }
+
+        _ = try await engine.writeScriptMetadataUnconditionally(fileURL: script, draft: draft)
+        XCTAssertTrue(
+            try String(contentsOf: script, encoding: .utf8).contains("Version=2.0.0")
+        )
+    }
+
+    func testIdleExplicitCancellationDoesNotAffectTheNextOperation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitIdleCancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("Example.jsx")
+        try "alert('ok');\n".write(to: script, atomically: false, encoding: .utf8)
+
+        let engine = ScriptMetaKitEngine()
+        _ = try await engine.scan(folderURL: root, checkUpdates: false)
+        engine.cancelCurrentOperation()
+        let result = try await engine.scan(folderURL: root, checkUpdates: false)
+
+        XCTAssertFalse(try XCTUnwrap(result.operation).cancelled)
+        XCTAssertTrue(result.flattenedFileEntries.contains { $0.displayPath == script.path })
+    }
+
     func testParentTaskCancellationStopsAnActiveScan() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitCancellation-\(UUID().uuidString)", isDirectory: true)
@@ -28,6 +92,35 @@ final class ScriptMetaKitAPITests: XCTestCase {
         } catch is CancellationError {
             // Expected.
         }
+    }
+
+    func testShutdownCanCancelTheCurrentOperation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitShutdownCancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in 0..<3_000 {
+            try "alert(\(index));\n".write(
+                to: root.appendingPathComponent("script-\(index).jsx"),
+                atomically: false,
+                encoding: .utf8
+            )
+        }
+
+        let engine = ScriptMetaKitEngine()
+        let scan = Task { try await engine.scan(folderURL: root, checkUpdates: false) }
+        try await Task.sleep(for: .milliseconds(1))
+        let clock = ContinuousClock()
+        let started = clock.now
+        await engine.shutdown(cancelCurrentOperation: true)
+        let elapsed = started.duration(to: clock.now)
+        do {
+            let result = try await scan.value
+            XCTAssertTrue(result.operation?.cancelled ?? false)
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertLessThan(elapsed, .seconds(1))
     }
 
     func testRegisteredPathResolutionUsesThePublicSwiftWrapper() throws {
@@ -60,7 +153,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.0.9")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.1.0")
     }
 
     func testVersionAndEditPasswordUtilityAPIsArePublic() throws {
@@ -101,6 +194,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(result.operation?.status, "finished")
         XCTAssertEqual(result.operation?.totalUnits, 1)
         XCTAssertTrue(result.fileIssues?.isEmpty ?? false)
+        XCTAssertFalse(try XCTUnwrap(result.fileListSnapshots.first).directoryStates.isEmpty)
     }
 
     func testRegisteredRootScanFindsScriptMetadata() async throws {
@@ -359,6 +453,54 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertFalse(result.sourceFingerprint.isEmpty)
     }
 
+    func testConditionalMetadataWriteRejectsAnExternalChange() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitConflict-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let script = root.appendingPathComponent("editable.jsx")
+        try """
+        /*
+        SCRIPTMETA-BEGIN
+        Script-ID=com.example.swiftapi.conflict
+        Version=1.0
+        SCRIPTMETA-END
+        */
+        alert("original");
+        """.write(to: script, atomically: true, encoding: .utf8)
+
+        let engine = ScriptMetaKitEngine()
+        let readResult = try await engine.readScriptMetadataDraft(fileURL: script)
+        XCTAssertEqual(readResult.draft.scriptID, "com.example.swiftapi.conflict")
+        try "alert(\"changed outside ScriptMetaKit\");\n".write(
+            to: script,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        do {
+            _ = try await engine.writeScriptMetadata(
+                fileURL: script,
+                draft: readResult.draft,
+                mode: .insertOrReplace,
+                expectedSourceFingerprint: readResult.sourceFingerprint
+            )
+            XCTFail("a stale edit must not overwrite the external change")
+        } catch let ScriptMetaKitError.sourceConflict(message) {
+            XCTAssertFalse(message.isEmpty)
+        } catch let ScriptMetaKitError.operationFailed(status, message) {
+            XCTFail("expected source conflict, received status \(status): \(message)")
+        } catch {
+            XCTFail("expected source conflict, received \(error)")
+        }
+
+        XCTAssertEqual(
+            try String(contentsOf: script, encoding: .utf8),
+            "alert(\"changed outside ScriptMetaKit\");\n"
+        )
+    }
+
     func testReadScriptMetadataEditPreviewIsBounded() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitAPITests-\(UUID().uuidString)", isDirectory: true)
@@ -498,6 +640,42 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(cached?.allItems.map(\.scriptID), ["com.example.swiftapi.clearvolatile"])
     }
 
+    func testWorkspaceReportsNonfatalCacheDiagnostics() async throws {
+        let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.diagnostic")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitDiagnostic-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        try Data("{invalid".utf8).write(to: cacheStore.writableCacheFileURL(scope: .catalog))
+        let recorder = DiagnosticRecorder()
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(
+            cacheStore: cacheStore,
+            diagnosticHandler: { diagnostic in
+                Task { await recorder.append(diagnostic) }
+            }
+        ))
+
+        _ = try await workspace.scanRoots(
+            [ScriptMetaKitRoot(rootID: "diagnostic", url: root)],
+            replacingGroup: "test.diagnostic",
+            rootIDs: ["diagnostic"],
+            mode: .metadataOnly,
+            cacheScope: .catalog
+        )
+        for _ in 0..<20 {
+            if await recorder.diagnostics.isEmpty == false {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let diagnostics = await recorder.diagnostics
+        XCTAssertTrue(diagnostics.contains { $0.code == "cache_load_failed" })
+    }
+
     func testWorkspaceSerializesConcurrentReplacementScansForTheSameGroup() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitWorkspaceRace-\(UUID().uuidString)", isDirectory: true)
@@ -532,6 +710,46 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(scanB.roots.map(\.rootID), ["B"])
         XCTAssertEqual(scanA.allItems.map(\.scriptID), ["com.example.a"])
         XCTAssertEqual(scanB.allItems.map(\.scriptID), ["com.example.b"])
+    }
+
+    func testCancelledWorkspaceWaiterReturnsBeforeTheActiveOperationFinishes() async throws {
+        let workspace = ScriptMetaKitWorkspace()
+        let (started, startedContinuation) = AsyncStream<Void>.makeStream()
+        let (release, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let active = Task {
+            try await workspace.performExclusiveOperation {
+                startedContinuation.yield()
+                for await _ in release {
+                    break
+                }
+            }
+        }
+        var startedIterator = started.makeAsyncIterator()
+        _ = await startedIterator.next()
+
+        let waiter = Task {
+            try await workspace.performExclusiveOperation {}
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let delayedRelease = Task {
+            try? await Task.sleep(for: .seconds(1))
+            releaseContinuation.yield()
+        }
+        let clock = ContinuousClock()
+        let cancelledAt = clock.now
+        waiter.cancel()
+        do {
+            try await waiter.value
+            XCTFail("cancelled waiter completed normally")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let cancellationDelay = cancelledAt.duration(to: clock.now)
+
+        delayedRelease.cancel()
+        releaseContinuation.yield()
+        try await active.value
+        XCTAssertLessThan(cancellationDelay, .milliseconds(250))
     }
 
     func testWorkspaceCompositePartialScanReturnsTheCompleteRegisteredCatalog() async throws {
@@ -619,6 +837,87 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertNil(result.catalogSnapshot)
         XCTAssertNil(result.updateCheckResult)
         XCTAssertTrue(result.fileListSnapshots.first?.children?.contains { $0.name == "added.jsx" } ?? false)
+    }
+
+    func testWatchSequenceDeliversInitialReconcileAndFileChange() async throws {
+        let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.sequence")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let sequence = try await workspace.watchChanges(
+            roots: [ScriptMetaKitRoot(
+                rootID: "sequence",
+                url: root,
+                watchPolicy: .allRegistered
+            )],
+            replacingGroup: "test.sequence",
+            dirtyOnly: true
+        )
+        let recorder = WatchResultRecorder()
+        let consumer = Task {
+            do {
+                for try await result in sequence {
+                    await recorder.append(result)
+                }
+            } catch {
+                await recorder.record(error)
+            }
+        }
+        let initial = try await waitForRecordedWatchResult(recorder, at: 0)
+        XCTAssertEqual(initial.roots.map(\.rootID), ["sequence"])
+
+        try "alert('added');\n".write(
+            to: root.appendingPathComponent("sequence-added.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let changed = try await waitForRecordedWatchResult(recorder, at: 1)
+        consumer.cancel()
+        await workspace.stopWatching()
+        XCTAssertTrue(
+            changed.fileListSnapshots.first?.children?.contains {
+                $0.name == "sequence-added.jsx"
+            } ?? false
+        )
+    }
+
+    func testRequiredWatchPlanRestartSchedulesAReconcile() async throws {
+        let firstRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.restart.first")
+        let secondRoot = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.restart.second")
+        defer {
+            try? FileManager.default.removeItem(at: firstRoot)
+            try? FileManager.default.removeItem(at: secondRoot)
+        }
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let first = ScriptMetaKitRoot(
+            rootID: "restart-first",
+            url: firstRoot,
+            watchPolicy: .allRegistered
+        )
+        let second = ScriptMetaKitRoot(
+            rootID: "restart-second",
+            url: secondRoot,
+            watchPolicy: .allRegistered
+        )
+        try await workspace.startWatching(
+            roots: [first],
+            replacingGroup: "test.restart",
+            drainsInitialChanges: true,
+            onChange: {}
+        )
+        try await workspace.registerRoots([first, second], replacingGroup: "test.restart")
+
+        let reconciled = try await waitForWatchChange(workspace: workspace, dirtyOnly: true)
+        await workspace.stopWatching()
+        XCTAssertEqual(
+            Set(reconciled.roots.map(\.rootID)),
+            Set(["restart-first", "restart-second"])
+        )
+        XCTAssertTrue(
+            reconciled.fileListSnapshots.contains {
+                $0.root.rootID == "restart-second"
+                    && ($0.children?.contains { $0.name == "sample.jsx" } ?? false)
+            }
+        )
     }
 
     func testDirtyOnlyWatchPollHandlesDeletedFile() async throws {
@@ -729,6 +1028,25 @@ final class ScriptMetaKitAPITests: XCTestCase {
         throw CancellationError()
     }
 
+    private func waitForRecordedWatchResult(
+        _ recorder: WatchResultRecorder,
+        at index: Int,
+        attempts: Int = 50
+    ) async throws -> ScriptMetaScanResult {
+        for _ in 0..<attempts {
+            if let result = await recorder.result(at: index) {
+                return result
+            }
+            if let errorMessage = await recorder.errorMessage {
+                XCTFail(errorMessage)
+                throw CancellationError()
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTFail("watch sequence result \(index) was not observed")
+        throw CancellationError()
+    }
+
     private func makeTemporaryScriptRoot(scriptID: String = "com.example.swiftapi.scan") throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitAPITests-\(UUID().uuidString)", isDirectory: true)
@@ -796,5 +1114,30 @@ final class ScriptMetaKitAPITests: XCTestCase {
                 refreshPolicy: .onFileEvent
             )
         ]
+    }
+}
+
+private actor WatchResultRecorder {
+    private var results: [ScriptMetaScanResult] = []
+    private(set) var errorMessage: String?
+
+    func append(_ result: ScriptMetaScanResult) {
+        results.append(result)
+    }
+
+    func record(_ error: Error) {
+        errorMessage = String(describing: error)
+    }
+
+    func result(at index: Int) -> ScriptMetaScanResult? {
+        results.indices.contains(index) ? results[index] : nil
+    }
+}
+
+private actor DiagnosticRecorder {
+    private(set) var diagnostics: [ScriptMetaKitDiagnostic] = []
+
+    func append(_ diagnostic: ScriptMetaKitDiagnostic) {
+        diagnostics.append(diagnostic)
     }
 }

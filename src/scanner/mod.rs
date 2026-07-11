@@ -10,7 +10,8 @@ pub use file_list::{
     scan_file_list_root_with_dirty_directories,
 };
 pub(crate) use file_list::{
-    scan_file_list_root_controlled, scan_file_list_root_with_dirty_directories_controlled,
+    scan_file_list_root_transactional_controlled,
+    scan_file_list_root_with_dirty_directories_controlled,
     try_scan_file_list_root_with_owned_dirty_directories_controlled,
 };
 pub use metadata_scan::{
@@ -18,8 +19,8 @@ pub use metadata_scan::{
     scan_metadata_roots, scan_metadata_roots_scoped,
 };
 pub(crate) use metadata_scan::{
-    deduplicated_items, file_items_from_cache, registered_root_signatures,
-    scan_metadata_roots_scoped_controlled,
+    MetadataScanSources, deduplicated_items, file_items_from_cache, registered_root_signatures,
+    scan_metadata_roots_scoped_with_file_lists_controlled,
 };
 pub use options::{ExtensionPolicy, RootPreflightOptions, ScannerOptions};
 pub use path_resolution::{

@@ -4,13 +4,38 @@ SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning
 
 The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer applications that need a reusable SCRIPTMETA engine across platforms.
 
-Registered macOS aliases and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. `PathKind::WindowsShortcut` is reserved for compatibility; `.lnk` resolution is not implemented in the 1.0 series and callers must treat it as unsupported.
+Registered macOS aliases and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. `PathKind::WindowsShortcut` is reserved for compatibility; `.lnk` resolution is not implemented in the 1.x series and callers must treat it as unsupported.
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.0.9`
-- Rust FFI crate: `scriptmetakit_ffi` `1.0.9`
+- Rust crate: `scriptmetakit` `1.1.0`
+- Rust FFI crate: `scriptmetakit_ffi` `1.1.0`
 - Swift package product: `ScriptMetaKit`
+
+## 1.1.0
+
+- Keeps scan and update cancellation in one operation scope, including cancellation requested immediately before native work begins.
+- Shares one filesystem traversal between file-list and metadata collectors for combined full scans and dirty refreshes.
+- Defers duplicate script-header probes to the metadata collector during combined full scans.
+- Reuses successful and terminal-failure results for each metadata URL within one batch update check, so every URL has one shared retry budget regardless of how many scripts reference it.
+- Retries transient source failures at most twice after the initial request, using cancellation-aware 500 ms and 1,500 ms backoff delays by default.
+- Cancels an active HTTP request without waiting for its request timeout, while preserving the existing synchronous FFI API.
+- Uses macOS Dispatch I/O for local metadata sources so cancellation and resource deadlines can interrupt a stalled file or network-volume read without abandoning worker threads.
+- Preserves the previous file-list subtree and dirty state after nested directory I/O failures.
+- Adds conditional metadata writes that reject stale source fingerprints instead of overwriting external edits.
+- Removes Swift's polling wait, exposes typed status projections, and returns directory-state snapshots through the public Swift API.
+- Strengthens cache and metadata replacement durability on macOS by syncing the containing directory.
+- Treats idle public cancellation as a no-op and binds hand-off cancellation to one reserved operation.
+- Preserves the last good catalog and file-list state across simulated transient permission and I/O failures.
+- Bounds metadata sources to 4 MiB by default and classifies HTTP, transport, and file failures before retrying.
+- Honors bounded `Retry-After` hints and singleflights requests that converge on the same downstream `Latest-URL`.
+- Revalidates repeated HTTP metadata checks with bounded `ETag`/`Last-Modified` state and reuses the cached body after `304 Not Modified`.
+- Uses continuous bounded worker queues for root scans and update groups instead of chunk barriers.
+- Keeps watcher queues bounded, avoids restart when the normalized plan is unchanged, and schedules one reconcile after a required restart.
+- Uses notification-driven HTTP and Dispatch I/O cancellation without active 5 ms polling.
+- Compacts persistent cache JSON, debounces watcher-driven saves, and skips identical writes.
+- Exposes `ScriptMetaKitOperationalPolicy` presets, `ScriptMetaKitWatchSequence`, nonfatal workspace diagnostics, explicit termination policy, and safe edit sessions.
+- Splits Swift editing, FFI operational policy, and Resolver retry logic into focused source files.
 
 ## 1.0.9
 

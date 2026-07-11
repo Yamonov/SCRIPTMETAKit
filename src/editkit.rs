@@ -627,18 +627,43 @@ pub fn write_script_metadata_to_file(
     mode: ScriptMetaWriteMode,
     backup_options: Option<&ScriptMetaBackupOptions>,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
+    write_script_metadata_to_file_if_unchanged(path, draft, mode, backup_options, None)
+}
+
+pub fn write_script_metadata_to_file_if_unchanged(
+    path: &Path,
+    draft: &ScriptMetadataDraft,
+    mode: ScriptMetaWriteMode,
+    backup_options: Option<&ScriptMetaBackupOptions>,
+    expected_source_fingerprint: Option<&str>,
+) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
     ensure_script_file_writable(path)?;
     if compiled_osa::is_compiled_osa_path(path) {
-        return write_script_metadata_to_compiled_osa_file(path, draft, mode, backup_options);
+        return write_script_metadata_to_compiled_osa_file(
+            path,
+            draft,
+            mode,
+            backup_options,
+            expected_source_fingerprint,
+        );
     }
 
     let bytes = read_script_bytes_file(path)?;
+    let initial_fingerprint = file_content_fingerprint(&bytes);
+    ensure_expected_source_fingerprint(path, expected_source_fingerprint, &initial_fingerprint)?;
     let decoded =
         decode_script_text_with_encoding(&bytes).ok_or_else(|| ScriptMetaKitError::Io {
             path: path.to_path_buf(),
             message: "script text encoding is not supported".to_string(),
         })?;
     let updated = write_script_metadata_to_text(&decoded.text, path, draft, mode)?;
+    let encoded = encode_script_text(&updated.text, decoded.encoding).ok_or_else(|| {
+        ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "updated script text cannot be encoded with the original encoding".to_string(),
+        }
+    })?;
+    ensure_file_fingerprint(path, &initial_fingerprint)?;
     let backup = match backup_options {
         Some(options) => Some(create_scriptmeta_backup(
             path,
@@ -648,15 +673,17 @@ pub fn write_script_metadata_to_file(
         None => None,
     };
 
-    let encoded = encode_script_text(&updated.text, decoded.encoding).ok_or_else(|| {
-        ScriptMetaKitError::Io {
-            path: path.to_path_buf(),
-            message: "updated script text cannot be encoded with the original encoding".to_string(),
+    if let Err(error) = ensure_file_fingerprint(path, &initial_fingerprint) {
+        if let (Some(options), Some(record)) = (backup_options, backup.as_ref()) {
+            remove_scriptmeta_backup_if_possible(path, options, record);
         }
-    })?;
+        return Err(error);
+    }
 
     if let Err(error) = write_bytes_file_atomic(path, &encoded) {
-        if let (Some(options), Some(record)) = (backup_options, backup.as_ref()) {
+        if !error.is_committed()
+            && let (Some(options), Some(record)) = (backup_options, backup.as_ref())
+        {
             remove_scriptmeta_backup_if_possible(path, options, record);
         }
         return Err(ScriptMetaKitError::Io {
@@ -677,11 +704,19 @@ fn write_script_metadata_to_compiled_osa_file(
     draft: &ScriptMetadataDraft,
     mode: ScriptMetaWriteMode,
     backup_options: Option<&ScriptMetaBackupOptions>,
+    expected_source_fingerprint: Option<&str>,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
+    let initial_file_fingerprint = file_content_fingerprint(&read_script_bytes_file(path)?);
     let source = match compiled_osa::decompile_compiled_osa_source(path, None) {
         Ok(source) => source,
         Err(error) if compiled_osa_error_allows_text_fallback(error.kind) => {
-            return write_script_metadata_to_text_file(path, draft, mode, backup_options);
+            return write_script_metadata_to_text_file(
+                path,
+                draft,
+                mode,
+                backup_options,
+                expected_source_fingerprint,
+            );
         }
         Err(error) => {
             return Err(ScriptMetaKitError::Io {
@@ -690,8 +725,14 @@ fn write_script_metadata_to_compiled_osa_file(
             });
         }
     };
+    ensure_expected_source_fingerprint(
+        path,
+        expected_source_fingerprint,
+        &file_content_fingerprint(source.source.as_bytes()),
+    )?;
     let updated = write_script_metadata_to_text(&source.source, path, draft, mode)?;
     let temp_path = compiled_osa_temp_path(path);
+    let mut temp_guard = TemporaryEditFile::new(temp_path.clone());
     let language_hint = source
         .language_hint
         .or_else(|| compiled_osa::language_hint_from_source(&updated.text));
@@ -705,7 +746,17 @@ fn write_script_metadata_to_compiled_osa_file(
         });
     }
 
-    write_compiled_osa_temp_result(path, &temp_path, updated.operation, backup_options)
+    let result = write_compiled_osa_temp_result(
+        path,
+        &temp_path,
+        updated.operation,
+        backup_options,
+        &initial_file_fingerprint,
+    );
+    if result.is_ok() {
+        temp_guard.disarm();
+    }
+    result
 }
 
 fn write_compiled_osa_temp_result(
@@ -713,6 +764,7 @@ fn write_compiled_osa_temp_result(
     temp_path: &Path,
     operation: ScriptMetaWriteOperation,
     backup_options: Option<&ScriptMetaBackupOptions>,
+    initial_file_fingerprint: &str,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
     if let Err(error) = copy_replacement_metadata(path, temp_path) {
         let _ = fs::remove_file(temp_path);
@@ -721,6 +773,7 @@ fn write_compiled_osa_temp_result(
             message: error.to_string(),
         });
     }
+    ensure_file_fingerprint(path, initial_file_fingerprint)?;
     let backup = match backup_options {
         Some(options) => Some(create_scriptmeta_backup(
             path,
@@ -730,9 +783,19 @@ fn write_compiled_osa_temp_result(
         None => None,
     };
 
-    if let Err(error) = replace_file(temp_path, path) {
+    if let Err(error) = ensure_file_fingerprint(path, initial_file_fingerprint) {
         let _ = fs::remove_file(temp_path);
         if let (Some(options), Some(record)) = (backup_options, backup.as_ref()) {
+            remove_scriptmeta_backup_if_possible(path, options, record);
+        }
+        return Err(error);
+    }
+
+    if let Err(error) = replace_file(temp_path, path) {
+        let _ = fs::remove_file(temp_path);
+        if !error.is_committed()
+            && let (Some(options), Some(record)) = (backup_options, backup.as_ref())
+        {
             remove_scriptmeta_backup_if_possible(path, options, record);
         }
         return Err(ScriptMetaKitError::Io {
@@ -753,14 +816,24 @@ fn write_script_metadata_to_text_file(
     draft: &ScriptMetadataDraft,
     mode: ScriptMetaWriteMode,
     backup_options: Option<&ScriptMetaBackupOptions>,
+    expected_source_fingerprint: Option<&str>,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
     let bytes = read_script_bytes_file(path)?;
+    let initial_fingerprint = file_content_fingerprint(&bytes);
+    ensure_expected_source_fingerprint(path, expected_source_fingerprint, &initial_fingerprint)?;
     let decoded =
         decode_script_text_with_encoding(&bytes).ok_or_else(|| ScriptMetaKitError::Io {
             path: path.to_path_buf(),
             message: "script text encoding is not supported".to_string(),
         })?;
     let updated = write_script_metadata_to_text(&decoded.text, path, draft, mode)?;
+    let encoded = encode_script_text(&updated.text, decoded.encoding).ok_or_else(|| {
+        ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "updated script text cannot be encoded with the original encoding".to_string(),
+        }
+    })?;
+    ensure_file_fingerprint(path, &initial_fingerprint)?;
     let backup = match backup_options {
         Some(options) => Some(create_scriptmeta_backup(
             path,
@@ -770,15 +843,17 @@ fn write_script_metadata_to_text_file(
         None => None,
     };
 
-    let encoded = encode_script_text(&updated.text, decoded.encoding).ok_or_else(|| {
-        ScriptMetaKitError::Io {
-            path: path.to_path_buf(),
-            message: "updated script text cannot be encoded with the original encoding".to_string(),
+    if let Err(error) = ensure_file_fingerprint(path, &initial_fingerprint) {
+        if let (Some(options), Some(record)) = (backup_options, backup.as_ref()) {
+            remove_scriptmeta_backup_if_possible(path, options, record);
         }
-    })?;
+        return Err(error);
+    }
 
     if let Err(error) = write_bytes_file_atomic(path, &encoded) {
-        if let (Some(options), Some(record)) = (backup_options, backup.as_ref()) {
+        if !error.is_committed()
+            && let (Some(options), Some(record)) = (backup_options, backup.as_ref())
+        {
             remove_scriptmeta_backup_if_possible(path, options, record);
         }
         return Err(ScriptMetaKitError::Io {
@@ -1929,7 +2004,37 @@ fn compiled_osa_temp_path(path: &Path) -> PathBuf {
     ))
 }
 
-fn write_bytes_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+#[derive(Debug)]
+enum AtomicWriteError {
+    BeforeCommit(std::io::Error),
+    DurabilityAfterCommit(std::io::Error),
+}
+
+impl AtomicWriteError {
+    fn is_committed(&self) -> bool {
+        matches!(self, Self::DurabilityAfterCommit(_))
+    }
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeCommit(error) => error.fmt(formatter),
+            Self::DurabilityAfterCommit(error) => write!(
+                formatter,
+                "file replacement succeeded, but directory durability sync failed: {error}"
+            ),
+        }
+    }
+}
+
+impl From<std::io::Error> for AtomicWriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::BeforeCommit(error)
+    }
+}
+
+fn write_bytes_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let temp_path = parent.join(format!(
@@ -2018,13 +2123,27 @@ impl Drop for TemporaryEditFile {
 }
 
 #[cfg(not(windows))]
-fn replace_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
-    fs::rename(temp_path, target_path)
+fn replace_file(temp_path: &Path, target_path: &Path) -> Result<(), AtomicWriteError> {
+    fs::rename(temp_path, target_path).map_err(AtomicWriteError::BeforeCommit)?;
+    #[cfg(test)]
+    if TEST_DIRECTORY_SYNC_FAILURE.with(|path| path.borrow().as_deref() == Some(target_path)) {
+        return Err(AtomicWriteError::DurabilityAfterCommit(
+            std::io::Error::other("injected directory sync failure"),
+        ));
+    }
+    let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+    let sync_result = fs::File::open(parent).and_then(|directory| directory.sync_all());
+    sync_result.map_err(AtomicWriteError::DurabilityAfterCommit)
+}
+
+#[cfg(all(test, not(windows)))]
+thread_local! {
+    static TEST_DIRECTORY_SYNC_FAILURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn replace_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
+fn replace_file(temp_path: &Path, target_path: &Path) -> Result<(), AtomicWriteError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -2050,7 +2169,9 @@ fn replace_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
         )
     };
     if moved == 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(AtomicWriteError::BeforeCommit(
+            std::io::Error::last_os_error(),
+        ));
     }
     Ok(())
 }
@@ -2105,6 +2226,25 @@ fn file_content_fingerprint(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     digest_to_hex(&hasher.finalize())
+}
+
+fn ensure_expected_source_fingerprint(
+    path: &Path,
+    expected: Option<&str>,
+    actual: &str,
+) -> ScriptMetaKitResult<()> {
+    if expected.is_some_and(|expected| expected != actual) {
+        return Err(ScriptMetaKitError::Conflict(format!(
+            "{} changed after it was loaded",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_file_fingerprint(path: &Path, expected: &str) -> ScriptMetaKitResult<()> {
+    let bytes = read_script_bytes_file(path)?;
+    ensure_expected_source_fingerprint(path, Some(expected), &file_content_fingerprint(&bytes))
 }
 
 fn parsed_edit_password_sha256(value: &str) -> Option<(&str, &str)> {
@@ -2227,10 +2367,11 @@ mod tests {
         ScriptMetaBackupReason, ScriptMetaCommentStyle, ScriptMetaWriteMode, ScriptMetadataDraft,
         append_script_metadata_to_text, backup_file_directory, clear_scriptmeta_backups,
         create_scriptmeta_backup, generate_edit_password_sha256, is_valid_edit_password_sha256,
-        render_distribution_metadata_block, render_script_metadata_for_style,
-        reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
-        scriptmeta_backup_generations, validate_script_id_uniqueness, verify_edit_password_sha256,
-        write_script_metadata_to_file, write_script_metadata_to_text,
+        read_script_metadata_draft_from_file, render_distribution_metadata_block,
+        render_script_metadata_for_style, reset_scriptmeta_backups_with_current_as_initial,
+        restore_scriptmeta_backup, scriptmeta_backup_generations, validate_script_id_uniqueness,
+        verify_edit_password_sha256, write_script_metadata_to_file,
+        write_script_metadata_to_file_if_unchanged, write_script_metadata_to_text,
     };
     use crate::core::{parse_distribution_metadata_for_script, parse_script_metadata};
 
@@ -2265,6 +2406,41 @@ mod tests {
         assert_eq!(report.total_items, 3);
         assert_eq!(report.unique_script_ids, 1);
         assert!(report.is_unique());
+    }
+
+    #[test]
+    fn conditional_metadata_write_rejects_an_external_change() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("conditional.jsx");
+        fs::write(
+            &script_path,
+            "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.conditional\n// Version=1.0.0\n// SCRIPTMETA-END\n",
+        )
+        .expect("initial script");
+        let loaded = read_script_metadata_draft_from_file(&script_path).expect("loaded draft");
+
+        fs::write(
+            &script_path,
+            "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.conditional\n// Version=1.0.1\n// SCRIPTMETA-END\n",
+        )
+        .expect("external edit");
+        let error = write_script_metadata_to_file_if_unchanged(
+            &script_path,
+            &ScriptMetadataDraft {
+                script_id: "com.example.conditional".to_string(),
+                version: Some("2.0.0".to_string()),
+                ..ScriptMetadataDraft::default()
+            },
+            ScriptMetaWriteMode::InsertOrReplace,
+            None,
+            Some(&loaded.source_fingerprint),
+        )
+        .expect_err("external change must be rejected");
+
+        assert!(matches!(error, crate::ScriptMetaKitError::Conflict(_)));
+        let current = fs::read_to_string(&script_path).expect("current script");
+        assert!(current.contains("Version=1.0.1"));
+        assert!(!current.contains("Version=2.0.0"));
     }
 
     #[test]
@@ -2480,6 +2656,50 @@ mod tests {
         );
 
         clear_scriptmeta_backups(&script_path, &backup_options).expect("clear backups");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_sync_failure_reports_committed_write_and_keeps_backup() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("example.jsx");
+        fs::write(&script_path, "alert('before');\n").expect("write script");
+        let backup_options = ScriptMetaBackupOptions {
+            root_directory: directory.path().join("backups"),
+        };
+        let draft = ScriptMetadataDraft {
+            script_id: "com.example.committed-sync-failure".to_string(),
+            ..ScriptMetadataDraft::default()
+        };
+
+        super::TEST_DIRECTORY_SYNC_FAILURE
+            .with(|failure| *failure.borrow_mut() = Some(script_path.clone()));
+        let result = write_script_metadata_to_file(
+            &script_path,
+            &draft,
+            ScriptMetaWriteMode::InsertOrReplace,
+            Some(&backup_options),
+        );
+        super::TEST_DIRECTORY_SYNC_FAILURE.with(|failure| *failure.borrow_mut() = None);
+
+        let error = result.expect_err("directory sync failure");
+        assert!(error.to_string().contains("file replacement succeeded"));
+        assert!(
+            fs::read_to_string(&script_path)
+                .expect("committed script")
+                .contains("Script-ID=com.example.committed-sync-failure")
+        );
+        let generations =
+            scriptmeta_backup_generations(&script_path, &backup_options).expect("generations");
+        let backup = generations
+            .iter()
+            .find(|generation| !generation.is_current_file)
+            .expect("before-save backup");
+        assert!(backup.file_path.exists());
+        assert_eq!(
+            fs::read_to_string(&backup.file_path).expect("backup"),
+            "alert('before');\n"
+        );
     }
 
     #[test]

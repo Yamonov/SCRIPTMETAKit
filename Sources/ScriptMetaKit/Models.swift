@@ -284,6 +284,64 @@ public nonisolated enum ScriptMetaCacheScope: UInt32, Codable, Sendable {
     case root = 3
 }
 
+public nonisolated enum ScriptMetaOperationTerminationPolicy: String, Codable, Sendable {
+    case waitForCurrentOperation
+    case cancelCurrentOperation
+}
+
+public nonisolated struct ScriptMetaKitOperationalPolicy: Codable, Sendable, Equatable {
+    public var maxConcurrentMetaURLChecks: Int
+    public var retryAttempts: Int
+    public var retryInitialDelayMillis: UInt64
+    public var retryBackoffMultiplier: UInt32
+    public var maxRetryDelayMillis: UInt64
+    public var requestTimeoutMillis: UInt64
+    public var resourceTimeoutMillis: UInt64
+    public var watcherDebounceDelayMillis: UInt64
+    public var watcherMaxDeliveryDelayMillis: UInt64
+    public var watcherMaxPendingPaths: Int
+
+    public init(
+        maxConcurrentMetaURLChecks: Int = 6,
+        retryAttempts: Int = 2,
+        retryInitialDelayMillis: UInt64 = 500,
+        retryBackoffMultiplier: UInt32 = 3,
+        maxRetryDelayMillis: UInt64 = 30_000,
+        requestTimeoutMillis: UInt64 = 15_000,
+        resourceTimeoutMillis: UInt64 = 15_000,
+        watcherDebounceDelayMillis: UInt64 = 500,
+        watcherMaxDeliveryDelayMillis: UInt64 = 2_000,
+        watcherMaxPendingPaths: Int = 1_024
+    ) {
+        self.maxConcurrentMetaURLChecks = maxConcurrentMetaURLChecks
+        self.retryAttempts = retryAttempts
+        self.retryInitialDelayMillis = retryInitialDelayMillis
+        self.retryBackoffMultiplier = retryBackoffMultiplier
+        self.maxRetryDelayMillis = maxRetryDelayMillis
+        self.requestTimeoutMillis = requestTimeoutMillis
+        self.resourceTimeoutMillis = resourceTimeoutMillis
+        self.watcherDebounceDelayMillis = watcherDebounceDelayMillis
+        self.watcherMaxDeliveryDelayMillis = watcherMaxDeliveryDelayMillis
+        self.watcherMaxPendingPaths = watcherMaxPendingPaths
+    }
+
+    public static let balanced = ScriptMetaKitOperationalPolicy()
+    public static let interactive = ScriptMetaKitOperationalPolicy(
+        watcherDebounceDelayMillis: 250,
+        watcherMaxDeliveryDelayMillis: 1_000
+    )
+    public static let lowImpact = ScriptMetaKitOperationalPolicy(
+        maxConcurrentMetaURLChecks: 2,
+        retryInitialDelayMillis: 1_000,
+        retryBackoffMultiplier: 2,
+        requestTimeoutMillis: 20_000,
+        resourceTimeoutMillis: 20_000,
+        watcherDebounceDelayMillis: 1_000,
+        watcherMaxDeliveryDelayMillis: 4_000,
+        watcherMaxPendingPaths: 512
+    )
+}
+
 public nonisolated enum ScriptMetaRefreshPolicy: UInt32, Codable, Sendable {
     case manualOnly = 0
     case onVisible = 1
@@ -981,6 +1039,69 @@ public nonisolated struct UpdateFailureSummary: Identifiable, Sendable {
     }
 }
 
+public nonisolated enum ScriptMetaOperationStatus: String, Codable, Sendable {
+    case finished
+    case cancelled
+    case timedOut = "timed_out"
+    case partial
+}
+
+public nonisolated enum ScriptMetaRootStatus: String, Codable, Sendable {
+    case notLoaded = "not_loaded"
+    case ready
+    case dirty
+    case loading
+    case missing
+    case unreadable
+    case timedOut = "timed_out"
+    case overflowed
+    case cancelled
+}
+
+public nonisolated enum ScriptMetaUpdateStatus: String, Codable, Sendable {
+    case idle
+    case checking
+    case upToDate = "up_to_date"
+    case updateAvailable = "update_available"
+    case failed
+    case cancelled
+    case notCheckable = "not_checkable"
+}
+
+public nonisolated enum ScriptMetaUpdateProgressPhase: String, Codable, Sendable {
+    case started
+    case checking
+    case retrying
+    case finishedItem = "finished_item"
+    case failedItem = "failed_item"
+    case finished
+    case cancelled
+}
+
+public extension OperationInfo {
+    var typedStatus: ScriptMetaOperationStatus? {
+        ScriptMetaOperationStatus(rawValue: status)
+    }
+}
+
+public extension RootSnapshot {
+    var typedStatus: ScriptMetaRootStatus? {
+        ScriptMetaRootStatus(rawValue: status)
+    }
+}
+
+public extension UpdateCheckResult {
+    var typedStatusesByItemID: [String: ScriptMetaUpdateStatus] {
+        statusesByItemID.compactMapValues(ScriptMetaUpdateStatus.init(rawValue:))
+    }
+}
+
+public extension UpdateCheckProgress {
+    var typedPhase: ScriptMetaUpdateProgressPhase? {
+        ScriptMetaUpdateProgressPhase(rawValue: phase)
+    }
+}
+
 public nonisolated struct UpdateFailure: Codable, Sendable {
     public var code: String
     public var message: String
@@ -1130,6 +1251,24 @@ public nonisolated struct ScriptMetadataEditReadResult: Codable, Sendable {
         case unknownLines = "unknown_lines"
         case existingBlockText = "existing_block_text"
         case sourceFingerprint = "source_fingerprint"
+    }
+}
+
+public nonisolated struct ScriptMetadataEditSession: Codable, Sendable {
+    public var fileURL: URL
+    public var readResult: ScriptMetadataEditReadResult
+
+    public init(fileURL: URL, readResult: ScriptMetadataEditReadResult) {
+        self.fileURL = fileURL
+        self.readResult = readResult
+    }
+
+    public var draft: ScriptMetadataDraft {
+        readResult.draft
+    }
+
+    public var sourceFingerprint: String {
+        readResult.sourceFingerprint
     }
 }
 

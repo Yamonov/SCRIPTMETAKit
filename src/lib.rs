@@ -22,10 +22,10 @@ pub use catalog::{
 };
 pub use core::{
     DistributionMetadata, DistributionResolution, FileIssue, OperationCancellation,
-    OperationStatus, OperationSummary, ParserOptions, ScriptMetaEditCapability,
-    ScriptMetaEditState, ScriptMetaItem, ScriptMetaItemRef, ScriptMetaKitError,
-    ScriptMetaKitResult, ScriptMetadata, ScriptRuntimeKind, VersionOrdering, compare_versions,
-    decode_script_text, decode_script_text_strict, normalize_metadata_url,
+    OperationCancellationReservation, OperationStatus, OperationSummary, ParserOptions,
+    ScriptMetaEditCapability, ScriptMetaEditState, ScriptMetaItem, ScriptMetaItemRef,
+    ScriptMetaKitError, ScriptMetaKitResult, ScriptMetadata, ScriptRuntimeKind, VersionOrdering,
+    compare_versions, decode_script_text, decode_script_text_strict, normalize_metadata_url,
     normalize_version_string, parse_distribution_metadata, parse_distribution_metadata_for_script,
     parse_distribution_metadata_records, parse_script_metadata, parse_script_metadata_with_options,
 };
@@ -43,7 +43,8 @@ pub use editkit::{
     render_script_metadata_block, render_script_metadata_for_style,
     reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
     scriptmeta_backup_generations, validate_script_id_uniqueness, verify_edit_password_sha256,
-    write_script_metadata_to_file, write_script_metadata_to_text,
+    write_script_metadata_to_file, write_script_metadata_to_file_if_unchanged,
+    write_script_metadata_to_text,
 };
 pub use engine::ScriptMetaKitEngine;
 pub use formats::{
@@ -57,7 +58,10 @@ pub use scanner::{
     ExtensionPolicy, FileSystemEntry, PathKind, PathResolutionStatus, RootPreflightOptions,
     ScannablePathResolution, ScannerOptions, can_read_directory_contents, resolve_registered_path,
 };
-pub use storage::{CachePayload, CacheSchema, load_cache_payload, save_cache_payload};
+pub use storage::{
+    CachePayload, CacheSchema, MAX_CACHE_FILE_BYTES, cache_payload_content_fingerprint,
+    load_cache_payload, save_cache_payload,
+};
 #[cfg(feature = "native-watch")]
 pub use watcher::NativeWatcher;
 pub use watcher::{
@@ -98,6 +102,6 @@ mod tests {
     #[test]
     fn exposes_package_metadata() {
         assert_eq!(package_name(), "scriptmetakit");
-        assert_eq!(package_version(), "1.0.9");
+        assert_eq!(package_version(), "1.1.0");
     }
 }

@@ -1,8 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -23,12 +28,16 @@ use crate::{
         ScriptMetaKitError, ScriptMetaKitResult,
     },
     now_timestamp_millis,
-    resolver::{DistributionResolverOptions, ResolvedItemUpdate, UpdateResolver},
+    resolver::{
+        DistributionResolverOptions, HttpValidationCache, ResolvedItemUpdate, UpdateResolver,
+        retry_after_hint_millis,
+    },
     scanner::{
-        CandidateCache, CandidateRecord, FileSystemEntry, deduplicated_items,
-        file_items_from_cache, registered_root_signatures, scan_file_list_root_controlled,
+        CandidateCache, CandidateRecord, FileSystemEntry, MetadataScanSources, deduplicated_items,
+        file_items_from_cache, registered_root_signatures,
+        scan_file_list_root_transactional_controlled,
         scan_file_list_root_with_dirty_directories_controlled,
-        scan_metadata_roots_scoped_controlled,
+        scan_metadata_roots_scoped_with_file_lists_controlled,
         try_scan_file_list_root_with_owned_dirty_directories_controlled,
     },
     storage::CachePayload,
@@ -38,7 +47,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ScriptMetaKitEngine {
     config: ScriptMetaKitConfig,
     roots: Vec<RootRegistration>,
@@ -46,11 +55,37 @@ pub struct ScriptMetaKitEngine {
     visible_root_id: Option<RootId>,
     root_snapshots: BTreeMap<RootId, RootSnapshot>,
     file_list_snapshots: BTreeMap<RootId, Arc<FileListSnapshot>>,
+    known_directory_paths: BTreeSet<PathBuf>,
+    known_file_paths: BTreeSet<PathBuf>,
     catalog_snapshot: Option<Arc<ScriptMetaCatalogSnapshot>>,
     update_check_result: Option<Arc<UpdateCheckResult>>,
     dirty_roots: BTreeMap<RootId, DirtyRootState>,
     last_memory_cache_accessed_at: Option<crate::TimestampMillis>,
+    memory_cache_export_allowed: bool,
+    http_validation_cache: HttpValidationCache,
     cancellation: OperationCancellation,
+}
+
+impl Clone for ScriptMetaKitEngine {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            roots: self.roots.clone(),
+            root_groups: self.root_groups.clone(),
+            visible_root_id: self.visible_root_id.clone(),
+            root_snapshots: self.root_snapshots.clone(),
+            file_list_snapshots: self.file_list_snapshots.clone(),
+            known_directory_paths: self.known_directory_paths.clone(),
+            known_file_paths: self.known_file_paths.clone(),
+            catalog_snapshot: self.catalog_snapshot.clone(),
+            update_check_result: self.update_check_result.clone(),
+            dirty_roots: self.dirty_roots.clone(),
+            last_memory_cache_accessed_at: self.last_memory_cache_accessed_at,
+            memory_cache_export_allowed: self.memory_cache_export_allowed,
+            http_validation_cache: self.http_validation_cache.clone(),
+            cancellation: OperationCancellation::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,12 +100,21 @@ struct FileListScanJob {
     root: RootRegistration,
     previous_snapshot: Option<Arc<FileListSnapshot>>,
     dirty_directories: Option<Vec<PathBuf>>,
+    probe_script_headers: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpdateCheckCacheMode {
     Replace,
     Merge,
+}
+
+#[derive(Clone, Copy)]
+struct UpdateRetryPolicy {
+    attempts: usize,
+    initial_delay_millis: u64,
+    backoff_multiplier: u32,
+    max_delay_millis: u64,
 }
 
 impl ScriptMetaKitEngine {
@@ -83,10 +127,14 @@ impl ScriptMetaKitEngine {
             visible_root_id: None,
             root_snapshots: BTreeMap::new(),
             file_list_snapshots: BTreeMap::new(),
+            known_directory_paths: BTreeSet::new(),
+            known_file_paths: BTreeSet::new(),
             catalog_snapshot: None,
             update_check_result: None,
             dirty_roots: BTreeMap::new(),
             last_memory_cache_accessed_at: None,
+            memory_cache_export_allowed: true,
+            http_validation_cache: HttpValidationCache::default(),
             cancellation: OperationCancellation::new(),
         })
     }
@@ -217,6 +265,7 @@ impl ScriptMetaKitEngine {
         }
 
         self.roots = roots;
+        self.rebuild_known_path_index();
         if invalidate_catalog {
             self.catalog_snapshot = None;
             self.update_check_result = None;
@@ -312,8 +361,46 @@ impl ScriptMetaKitEngine {
 
     pub fn scan_roots(&mut self, request: ScanRequest) -> ScriptMetaKitResult<ScanResult> {
         self.expire_idle_memory_cache();
-        self.begin_operation();
+        let _operation_scope = self.cancellation.begin_scope();
         self.scan_roots_inner(request, None)
+    }
+
+    pub fn scan_roots_and_check_updates(
+        &mut self,
+        request: ScanRequest,
+        check_updates: bool,
+    ) -> ScriptMetaKitResult<(ScanResult, Option<Arc<UpdateCheckResult>>)> {
+        self.scan_roots_and_check_updates_inner(request, check_updates, None)
+    }
+
+    pub fn scan_roots_and_check_updates_with_progress(
+        &mut self,
+        request: ScanRequest,
+        check_updates: bool,
+        mut progress: impl FnMut(UpdateCheckProgress),
+    ) -> ScriptMetaKitResult<(ScanResult, Option<Arc<UpdateCheckResult>>)> {
+        self.scan_roots_and_check_updates_inner(request, check_updates, Some(&mut progress))
+    }
+
+    fn scan_roots_and_check_updates_inner(
+        &mut self,
+        request: ScanRequest,
+        check_updates: bool,
+        progress: Option<&mut dyn FnMut(UpdateCheckProgress)>,
+    ) -> ScriptMetaKitResult<(ScanResult, Option<Arc<UpdateCheckResult>>)> {
+        self.expire_idle_memory_cache();
+        let _operation_scope = self.cancellation.begin_scope();
+        let scan_result = self.scan_roots_inner(request, None)?;
+        if !check_updates || self.cancellation.is_cancelled() {
+            return Ok((scan_result, None));
+        }
+        let items = scan_result
+            .catalog_snapshot
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.file_items.as_slice());
+        let update_result =
+            self.check_updates_items(items, progress, UpdateCheckCacheMode::Replace)?;
+        Ok((scan_result, Some(update_result)))
     }
 
     #[must_use]
@@ -324,7 +411,7 @@ impl ScriptMetaKitEngine {
             .iter()
             .map(|index| self.roots[*index].root_id.clone())
             .collect();
-        let roots = self.snapshots_for_roots(&root_ids);
+        let mut roots = self.snapshots_for_roots(&root_ids);
         let file_list_snapshots = if request.mode.includes_file_list() {
             self.file_list_snapshots_for_roots(&root_ids)
         } else {
@@ -335,6 +422,26 @@ impl ScriptMetaKitEngine {
             .includes_metadata()
             .then(|| self.catalog_snapshot.clone())
             .flatten();
+        for root in &mut roots {
+            let has_file_list = !request.mode.includes_file_list()
+                || file_list_snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.root.root_id == root.root_id);
+            let has_catalog = !request.mode.includes_metadata()
+                || catalog_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .roots
+                        .iter()
+                        .any(|catalog_root| catalog_root.root_id == root.root_id)
+                });
+            if root.status == RootStatus::Ready && (!has_file_list || !has_catalog) {
+                root.status = RootStatus::NotLoaded;
+                root.is_dirty = true;
+                root.item_count = 0;
+                root.error = None;
+            }
+        }
+        self.touch_memory_cache_if_needed();
         let operation = scan_operation_summary(&roots);
         let file_issues =
             collect_scan_file_issues(&roots, &file_list_snapshots, catalog_snapshot.as_deref());
@@ -364,10 +471,6 @@ impl ScriptMetaKitEngine {
         self.cancellation.clone()
     }
 
-    fn begin_operation(&self) {
-        self.cancellation.reset();
-    }
-
     fn scan_roots_inner(
         &mut self,
         request: ScanRequest,
@@ -392,7 +495,13 @@ impl ScriptMetaKitEngine {
         let mut change_summary = ScanChangeSummary::default();
 
         if request.mode.includes_file_list() {
-            for output in self.scan_file_list_outputs(&file_list_root_indices, dirty_scopes) {
+            let defer_script_probe_to_metadata =
+                request.mode.includes_metadata() && dirty_scopes.is_none();
+            for output in self.scan_file_list_outputs(
+                &file_list_root_indices,
+                dirty_scopes,
+                defer_script_probe_to_metadata,
+            ) {
                 let output_change_summary = output.change_summary;
                 let root_snapshot = output.root;
                 let root_id = root_snapshot.root_id.clone();
@@ -426,15 +535,22 @@ impl ScriptMetaKitEngine {
                     })
                     .flatten();
                 let dirty_directories = self.metadata_dirty_directories(dirty_scopes);
-                scan_metadata_roots_scoped_controlled(
+                let shared_file_list_snapshots = request
+                    .mode
+                    .includes_file_list()
+                    .then_some(file_list_snapshots.as_slice());
+                scan_metadata_roots_scoped_with_file_lists_controlled(
                     metadata_root_indices
                         .iter()
                         .map(|index| &self.roots[*index]),
                     &self.config.scanner,
                     &self.config.parser,
                     &self.config.supported_extensions,
-                    previous_cache,
-                    dirty_directories.as_ref(),
+                    MetadataScanSources {
+                        previous_cache,
+                        dirty_directories_by_root: dirty_directories.as_ref(),
+                        file_list_snapshots: shared_file_list_snapshots,
+                    },
                     Some(&self.cancellation),
                 )
             };
@@ -448,27 +564,47 @@ impl ScriptMetaKitEngine {
                 .collect::<BTreeSet<_>>();
             let scan_roots = output.roots;
             let scan_candidate_cache = output.candidate_cache;
-            let scan_file_items = file_items_from_cache(&scan_candidate_cache);
-            let scan_all_items = deduplicated_items(&scan_file_items);
-
-            let mut stored_roots = scan_roots.clone();
-            let mut stored_candidate_cache = scan_candidate_cache.clone();
-            let mut return_stored_snapshot = true;
-            if let Some(previous_snapshot) = self.catalog_snapshot.as_ref() {
-                return_stored_snapshot = false;
-                stored_roots = merged_catalog_roots(
-                    previous_snapshot.as_ref(),
-                    stored_roots,
-                    &refreshed_root_ids,
-                );
-                stored_candidate_cache = merged_candidate_cache(
-                    previous_snapshot.as_ref(),
-                    stored_candidate_cache,
-                    &refreshed_root_ids,
-                    &self.roots,
-                    root_allows_memory_cache,
-                );
-            }
+            let previous_snapshot = self.catalog_snapshot.as_ref();
+            let needs_partial_merge = previous_snapshot.is_some_and(|previous| {
+                previous
+                    .roots
+                    .iter()
+                    .any(|root| !refreshed_root_ids.contains(&root.root_id))
+                    || previous.candidate_cache.records.iter().any(|record| {
+                        !refreshed_root_ids.contains(&record.root_id)
+                            && self
+                                .root_by_id(&record.root_id)
+                                .is_some_and(root_allows_memory_cache)
+                    })
+            });
+            let (stored_roots, stored_candidate_cache, partial_snapshot_parts) =
+                if needs_partial_merge {
+                    let scan_file_items = file_items_from_cache(&scan_candidate_cache);
+                    let scan_all_items = deduplicated_items(&scan_file_items);
+                    let previous = previous_snapshot.expect("partial merge requires a snapshot");
+                    (
+                        merged_catalog_roots(
+                            previous.as_ref(),
+                            scan_roots.clone(),
+                            &refreshed_root_ids,
+                        ),
+                        merged_candidate_cache(
+                            previous.as_ref(),
+                            scan_candidate_cache.clone(),
+                            &refreshed_root_ids,
+                            &self.roots,
+                            root_allows_memory_cache,
+                        ),
+                        Some((
+                            scan_roots,
+                            scan_all_items,
+                            scan_file_items,
+                            scan_candidate_cache,
+                        )),
+                    )
+                } else {
+                    (scan_roots, scan_candidate_cache, None)
+                };
             let stored_file_items = file_items_from_cache(&stored_candidate_cache);
             let stored_all_items = deduplicated_items(&stored_file_items);
             let update_check_result = self.preserved_update_result(
@@ -483,16 +619,18 @@ impl ScriptMetaKitEngine {
                 file_items: stored_file_items,
                 candidate_cache: stored_candidate_cache,
             });
-            let snapshot = if return_stored_snapshot {
-                Arc::clone(&stored_snapshot)
-            } else {
+            let snapshot = if let Some((roots, all_items, file_items, candidate_cache)) =
+                partial_snapshot_parts
+            {
                 Arc::new(ScriptMetaCatalogSnapshot {
                     source_revision: output.source_revision,
-                    roots: scan_roots,
-                    all_items: scan_all_items,
-                    file_items: scan_file_items,
-                    candidate_cache: scan_candidate_cache,
+                    roots,
+                    all_items,
+                    file_items,
+                    candidate_cache,
                 })
+            } else {
+                Arc::clone(&stored_snapshot)
             };
             if request.mode.includes_file_list() {
                 apply_metadata_capabilities_to_file_list_snapshots(
@@ -545,14 +683,19 @@ impl ScriptMetaKitEngine {
         } else {
             Vec::new()
         };
+        self.rebuild_known_path_index();
         self.enforce_memory_node_limit();
         for root_id in &root_ids {
-            if self
+            let completed = self
                 .root_snapshots
                 .get(root_id)
-                .is_some_and(|root| matches!(root.status, RootStatus::Ready | RootStatus::Missing))
-            {
+                .is_some_and(|root| matches!(root.status, RootStatus::Ready | RootStatus::Missing));
+            if completed {
                 self.dirty_roots.remove(root_id);
+            } else if self.dirty_roots.contains_key(root_id)
+                && let Some(snapshot) = self.root_snapshots.get_mut(root_id)
+            {
+                snapshot.is_dirty = true;
             }
         }
         self.touch_memory_cache_if_needed();
@@ -591,8 +734,8 @@ impl ScriptMetaKitEngine {
                 extensions: &self.config.supported_extensions,
                 skip_hidden_paths: self.config.scanner.skip_hidden,
                 skip_package_paths: self.config.scanner.skip_packages,
-                known_directory_paths: &known_directory_paths,
-                known_file_paths: &known_file_paths,
+                known_directory_paths,
+                known_file_paths,
                 overflow_policy: self.config.watcher.overflow_policy,
                 max_deferred_dirty_directories: self.config.cache.max_deferred_dirty_directories,
             },
@@ -675,7 +818,7 @@ impl ScriptMetaKitEngine {
         request: RefreshRequest,
     ) -> ScriptMetaKitResult<ScanResult> {
         self.expire_idle_memory_cache();
-        self.begin_operation();
+        let _operation_scope = self.cancellation.begin_scope();
         let dirty_scopes = self.dirty_roots.clone();
         let dirty_root_ids = dirty_scopes.keys().cloned().collect::<Vec<_>>();
         let all_root_ids: Vec<_> = self.roots.iter().map(|root| root.root_id.clone()).collect();
@@ -706,8 +849,6 @@ impl ScriptMetaKitEngine {
             });
         }
 
-        let previous_catalog = self.catalog_snapshot.clone();
-        let previous_update_result = self.update_check_result.clone();
         let partial_result = self.scan_roots_inner(
             ScanRequest {
                 root_ids: dirty_root_ids,
@@ -715,20 +856,6 @@ impl ScriptMetaKitEngine {
             },
             Some(&dirty_scopes),
         )?;
-
-        if request.mode.includes_metadata()
-            && let Some(partial_catalog) = partial_result.catalog_snapshot.as_ref()
-        {
-            let merged_catalog =
-                self.merge_catalog_snapshot(previous_catalog.as_deref(), partial_catalog.as_ref());
-            let update_check_result = self.preserved_update_result(
-                previous_catalog.as_deref(),
-                previous_update_result.as_deref(),
-                &merged_catalog.file_items,
-            );
-            let merged_catalog = Arc::new(merged_catalog);
-            self.store_catalog_snapshot_if_allowed(&merged_catalog, update_check_result);
-        }
 
         let roots = self.snapshots_for_roots(&all_root_ids);
         let file_list_snapshots = self.file_list_snapshots_for_roots(&all_root_ids);
@@ -760,6 +887,7 @@ impl ScriptMetaKitEngine {
         &mut self,
         request: UpdateCheckRequest,
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
+        let _operation_scope = self.cancellation.begin_scope();
         self.check_updates_items(&request.items, None, UpdateCheckCacheMode::Replace)
     }
 
@@ -768,6 +896,7 @@ impl ScriptMetaKitEngine {
         request: UpdateCheckRequest,
         mut progress: impl FnMut(UpdateCheckProgress),
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
+        let _operation_scope = self.cancellation.begin_scope();
         self.check_updates_items(
             &request.items,
             Some(&mut progress),
@@ -779,6 +908,7 @@ impl ScriptMetaKitEngine {
         &mut self,
         items: &[ScriptMetaItemRef],
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
+        let _operation_scope = self.cancellation.begin_scope();
         self.check_updates_items(items, None, UpdateCheckCacheMode::Replace)
     }
 
@@ -787,6 +917,7 @@ impl ScriptMetaKitEngine {
         items: &[ScriptMetaItemRef],
         mut progress: impl FnMut(UpdateCheckProgress),
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
+        let _operation_scope = self.cancellation.begin_scope();
         self.check_updates_items(items, Some(&mut progress), UpdateCheckCacheMode::Replace)
     }
 
@@ -794,6 +925,7 @@ impl ScriptMetaKitEngine {
         &mut self,
         item: ScriptMetaItemRef,
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
+        let _operation_scope = self.cancellation.begin_scope();
         self.check_updates_items(&[item], None, UpdateCheckCacheMode::Merge)
     }
 
@@ -802,6 +934,7 @@ impl ScriptMetaKitEngine {
         item: ScriptMetaItemRef,
         mut progress: impl FnMut(UpdateCheckProgress),
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
+        let _operation_scope = self.cancellation.begin_scope();
         self.check_updates_items(&[item], Some(&mut progress), UpdateCheckCacheMode::Merge)
     }
 
@@ -811,7 +944,6 @@ impl ScriptMetaKitEngine {
         mut progress: Option<&mut dyn FnMut(UpdateCheckProgress)>,
         cache_mode: UpdateCheckCacheMode,
     ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
-        self.begin_operation();
         if !self.config.update_check.enabled {
             return Err(ScriptMetaKitError::InvalidConfig(
                 "update checking is disabled".to_string(),
@@ -828,17 +960,34 @@ impl ScriptMetaKitEngine {
         };
         let total_items = items.len();
 
-        let update_resolver = UpdateResolver::new(DistributionResolverOptions {
-            request_timeout_millis: self
-                .config
-                .update_check
-                .request_timeout_millis
-                .or(self.config.update_check.resource_timeout_millis),
-            resource_timeout_millis: self.config.update_check.resource_timeout_millis,
-            cache_enabled: self.config.update_check.cache_network_responses,
-            ..DistributionResolverOptions::default()
-        })?;
         let retry_attempts = self.config.update_check.retry_attempts;
+        let retry_initial_delay_millis = self.config.update_check.retry_initial_delay_millis;
+        let retry_backoff_multiplier = self.config.update_check.retry_backoff_multiplier;
+        let max_retry_delay_millis = self.config.update_check.max_retry_delay_millis;
+        let retry_policy = UpdateRetryPolicy {
+            attempts: retry_attempts,
+            initial_delay_millis: retry_initial_delay_millis,
+            backoff_multiplier: retry_backoff_multiplier,
+            max_delay_millis: max_retry_delay_millis,
+        };
+        let update_resolver = UpdateResolver::new_with_cancellation_retry_and_http_cache(
+            DistributionResolverOptions {
+                request_timeout_millis: self
+                    .config
+                    .update_check
+                    .request_timeout_millis
+                    .or(self.config.update_check.resource_timeout_millis),
+                resource_timeout_millis: self.config.update_check.resource_timeout_millis,
+                // Parsed/source singleflight state is operation-local. HTTP
+                // validators and their bounded response bodies are supplied
+                // separately by the engine for conditional revalidation.
+                cache_enabled: true,
+                ..DistributionResolverOptions::default()
+            },
+            self.cancellation.clone(),
+            retry_attempts,
+            self.http_validation_cache.clone(),
+        )?;
 
         emit_update_progress(
             &mut progress,
@@ -859,19 +1008,24 @@ impl ScriptMetaKitEngine {
             .min(groups.len().max(1));
         let mut completed_items = 0usize;
 
-        for chunk_start in (0..groups.len()).step_by(group_parallelism) {
-            if self.cancellation.is_cancelled() {
-                break;
-            }
-            let chunk_end = (chunk_start + group_parallelism).min(groups.len());
-            let chunk = &groups[chunk_start..chunk_end];
-            let (sender, receiver) = mpsc::channel();
-            thread::scope(|scope| {
-                for group in chunk {
-                    let sender = sender.clone();
-                    let update_resolver = update_resolver.clone();
-                    let cancellation = self.cancellation.clone();
-                    scope.spawn(move || {
+        let next_group_index = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::channel();
+        thread::scope(|scope| {
+            for _ in 0..group_parallelism {
+                let next_group_index = &next_group_index;
+                let groups = &groups;
+                let sender = sender.clone();
+                let update_resolver = update_resolver.clone();
+                let cancellation = self.cancellation.clone();
+                scope.spawn(move || {
+                    loop {
+                        if cancellation.is_cancelled() {
+                            break;
+                        }
+                        let group_index = next_group_index.fetch_add(1, Ordering::Relaxed);
+                        let Some(group) = groups.get(group_index) else {
+                            break;
+                        };
                         for &item_index in group {
                             if cancellation.is_cancelled() {
                                 break;
@@ -886,7 +1040,8 @@ impl ScriptMetaKitEngine {
                             let resolved_result = resolve_update_item_with_retry(
                                 &update_resolver,
                                 item,
-                                retry_attempts,
+                                retry_policy,
+                                &cancellation,
                                 |error| {
                                     let _ = sender.send(UpdateWorkEvent::Retrying {
                                         item_id: item_id.clone(),
@@ -895,6 +1050,9 @@ impl ScriptMetaKitEngine {
                                     });
                                 },
                             );
+                            if cancellation.is_cancelled() {
+                                break;
+                            }
                             let _ = sender.send(UpdateWorkEvent::Finished {
                                 item_index,
                                 item_id,
@@ -902,79 +1060,79 @@ impl ScriptMetaKitEngine {
                                 resolved_result: Box::new(resolved_result),
                             });
                         }
-                    });
-                }
-                drop(sender);
+                    }
+                });
+            }
+            drop(sender);
 
-                for event in receiver {
-                    match event {
-                        UpdateWorkEvent::Checking { item_id, script_id } => {
-                            emit_update_progress(
-                                &mut progress,
-                                completed_items,
-                                total_items,
-                                Some(item_id.as_str()),
-                                Some(script_id.as_str()),
-                                UpdateCheckProgressPhase::Checking,
-                                || format!("checking {script_id}"),
-                            );
-                        }
-                        UpdateWorkEvent::Retrying {
-                            item_id,
-                            script_id,
-                            error,
-                        } => {
-                            emit_update_progress(
-                                &mut progress,
-                                completed_items,
-                                total_items,
-                                Some(item_id.as_str()),
-                                Some(script_id.as_str()),
-                                UpdateCheckProgressPhase::Retrying,
-                                || format!("retrying {script_id} after failure: {error}"),
-                            );
-                        }
-                        UpdateWorkEvent::Finished {
-                            item_index,
-                            item_id,
-                            script_id,
-                            resolved_result,
-                        } => {
-                            let status = apply_update_item_result(
-                                &mut result,
-                                &items[item_index],
-                                item_id.clone(),
-                                checked_at,
-                                *resolved_result,
-                            );
-                            completed_items += 1;
-                            let failed = status == UpdateStatus::Failed;
-                            emit_update_progress(
-                                &mut progress,
-                                completed_items,
-                                total_items,
-                                Some(item_id.as_str()),
-                                Some(script_id.as_str()),
-                                if failed {
-                                    UpdateCheckProgressPhase::FailedItem
-                                } else {
-                                    UpdateCheckProgressPhase::FinishedItem
-                                },
-                                || {
-                                    format!(
-                                        "{}/{} {} {}",
-                                        completed_items,
-                                        total_items,
-                                        if failed { "failed" } else { "finished" },
-                                        script_id
-                                    )
-                                },
-                            );
-                        }
+            for event in receiver {
+                match event {
+                    UpdateWorkEvent::Checking { item_id, script_id } => {
+                        emit_update_progress(
+                            &mut progress,
+                            completed_items,
+                            total_items,
+                            Some(item_id.as_str()),
+                            Some(script_id.as_str()),
+                            UpdateCheckProgressPhase::Checking,
+                            || format!("checking {script_id}"),
+                        );
+                    }
+                    UpdateWorkEvent::Retrying {
+                        item_id,
+                        script_id,
+                        error,
+                    } => {
+                        emit_update_progress(
+                            &mut progress,
+                            completed_items,
+                            total_items,
+                            Some(item_id.as_str()),
+                            Some(script_id.as_str()),
+                            UpdateCheckProgressPhase::Retrying,
+                            || format!("retrying {script_id} after failure: {error}"),
+                        );
+                    }
+                    UpdateWorkEvent::Finished {
+                        item_index,
+                        item_id,
+                        script_id,
+                        resolved_result,
+                    } => {
+                        let status = apply_update_item_result(
+                            &mut result,
+                            &items[item_index],
+                            item_id.clone(),
+                            checked_at,
+                            *resolved_result,
+                        );
+                        completed_items += 1;
+                        let failed = status == UpdateStatus::Failed;
+                        emit_update_progress(
+                            &mut progress,
+                            completed_items,
+                            total_items,
+                            Some(item_id.as_str()),
+                            Some(script_id.as_str()),
+                            if failed {
+                                UpdateCheckProgressPhase::FailedItem
+                            } else {
+                                UpdateCheckProgressPhase::FinishedItem
+                            },
+                            || {
+                                format!(
+                                    "{}/{} {} {}",
+                                    completed_items,
+                                    total_items,
+                                    if failed { "failed" } else { "finished" },
+                                    script_id
+                                )
+                            },
+                        );
                     }
                 }
-            });
-        }
+            }
+        });
 
         let was_cancelled = self.cancellation.is_cancelled();
         if was_cancelled {
@@ -1123,6 +1281,12 @@ impl ScriptMetaKitEngine {
                 "persistent cache is disabled".to_string(),
             ));
         }
+        if !self.memory_cache_export_allowed {
+            return Err(ScriptMetaKitError::Cache(
+                "memory cache was partially evicted; refusing to overwrite persistent cache"
+                    .to_string(),
+            ));
+        }
         match scope {
             CacheScope::All => {
                 let data = serde_json::to_value(AllCacheDataRef {
@@ -1173,6 +1337,7 @@ impl ScriptMetaKitEngine {
             .and_then(|result| filter_update_result_to_items(result, &catalog_snapshot.file_items));
         self.catalog_snapshot = Some(Arc::new(catalog_snapshot));
         self.enforce_memory_node_limit();
+        self.rebuild_known_path_index();
         self.touch_memory_cache_if_needed();
         Ok(())
     }
@@ -1196,6 +1361,7 @@ impl ScriptMetaKitEngine {
                 self.file_list_snapshots.insert(root_id, snapshot);
             }
         }
+        self.rebuild_known_path_index();
         self.enforce_memory_node_limit();
         self.touch_memory_cache_if_needed();
         Ok(())
@@ -1279,6 +1445,7 @@ impl ScriptMetaKitEngine {
             }
             CacheScope::FileList | CacheScope::Root => self.file_list_snapshots.clear(),
         }
+        self.rebuild_known_path_index();
         vec![ScriptMetaKitEvent::CacheInvalidated { scope, reason }]
     }
 
@@ -1286,6 +1453,7 @@ impl ScriptMetaKitEngine {
         &mut self,
         selected_root_indices: &[usize],
         dirty_scopes: Option<&BTreeMap<RootId, DirtyRootState>>,
+        defer_script_probe_to_metadata: bool,
     ) -> Vec<crate::scanner::DirectoryScanOutput> {
         if selected_root_indices.is_empty() {
             return Vec::new();
@@ -1299,6 +1467,8 @@ impl ScriptMetaKitEngine {
         let mut jobs = Vec::new();
 
         for (index, root) in roots.into_iter().enumerate() {
+            let probe_script_headers =
+                !(defer_script_probe_to_metadata && root.purpose.includes_metadata());
             let dirty_directories = dirty_scopes
                 .and_then(|scopes| scopes.get(&root.root_id))
                 .filter(|dirty_scope| {
@@ -1338,6 +1508,7 @@ impl ScriptMetaKitEngine {
                                     root,
                                     previous_snapshot: Some(previous_snapshot),
                                     dirty_directories: None,
+                                    probe_script_headers,
                                 });
                                 continue;
                             }
@@ -1351,6 +1522,7 @@ impl ScriptMetaKitEngine {
                             root,
                             previous_snapshot: Some(previous_snapshot),
                             dirty_directories: Some(dirty_directories.clone()),
+                            probe_script_headers,
                         });
                         continue;
                     }
@@ -1363,6 +1535,7 @@ impl ScriptMetaKitEngine {
                 root,
                 previous_snapshot,
                 dirty_directories,
+                probe_script_headers,
             });
         }
 
@@ -1379,32 +1552,39 @@ impl ScriptMetaKitEngine {
             return outputs_by_index.into_iter().flatten().collect::<Vec<_>>();
         }
 
-        for chunk_start in (0..jobs.len()).step_by(parallelism) {
-            let chunk_end = (chunk_start + parallelism).min(jobs.len());
-            let chunk = &jobs[chunk_start..chunk_end];
-            let (sender, receiver) = mpsc::channel();
-            thread::scope(|scope| {
-                for job in chunk.iter().cloned() {
-                    let sender = sender.clone();
-                    let scanner_options = &self.config.scanner;
-                    let extensions = &self.config.supported_extensions;
-                    let cancellation = self.cancellation.clone();
-                    scope.spawn(move || {
+        let next_job_index = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::channel();
+        thread::scope(|scope| {
+            for _ in 0..parallelism.min(jobs.len()) {
+                let next_job_index = &next_job_index;
+                let jobs = &jobs;
+                let sender = sender.clone();
+                let scanner_options = &self.config.scanner;
+                let extensions = &self.config.supported_extensions;
+                let cancellation = self.cancellation.clone();
+                scope.spawn(move || {
+                    loop {
+                        let job_index = next_job_index.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(job_index).cloned() else {
+                            break;
+                        };
                         let index = job.index;
-                        let output =
-                            scan_file_list_job(job, scanner_options, extensions, cancellation);
+                        let output = scan_file_list_job(
+                            job,
+                            scanner_options,
+                            extensions,
+                            cancellation.clone(),
+                        );
                         let _ = sender.send((index, output));
-                    });
-                }
-                drop(sender);
+                    }
+                });
+            }
+            drop(sender);
 
-                let mut chunk_outputs: Vec<_> = receiver.into_iter().collect();
-                chunk_outputs.sort_by_key(|(index, _)| *index);
-                for (index, output) in chunk_outputs {
-                    outputs_by_index[index] = Some(output);
-                }
-            });
-        }
+            for (index, output) in receiver {
+                outputs_by_index[index] = Some(output);
+            }
+        });
         outputs_by_index.into_iter().flatten().collect::<Vec<_>>()
     }
 
@@ -1463,24 +1643,28 @@ impl ScriptMetaKitEngine {
         plan
     }
 
-    fn known_directory_paths(&self) -> BTreeSet<PathBuf> {
-        let mut paths: BTreeSet<PathBuf> = self
+    fn rebuild_known_path_index(&mut self) {
+        let mut directories: BTreeSet<PathBuf> = self
             .roots
             .iter()
             .map(|root| normalize_path(&root.path))
             .collect();
+        let mut files = BTreeSet::new();
         for snapshot in self.file_list_snapshots.values() {
-            collect_directory_paths(snapshot.children.as_deref().unwrap_or_default(), &mut paths);
+            let children = snapshot.children.as_deref().unwrap_or_default();
+            collect_directory_paths(children, &mut directories);
+            collect_file_paths(children, &mut files);
         }
-        paths
+        self.known_directory_paths = directories;
+        self.known_file_paths = files;
     }
 
-    fn known_file_paths(&self) -> BTreeSet<PathBuf> {
-        let mut paths = BTreeSet::new();
-        for snapshot in self.file_list_snapshots.values() {
-            collect_file_paths(snapshot.children.as_deref().unwrap_or_default(), &mut paths);
-        }
-        paths
+    fn known_directory_paths(&self) -> &BTreeSet<PathBuf> {
+        &self.known_directory_paths
+    }
+
+    fn known_file_paths(&self) -> &BTreeSet<PathBuf> {
+        &self.known_file_paths
     }
 
     fn memory_cache_enabled(&self) -> bool {
@@ -1614,9 +1798,72 @@ impl ScriptMetaKitEngine {
             return;
         }
         let max_nodes = self.config.cache.max_memory_nodes;
-        if max_nodes == 0 || self.memory_node_count() > max_nodes {
-            self.clear_memory_cache();
+        while max_nodes == 0 || self.memory_node_count() > max_nodes {
+            let Some(root_id) = self.largest_memory_cache_root() else {
+                break;
+            };
+            self.evict_memory_cache_root(&root_id);
+            self.memory_cache_export_allowed = false;
         }
+    }
+
+    fn largest_memory_cache_root(&self) -> Option<RootId> {
+        let mut counts = BTreeMap::<RootId, usize>::new();
+        for (root_id, snapshot) in &self.file_list_snapshots {
+            counts.insert(
+                root_id.clone(),
+                snapshot.children.as_deref().map_or(0, file_entry_count),
+            );
+        }
+        if let Some(snapshot) = self.catalog_snapshot.as_ref() {
+            for record in &snapshot.candidate_cache.records {
+                *counts.entry(record.root_id.clone()).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by(|(lhs_id, lhs_count), (rhs_id, rhs_count)| {
+                lhs_count.cmp(rhs_count).then_with(|| rhs_id.cmp(lhs_id))
+            })
+            .map(|(root_id, _)| root_id)
+    }
+
+    fn evict_memory_cache_root(&mut self, root_id: &RootId) {
+        self.file_list_snapshots.remove(root_id);
+        if let Some(previous) = self.catalog_snapshot.as_ref() {
+            let mut candidate_cache = previous.candidate_cache.clone();
+            candidate_cache
+                .records
+                .retain(|record| record.root_id != *root_id);
+            let roots = previous
+                .roots
+                .iter()
+                .filter(|root| root.root_id != *root_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let file_items = file_items_from_cache(&candidate_cache);
+            let all_items = deduplicated_items(&file_items);
+            let update_check_result = self
+                .update_check_result
+                .as_ref()
+                .and_then(|result| filter_update_result_to_items(result, &file_items));
+            self.catalog_snapshot = (!roots.is_empty() || !candidate_cache.records.is_empty())
+                .then(|| {
+                    Arc::new(ScriptMetaCatalogSnapshot {
+                        source_revision: previous.source_revision,
+                        roots,
+                        all_items,
+                        file_items,
+                        candidate_cache,
+                    })
+                });
+            self.update_check_result = update_check_result;
+        }
+        self.dirty_roots
+            .entry(root_id.clone())
+            .or_default()
+            .requires_full_rescan = true;
+        self.rebuild_known_path_index();
     }
 
     fn memory_node_count(&self) -> usize {
@@ -1636,6 +1883,8 @@ impl ScriptMetaKitEngine {
         self.catalog_snapshot = None;
         self.update_check_result = None;
         self.last_memory_cache_accessed_at = None;
+        self.http_validation_cache.clear();
+        self.rebuild_known_path_index();
     }
 
     fn expire_idle_memory_cache(&mut self) {
@@ -1646,6 +1895,7 @@ impl ScriptMetaKitEngine {
         let idle_lifetime = self.config.cache.idle_lifetime_millis;
         if idle_lifetime == 0 {
             self.clear_memory_cache();
+            self.memory_cache_export_allowed = false;
             return;
         }
         let Some(last_accessed_at) = self.last_memory_cache_accessed_at else {
@@ -1654,6 +1904,7 @@ impl ScriptMetaKitEngine {
         let now = now_timestamp_millis();
         if now.saturating_sub(last_accessed_at) >= idle_lifetime {
             self.clear_memory_cache();
+            self.memory_cache_export_allowed = false;
         }
     }
 
@@ -1666,69 +1917,6 @@ impl ScriptMetaKitEngine {
             self.last_memory_cache_accessed_at = Some(now_timestamp_millis());
         } else {
             self.last_memory_cache_accessed_at = None;
-        }
-    }
-
-    fn merge_catalog_snapshot(
-        &self,
-        previous: Option<&ScriptMetaCatalogSnapshot>,
-        refreshed: &ScriptMetaCatalogSnapshot,
-    ) -> ScriptMetaCatalogSnapshot {
-        let Some(previous) = previous else {
-            return refreshed.clone();
-        };
-
-        let refreshed_root_ids: BTreeSet<_> = refreshed
-            .roots
-            .iter()
-            .map(|root| root.root_id.as_ref())
-            .collect();
-        let mut roots: Vec<_> = previous
-            .roots
-            .iter()
-            .filter(|root| !refreshed_root_ids.contains(root.root_id.as_ref()))
-            .cloned()
-            .collect();
-        roots.extend(refreshed.roots.iter().cloned());
-        let root_order: BTreeMap<_, _> = self
-            .roots
-            .iter()
-            .enumerate()
-            .map(|(index, root)| (root.root_id.as_ref(), index))
-            .collect();
-        roots.sort_by_key(|root| {
-            root_order
-                .get(root.root_id.as_ref())
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
-
-        let mut records: Vec<_> = previous
-            .candidate_cache
-            .records
-            .iter()
-            .filter(|record| !refreshed_root_ids.contains(record.root_id.as_ref()))
-            .cloned()
-            .collect();
-        records.extend(refreshed.candidate_cache.records.iter().cloned());
-        records.sort_by(|lhs, rhs| lhs.identity_path.cmp(&rhs.identity_path));
-
-        let registered_roots: Vec<_> = self.roots.iter().collect();
-        let candidate_cache = CandidateCache {
-            schema_version: CandidateCache::CURRENT_SCHEMA_VERSION,
-            built_at: now_timestamp_millis(),
-            registered_roots: registered_root_signatures(&registered_roots),
-            records,
-        };
-        let file_items = file_items_from_cache(&candidate_cache);
-        let all_items = deduplicated_items(&file_items);
-
-        ScriptMetaCatalogSnapshot {
-            source_revision: refreshed.source_revision,
-            roots,
-            all_items,
-            file_items,
-            candidate_cache,
         }
     }
 
@@ -2071,12 +2259,14 @@ fn scan_file_list_job(
         );
     }
 
-    scan_file_list_root_controlled(
+    scan_file_list_root_transactional_controlled(
         &job.root.root_id,
         &job.root.path,
         scanner_options,
         extensions,
+        job.previous_snapshot.as_deref(),
         Some(&cancellation),
+        job.probe_script_headers,
     )
 }
 
@@ -2375,20 +2565,74 @@ fn update_work_groups(items: &[ScriptMetaItemRef]) -> Vec<Vec<usize>> {
 fn resolve_update_item_with_retry(
     update_resolver: &UpdateResolver,
     item: &ScriptMetaItem,
-    retry_attempts: usize,
+    policy: UpdateRetryPolicy,
+    cancellation: &OperationCancellation,
     mut retry: impl FnMut(&ScriptMetaKitError),
 ) -> ScriptMetaKitResult<ResolvedItemUpdate> {
     let mut attempt = 0usize;
     loop {
+        if cancellation.is_cancelled() {
+            return Err(ScriptMetaKitError::Timeout(
+                "update resolution was cancelled".to_string(),
+            ));
+        }
+        if let Some(meta_url) = item.meta_url.as_ref()
+            && let Some(error) = update_resolver.terminal_source_failure(meta_url)?
+        {
+            return Err(error.as_ref().clone());
+        }
         match update_resolver.resolve_item(item) {
             Ok(resolved) => return Ok(resolved),
-            Err(error) if attempt < retry_attempts => {
-                attempt += 1;
+            Err(error) => {
+                if attempt >= policy.attempts
+                    || cancellation.is_cancelled()
+                    || !is_retryable_update_error(&error)
+                    || update_resolver.is_terminal_source_failure(&error)?
+                {
+                    return Err(error);
+                }
                 retry(&error);
+                let delay = update_retry_delay(
+                    policy.initial_delay_millis,
+                    policy.backoff_multiplier,
+                    attempt,
+                );
+                let server_delay = retry_after_hint_millis(&error)
+                    .map(Duration::from_millis)
+                    .unwrap_or_default();
+                let delay = delay.max(server_delay);
+                if delay > Duration::from_millis(policy.max_delay_millis) {
+                    return Err(error);
+                }
+                attempt += 1;
+                if cancellation.wait_for_cancellation(delay) {
+                    return Err(ScriptMetaKitError::Timeout(
+                        "update resolution was cancelled".to_string(),
+                    ));
+                }
             }
-            Err(error) => return Err(error),
         }
     }
+}
+
+fn update_retry_delay(
+    initial_delay_millis: u64,
+    backoff_multiplier: u32,
+    retry_index: usize,
+) -> Duration {
+    let multiplier = u64::from(backoff_multiplier.max(1));
+    let mut delay_millis = initial_delay_millis;
+    for _ in 0..retry_index {
+        delay_millis = delay_millis.saturating_mul(multiplier);
+    }
+    Duration::from_millis(delay_millis)
+}
+
+fn is_retryable_update_error(error: &ScriptMetaKitError) -> bool {
+    matches!(
+        error,
+        ScriptMetaKitError::Url(_) | ScriptMetaKitError::Io { .. } | ScriptMetaKitError::Timeout(_)
+    )
 }
 
 fn apply_update_item_result(
@@ -2675,6 +2919,8 @@ fn apply_metadata_capabilities_to_entries(
             .or_else(|| by_identity_path.get(&(root_id, entry.resolved_path.as_path())))
         {
             entry.has_scriptmeta = record.has_scriptmeta;
+            entry.runtime_kind = record.runtime_kind;
+            entry.shebang.clone_from(&record.shebang);
             entry.has_scriptmeta_edit_password = record.has_scriptmeta_edit_password;
             entry.is_file_locked = record.is_file_locked;
             entry.is_read_only = record.is_read_only;
@@ -2700,7 +2946,7 @@ mod tests {
 
     use super::{
         apply_metadata_capabilities_to_file_list_snapshots, decode_all_cache_data,
-        merged_root_purpose, update_work_groups,
+        merged_root_purpose, update_retry_delay, update_work_groups,
     };
     use crate::{
         RootId,
@@ -2784,6 +3030,17 @@ mod tests {
         assert_eq!(
             update_work_groups(&items),
             vec![vec![0, 1], vec![2], vec![3], vec![4]]
+        );
+    }
+
+    #[test]
+    fn update_retry_delay_uses_bounded_integer_backoff() {
+        assert_eq!(update_retry_delay(500, 3, 0).as_millis(), 500);
+        assert_eq!(update_retry_delay(500, 3, 1).as_millis(), 1_500);
+        assert_eq!(update_retry_delay(500, 0, 2).as_millis(), 500);
+        assert_eq!(
+            update_retry_delay(u64::MAX, u32::MAX, 4).as_millis(),
+            u128::from(u64::MAX)
         );
     }
 

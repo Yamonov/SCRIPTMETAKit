@@ -4,7 +4,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        mpsc::{self, Receiver, RecvTimeoutError},
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -13,13 +14,32 @@ use std::{
 use crate::{
     core::{ScriptMetaKitError, ScriptMetaKitResult},
     scanner::ExtensionPolicy,
-    watcher::{RawChangeBatch, WatchPlan},
+    watcher::{DEFAULT_MAX_PENDING_PATHS, RawChangeBatch, WatchPlan},
 };
 
 pub struct NativeWatcher {
     platform: Option<platform::PlatformWatcher>,
     receiver: Receiver<RawChangeBatch>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeEventSender {
+    sender: SyncSender<NativeFsEvent>,
+    overflowed: Arc<AtomicBool>,
+}
+
+impl NativeEventSender {
+    fn send(&self, event: NativeFsEvent) -> Result<(), ()> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.overflowed.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
 }
 
 impl NativeWatcher {
@@ -31,7 +51,20 @@ impl NativeWatcher {
         plan: &WatchPlan,
         notifier: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> ScriptMetaKitResult<Self> {
-        let (event_sender, event_receiver) = mpsc::channel();
+        // Keep native callbacks non-blocking without treating an ordinary
+        // multi-path FSEvents batch as overflow. The same configured limit
+        // bounds both this handoff queue and the worker's coalesced path set.
+        let raw_event_queue_capacity = if plan.max_pending_paths == 0 {
+            DEFAULT_MAX_PENDING_PATHS
+        } else {
+            plan.max_pending_paths
+        };
+        let (raw_event_sender, event_receiver) = mpsc::sync_channel(raw_event_queue_capacity);
+        let event_queue_overflowed = Arc::new(AtomicBool::new(false));
+        let event_sender = NativeEventSender {
+            sender: raw_event_sender,
+            overflowed: Arc::clone(&event_queue_overflowed),
+        };
         let platform = platform::PlatformWatcher::start(plan, event_sender)?;
 
         let debounce_delay = Duration::from_millis(plan.debounce_delay_millis);
@@ -48,7 +81,7 @@ impl NativeWatcher {
         let skip_hidden_paths = plan.skip_hidden_paths;
         let skip_package_paths = plan.skip_package_paths;
 
-        let (batch_sender, batch_receiver) = mpsc::channel();
+        let (batch_sender, batch_receiver) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let mut pending_paths = Vec::new();
             let mut pending_overflowed = false;
@@ -70,7 +103,7 @@ impl NativeWatcher {
 
                 match receive_result {
                     Ok(event) => {
-                        let (pending_changed, flush_now) = append_event_to_pending(
+                        let (mut pending_changed, mut flush_now) = append_event_to_pending(
                             event,
                             &mut pending_paths,
                             &mut pending_overflowed,
@@ -83,6 +116,23 @@ impl NativeWatcher {
                                 skip_package_paths,
                             },
                         );
+                        if event_queue_overflowed.swap(false, Ordering::AcqRel) {
+                            let (overflow_changed, overflow_flush_now) = append_event_to_pending(
+                                NativeFsEvent::Overflow,
+                                &mut pending_paths,
+                                &mut pending_overflowed,
+                                NativeEventFilter {
+                                    overflow_paths: &overflow_paths,
+                                    max_pending_paths,
+                                    watch_roots: &watch_roots,
+                                    supported_extensions: &supported_extensions,
+                                    skip_hidden_paths,
+                                    skip_package_paths,
+                                },
+                            );
+                            pending_changed |= overflow_changed;
+                            flush_now |= overflow_flush_now;
+                        }
                         if !pending_changed {
                             continue;
                         }
@@ -102,6 +152,7 @@ impl NativeWatcher {
                             && !flush_pending_batch(
                                 &batch_sender,
                                 notifier.as_ref(),
+                                &overflow_paths,
                                 &mut pending_paths,
                                 &mut pending_overflowed,
                                 &mut first_event_at,
@@ -115,6 +166,7 @@ impl NativeWatcher {
                         if !flush_pending_batch(
                             &batch_sender,
                             notifier.as_ref(),
+                            &overflow_paths,
                             &mut pending_paths,
                             &mut pending_overflowed,
                             &mut first_event_at,
@@ -127,6 +179,7 @@ impl NativeWatcher {
                         let _ = flush_pending_batch(
                             &batch_sender,
                             notifier.as_ref(),
+                            &overflow_paths,
                             &mut pending_paths,
                             &mut pending_overflowed,
                             &mut first_event_at,
@@ -329,8 +382,9 @@ fn next_flush_timeout(
 }
 
 fn flush_pending_batch(
-    batch_sender: &mpsc::Sender<RawChangeBatch>,
+    batch_sender: &SyncSender<RawChangeBatch>,
     notifier: Option<&Arc<dyn Fn() + Send + Sync + 'static>>,
+    overflow_paths: &[PathBuf],
     pending_paths: &mut Vec<PathBuf>,
     pending_overflowed: &mut bool,
     first_event_at: &mut Option<Instant>,
@@ -350,8 +404,16 @@ fn flush_pending_batch(
     *first_event_at = None;
     *last_event_at = None;
 
-    if batch_sender.send(batch).is_err() {
-        return false;
+    match batch_sender.try_send(batch) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            mark_pending_overflowed(pending_paths, pending_overflowed, overflow_paths);
+            let now = Instant::now();
+            *first_event_at = Some(now);
+            *last_event_at = Some(now);
+            return true;
+        }
+        Err(TrySendError::Disconnected(_)) => return false,
     }
 
     if let Some(notifier) = notifier {
@@ -374,7 +436,9 @@ mod platform {
     use fsevent_sys as fs;
     use fsevent_sys::core_foundation as cf;
 
-    use super::{NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
+    use super::{
+        NativeEventSender, NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan,
+    };
 
     pub struct PlatformWatcher {
         paths: cf::CFMutableArrayRef,
@@ -384,7 +448,7 @@ mod platform {
     }
 
     struct StreamContext {
-        sender: mpsc::Sender<NativeFsEvent>,
+        sender: NativeEventSender,
     }
 
     struct CFSendWrapper(usize);
@@ -438,7 +502,7 @@ mod platform {
     impl PlatformWatcher {
         pub fn start(
             plan: &WatchPlan,
-            event_sender: mpsc::Sender<NativeFsEvent>,
+            event_sender: NativeEventSender,
         ) -> ScriptMetaKitResult<Self> {
             let paths = unsafe {
                 cf::CFArrayCreateMutable(cf::kCFAllocatorDefault, 0, &cf::kCFTypeArrayCallBacks)
@@ -732,6 +796,70 @@ mod platform {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+    };
+
+    use super::{NativeEventSender, NativeFsEvent, flush_pending_batch};
+    use crate::watcher::RawChangeBatch;
+
+    #[test]
+    fn native_event_queue_marks_overflow_instead_of_growing() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let sender = NativeEventSender {
+            sender,
+            overflowed: Arc::clone(&overflowed),
+        };
+
+        sender.send(NativeFsEvent::Overflow).expect("first event");
+        sender
+            .send(NativeFsEvent::Overflow)
+            .expect("coalesced overflow");
+
+        assert!(overflowed.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_batch_queue_keeps_one_overflow_batch_pending() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(RawChangeBatch {
+                paths: vec![PathBuf::from("/queued")],
+                overflowed: false,
+            })
+            .expect("queued batch");
+        let overflow_paths = vec![PathBuf::from("/root")];
+        let mut pending_paths = vec![PathBuf::from("/changed")];
+        let mut pending_overflowed = false;
+        let mut first_event_at = None;
+        let mut last_event_at = None;
+
+        assert!(flush_pending_batch(
+            &sender,
+            None,
+            &overflow_paths,
+            &mut pending_paths,
+            &mut pending_overflowed,
+            &mut first_event_at,
+            &mut last_event_at,
+        ));
+        assert_eq!(pending_paths, overflow_paths);
+        assert!(pending_overflowed);
+        assert!(first_event_at.is_some());
+        assert!(last_event_at.is_some());
+    }
+}
+
 #[cfg(windows)]
 mod platform {
     use std::{
@@ -765,7 +893,9 @@ mod platform {
         },
     };
 
-    use super::{NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
+    use super::{
+        NativeEventSender, NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan,
+    };
 
     const BUFFER_SIZE: usize = 64 * 1024;
     const RETRY_OPEN_DELAY_MILLIS: u32 = 1_000;
@@ -778,7 +908,7 @@ mod platform {
     impl PlatformWatcher {
         pub fn start(
             plan: &WatchPlan,
-            event_sender: mpsc::Sender<NativeFsEvent>,
+            event_sender: NativeEventSender,
         ) -> ScriptMetaKitResult<Self> {
             let mut stop_events = Vec::new();
             let mut workers = Vec::new();
@@ -883,12 +1013,7 @@ mod platform {
         Ok(handle)
     }
 
-    fn watch_root(
-        root: PathBuf,
-        directory: HANDLE,
-        stop_event: HANDLE,
-        sender: mpsc::Sender<NativeFsEvent>,
-    ) {
+    fn watch_root(root: PathBuf, directory: HANDLE, stop_event: HANDLE, sender: NativeEventSender) {
         let mut directory = Some(directory);
         loop {
             let Some(directory_handle) = directory else {
@@ -1017,7 +1142,7 @@ mod platform {
         }
     }
 
-    fn parse_change_buffer(root: &Path, buffer: &[u8], sender: &mpsc::Sender<NativeFsEvent>) {
+    fn parse_change_buffer(root: &Path, buffer: &[u8], sender: &NativeEventSender) {
         const FILE_NOTIFY_INFORMATION_HEADER_SIZE: usize = 12;
 
         let mut offset = 0usize;
@@ -1087,16 +1212,14 @@ mod platform {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod platform {
-    use std::sync::mpsc;
-
-    use super::{NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
+    use super::{NativeEventSender, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
 
     pub struct PlatformWatcher;
 
     impl PlatformWatcher {
         pub fn start(
             _plan: &WatchPlan,
-            _event_sender: mpsc::Sender<NativeFsEvent>,
+            _event_sender: NativeEventSender,
         ) -> ScriptMetaKitResult<Self> {
             Err(ScriptMetaKitError::InvalidConfig(
                 "native watcher is implemented for macOS and Windows".to_string(),

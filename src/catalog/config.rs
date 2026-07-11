@@ -12,6 +12,9 @@ use crate::{
 
 pub const DEFAULT_UPDATE_REQUEST_TIMEOUT_MILLIS: u64 = 15_000;
 pub const DEFAULT_UPDATE_RESOURCE_TIMEOUT_MILLIS: u64 = 15_000;
+pub const DEFAULT_UPDATE_RETRY_INITIAL_DELAY_MILLIS: u64 = 500;
+pub const DEFAULT_UPDATE_RETRY_BACKOFF_MULTIPLIER: u32 = 3;
+pub const DEFAULT_UPDATE_MAX_RETRY_DELAY_MILLIS: u64 = 30_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScriptMetaKitConfig {
@@ -87,6 +90,12 @@ pub struct UpdateCheckOptions {
     pub enabled: bool,
     pub max_concurrent_meta_url_checks: usize,
     pub retry_attempts: usize,
+    #[serde(default = "default_update_retry_initial_delay_millis")]
+    pub retry_initial_delay_millis: u64,
+    #[serde(default = "default_update_retry_backoff_multiplier")]
+    pub retry_backoff_multiplier: u32,
+    #[serde(default = "default_update_max_retry_delay_millis")]
+    pub max_retry_delay_millis: u64,
     #[serde(default = "default_update_request_timeout_millis")]
     pub request_timeout_millis: Option<u64>,
     #[serde(default = "default_update_resource_timeout_millis")]
@@ -100,11 +109,26 @@ impl Default for UpdateCheckOptions {
             enabled: true,
             max_concurrent_meta_url_checks: 6,
             retry_attempts: 2,
+            retry_initial_delay_millis: default_update_retry_initial_delay_millis(),
+            retry_backoff_multiplier: default_update_retry_backoff_multiplier(),
+            max_retry_delay_millis: default_update_max_retry_delay_millis(),
             request_timeout_millis: default_update_request_timeout_millis(),
             resource_timeout_millis: default_update_resource_timeout_millis(),
             cache_network_responses: false,
         }
     }
+}
+
+fn default_update_retry_initial_delay_millis() -> u64 {
+    DEFAULT_UPDATE_RETRY_INITIAL_DELAY_MILLIS
+}
+
+fn default_update_retry_backoff_multiplier() -> u32 {
+    DEFAULT_UPDATE_RETRY_BACKOFF_MULTIPLIER
+}
+
+fn default_update_max_retry_delay_millis() -> u64 {
+    DEFAULT_UPDATE_MAX_RETRY_DELAY_MILLIS
 }
 
 fn default_update_request_timeout_millis() -> Option<u64> {
