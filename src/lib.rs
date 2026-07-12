@@ -102,6 +102,6 @@ mod tests {
     #[test]
     fn exposes_package_metadata() {
         assert_eq!(package_name(), "scriptmetakit");
-        assert_eq!(package_version(), "1.1.2");
+        assert_eq!(package_version(), "1.1.3");
     }
 }

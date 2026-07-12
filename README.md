@@ -8,9 +8,14 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.1.2`
-- Rust FFI crate: `scriptmetakit_ffi` `1.1.2`
+- Rust crate: `scriptmetakit` `1.1.3`
+- Rust FFI crate: `scriptmetakit_ffi` `1.1.3`
 - Swift package product: `ScriptMetaKit`
+
+## 1.1.3
+
+- Describes SCRIPTMETAKit's purpose, author, and supported platforms in `ScriptMetaKitRuntime.acknowledgementsSummaryText`.
+- Keeps the complete license texts and notices unchanged in `ScriptMetaKitRuntime.acknowledgementsText`.
 
 ## 1.1.2
 

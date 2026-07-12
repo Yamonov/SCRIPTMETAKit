@@ -1,9 +1,15 @@
-SCRIPTMETAKit Third-Party Components
-====================================
+SCRIPTMETAKit
+=============
 
-This is a concise index for display in application About screens.
-Complete license texts and notices are available through
-ScriptMetaKitRuntime.acknowledgementsText.
+Developed by Yoshiteru Murakami, the author of Scripta! and ACEMenuPlus,
+SCRIPTMETAKit is a cross-platform library for macOS and Windows. It is
+specialized in reading SCRIPTMETA tags and discovering and listing scripts.
+
+Components and Licenses
+-----------------------
+
+The following is a concise index of the components used by SCRIPTMETAKit.
+Complete license texts and notices are provided with SCRIPTMETAKit.
 
 - SCRIPTMETAKit — Apache-2.0 — https://github.com/Yamonov/SCRIPTMETAKit
 - atomic-waker 1.1.2 — Apache-2.0 OR MIT — https://github.com/smol-rs/atomic-waker

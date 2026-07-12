@@ -2,7 +2,7 @@ import Foundation
 
 public enum ScriptMetaKitRuntime {
     public static let apiVersion = 1
-    public static let packageVersion = "1.1.2"
+    public static let packageVersion = "1.1.3"
     public static let usesLocalBinaryArtifact = true
 
     /// A concise component index suitable for an application's About screen.
