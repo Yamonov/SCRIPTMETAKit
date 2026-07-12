@@ -375,7 +375,7 @@ public nonisolated struct ScriptMetaKitRoot: Codable, Identifiable, Sendable {
         purpose: ScriptMetaRootPurpose = .fileListAndMetadata,
         watchPolicy: ScriptMetaWatchPolicy = .visibleOnly,
         cachePolicy: ScriptMetaCachePolicy = .memoryAndPersistent,
-        refreshPolicy: ScriptMetaRefreshPolicy = .onFileEventDeferred,
+        refreshPolicy: ScriptMetaRefreshPolicy = .onFileEvent,
         priority: ScriptMetaRootPriority = .userInitiated
     ) {
         self.rootID = rootID

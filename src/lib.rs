@@ -61,7 +61,8 @@ pub use scanner::{
 };
 pub use storage::{
     CachePayload, CacheSchema, MAX_CACHE_FILE_BYTES, cache_payload_content_fingerprint,
-    load_cache_payload, save_cache_payload,
+    load_cache_payload, load_cache_payload_with_limit, save_cache_payload,
+    save_cache_payload_with_limit,
 };
 #[cfg(feature = "native-watch")]
 pub use watcher::NativeWatcher;

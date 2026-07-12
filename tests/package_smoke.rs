@@ -617,6 +617,69 @@ fn persistent_restore_does_not_overwrite_newer_memory_snapshot() {
 }
 
 #[test]
+fn persistent_restore_does_not_overwrite_newer_pending_snapshot_after_eviction() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_path = temp.path().join("Root");
+    std::fs::create_dir_all(&root_path).expect("root");
+    std::fs::write(root_path.join("Initial.jsx"), "alert('initial');").expect("initial");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "PendingRestoreMerge");
+    config.cache.max_memory_nodes = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", &root_path),
+        ])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("initial scan");
+    let old_cache = engine
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("old cache");
+    engine.mark_cache_persisted(scriptmetakit::CacheScope::FileList);
+
+    std::fs::write(root_path.join("New.jsx"), "alert('new');").expect("new");
+    let refreshed = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("new scan");
+    assert!(
+        refreshed.file_list_snapshots[0]
+            .children
+            .as_ref()
+            .expect("refreshed children")
+            .iter()
+            .any(|entry| entry.display_path.ends_with("New.jsx"))
+    );
+
+    engine
+        .load_cache(old_cache)
+        .expect("load old durable cache");
+    let cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    assert!(cached.file_list_snapshots.is_empty());
+    let exported = engine
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("pending snapshot remains exportable");
+    let snapshots: std::collections::BTreeMap<
+        scriptmetakit::RootId,
+        std::sync::Arc<scriptmetakit::FileListSnapshot>,
+    > = serde_json::from_value(exported.data).expect("file-list snapshots");
+    assert!(
+        snapshots["root"]
+            .children
+            .as_ref()
+            .expect("exported children")
+            .iter()
+            .any(|entry| entry.display_path.ends_with("New.jsx"))
+    );
+}
+
+#[test]
 fn idle_expiry_can_restore_and_resume_file_list_export() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("Tool.jsx"), "alert('tool');").expect("tool");
@@ -1041,6 +1104,81 @@ fn durable_catalog_merge_preserves_unresident_roots_and_newer_metadata() {
 }
 
 #[test]
+fn adding_file_list_capability_does_not_invalidate_unrelated_metadata_catalog() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_path = temp.path().join("First");
+    let second_path = temp.path().join("Second");
+    std::fs::create_dir_all(&first_path).expect("first root");
+    std::fs::create_dir_all(&second_path).expect("second root");
+    std::fs::write(
+        first_path.join("First.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.first\n// SCRIPTMETA-END\n",
+    )
+    .expect("first script");
+    std::fs::write(
+        second_path.join("Second.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.second\n// SCRIPTMETA-END\n",
+    )
+    .expect("second script");
+    let metadata_root = |root_id: &str, path: &std::path::Path| scriptmetakit::RootRegistration {
+        root_id: root_id.into(),
+        path: path.to_path_buf(),
+        display_name: None,
+        purpose: scriptmetakit::RootPurpose::MetadataCatalog,
+        watch_policy: scriptmetakit::WatchPolicy::Disabled,
+        cache_policy: scriptmetakit::CachePolicy::MemoryOnly,
+        refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+        priority: scriptmetakit::RootPriority::Background,
+    };
+    let first_metadata = metadata_root("first", &first_path);
+    let second_metadata = metadata_root("second", &second_path);
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "CatalogScopeIsolation"),
+    )
+    .expect("engine");
+    engine
+        .replace_root_group("metadata", vec![first_metadata.clone(), second_metadata])
+        .expect("metadata roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("metadata scan");
+
+    engine
+        .replace_root_group(
+            "file-list",
+            vec![scriptmetakit::RootRegistration {
+                purpose: scriptmetakit::RootPurpose::FileList,
+                watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
+                cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+                refresh_policy: scriptmetakit::RefreshPolicy::OnFileEvent,
+                priority: scriptmetakit::RootPriority::UserInitiated,
+                ..first_metadata
+            }],
+        )
+        .expect("file-list root");
+
+    let cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+    let catalog = cached.catalog_snapshot.expect("catalog retained");
+    assert_eq!(catalog.file_items.len(), 2);
+    assert!(
+        catalog
+            .file_items
+            .iter()
+            .any(|item| item.script_id == "com.example.first")
+    );
+    assert!(
+        catalog
+            .file_items
+            .iter()
+            .any(|item| item.script_id == "com.example.second")
+    );
+}
+
+#[test]
 fn root_cache_policy_disabled_skips_engine_storage_only() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(
@@ -1096,6 +1234,321 @@ fn root_cache_policy_disabled_skips_engine_storage_only() {
             .as_ref()
             .is_none_or(|catalog| catalog.all_items.is_empty())
     );
+}
+
+#[test]
+fn root_cache_scope_is_a_file_list_compatibility_alias() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Alias.jsx"), "alert('alias');").expect("script");
+    let config = scriptmetakit::ScriptMetaKitConfig::new("Test", "RootScopeAlias");
+    let root = scriptmetakit::RootRegistration::file_list_and_metadata("scripts", temp.path());
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config.clone()).expect("engine");
+    engine.set_roots(vec![root.clone()]).expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("scan");
+
+    let root_payload = engine
+        .export_cache(scriptmetakit::CacheScope::Root)
+        .expect("root alias export");
+    assert_eq!(root_payload.scope, scriptmetakit::CacheScope::FileList);
+
+    let mut legacy_payload = root_payload;
+    legacy_payload.scope = scriptmetakit::CacheScope::Root;
+    let mut restored = scriptmetakit::ScriptMetaKitEngine::new(config).expect("restored engine");
+    restored.set_roots(vec![root]).expect("restored roots");
+    restored
+        .load_cache(legacy_payload)
+        .expect("legacy root cache");
+    assert_eq!(
+        restored
+            .cached_scan_result(scriptmetakit::ScanRequest::all(
+                scriptmetakit::ScanMode::FileListOnly,
+            ))
+            .file_list_snapshots
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn cached_file_list_unavailable_transition_has_a_stable_new_revision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Uncached.jsx"), "alert('uncached');").expect("script");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "UncachedRevision"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![scriptmetakit::RootRegistration {
+            root_id: "scripts".into(),
+            path: temp.path().to_path_buf(),
+            display_name: Some("Scripts".into()),
+            purpose: scriptmetakit::RootPurpose::FileList,
+            watch_policy: scriptmetakit::WatchPolicy::Disabled,
+            cache_policy: scriptmetakit::CachePolicy::Disabled,
+            refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+            priority: scriptmetakit::RootPriority::UserInitiated,
+        }])
+        .expect("roots");
+
+    let scanned = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("scan");
+    let first_cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    let second_cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+
+    assert_eq!(
+        first_cached.roots[0].status,
+        scriptmetakit::RootStatus::NotLoaded
+    );
+    assert_ne!(
+        first_cached.roots[0].state_revision,
+        scanned.roots[0].state_revision
+    );
+    assert_eq!(
+        second_cached.roots[0].state_revision,
+        first_cached.roots[0].state_revision
+    );
+}
+
+#[test]
+fn combined_cached_result_requires_only_each_roots_declared_purpose() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let file_root = temp.path().join("files");
+    let metadata_root = temp.path().join("metadata");
+    std::fs::create_dir_all(&file_root).expect("file root");
+    std::fs::create_dir_all(&metadata_root).expect("metadata root");
+    std::fs::write(file_root.join("FileOnly.jsx"), "alert('file');").expect("file script");
+    std::fs::write(
+        metadata_root.join("Metadata.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.metadata-only\n// SCRIPTMETA-END\n",
+    )
+    .expect("metadata script");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "PurposeSpecificCache"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration {
+                root_id: "files".into(),
+                path: file_root,
+                display_name: None,
+                purpose: scriptmetakit::RootPurpose::FileList,
+                watch_policy: scriptmetakit::WatchPolicy::Disabled,
+                cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+                refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+                priority: scriptmetakit::RootPriority::UserInitiated,
+            },
+            scriptmetakit::RootRegistration {
+                root_id: "metadata".into(),
+                path: metadata_root,
+                display_name: None,
+                purpose: scriptmetakit::RootPurpose::MetadataCatalog,
+                watch_policy: scriptmetakit::WatchPolicy::Disabled,
+                cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+                refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+                priority: scriptmetakit::RootPriority::UserInitiated,
+            },
+        ])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("scan");
+
+    let cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListAndMetadata,
+    ));
+
+    assert!(
+        cached
+            .roots
+            .iter()
+            .all(|root| root.status == scriptmetakit::RootStatus::Ready)
+    );
+}
+
+#[test]
+fn cached_catalog_unavailable_transition_has_a_stable_new_revision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("Uncached.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.uncached-catalog\n// SCRIPTMETA-END\n",
+    )
+    .expect("script");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "UncachedCatalogRevision"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![scriptmetakit::RootRegistration {
+            root_id: "scripts".into(),
+            path: temp.path().to_path_buf(),
+            display_name: None,
+            purpose: scriptmetakit::RootPurpose::MetadataCatalog,
+            watch_policy: scriptmetakit::WatchPolicy::Disabled,
+            cache_policy: scriptmetakit::CachePolicy::Disabled,
+            refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+            priority: scriptmetakit::RootPriority::UserInitiated,
+        }])
+        .expect("roots");
+    let scanned = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("scan");
+
+    let first_cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+    let second_cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+
+    assert_eq!(
+        first_cached.roots[0].status,
+        scriptmetakit::RootStatus::NotLoaded
+    );
+    assert_ne!(
+        first_cached.roots[0].state_revision,
+        scanned.roots[0].state_revision
+    );
+    assert_eq!(
+        second_cached.roots[0].state_revision,
+        first_cached.roots[0].state_revision
+    );
+}
+
+#[test]
+fn persistent_catalog_only_is_exported_without_resident_catalog_storage() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("Persistent.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.persistent-only\n// SCRIPTMETA-END\n",
+    )
+    .expect("script");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "PersistentCatalogOnly"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![scriptmetakit::RootRegistration {
+            root_id: "scripts".into(),
+            path: temp.path().to_path_buf(),
+            display_name: Some("Scripts".into()),
+            purpose: scriptmetakit::RootPurpose::MetadataCatalog,
+            watch_policy: scriptmetakit::WatchPolicy::Disabled,
+            cache_policy: scriptmetakit::CachePolicy::PersistentCatalogOnly,
+            refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+            priority: scriptmetakit::RootPriority::Background,
+        }])
+        .expect("roots");
+
+    let scanned = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("scan");
+    assert_eq!(
+        scanned
+            .catalog_snapshot
+            .as_ref()
+            .expect("returned catalog")
+            .file_items
+            .len(),
+        1
+    );
+    assert!(
+        engine
+            .catalog_snapshot()
+            .as_ref()
+            .is_none_or(|catalog| catalog.file_items.is_empty())
+    );
+    let exported = engine
+        .export_cache(scriptmetakit::CacheScope::Catalog)
+        .expect("persistent catalog export");
+    assert_eq!(
+        exported
+            .data
+            .get("catalog_snapshot")
+            .and_then(|snapshot| snapshot.get("candidate_cache"))
+            .and_then(|cache| cache.get("records"))
+            .and_then(serde_json::Value::as_array)
+            .expect("candidate records")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn persistent_catalog_only_merges_multiple_unsaved_partial_scans() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir_all(&first).expect("first root");
+    std::fs::create_dir_all(&second).expect("second root");
+    std::fs::write(
+        first.join("First.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.pending-first\n// SCRIPTMETA-END\n",
+    )
+    .expect("first script");
+    std::fs::write(
+        second.join("Second.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.pending-second\n// SCRIPTMETA-END\n",
+    )
+    .expect("second script");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "PendingCatalogMerge"),
+    )
+    .expect("engine");
+    let root = |root_id: &str, path| scriptmetakit::RootRegistration {
+        root_id: root_id.into(),
+        path,
+        display_name: None,
+        purpose: scriptmetakit::RootPurpose::MetadataCatalog,
+        watch_policy: scriptmetakit::WatchPolicy::Disabled,
+        cache_policy: scriptmetakit::CachePolicy::PersistentCatalogOnly,
+        refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+        priority: scriptmetakit::RootPriority::Background,
+    };
+    engine
+        .set_roots(vec![root("first", first), root("second", second)])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest {
+            root_ids: vec!["first".into()],
+            mode: scriptmetakit::ScanMode::MetadataOnly,
+        })
+        .expect("first scan");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest {
+            root_ids: vec!["second".into()],
+            mode: scriptmetakit::ScanMode::MetadataOnly,
+        })
+        .expect("second scan");
+
+    let exported = engine
+        .export_cache(scriptmetakit::CacheScope::Catalog)
+        .expect("merged catalog");
+    let records = exported
+        .data
+        .get("catalog_snapshot")
+        .and_then(|snapshot| snapshot.get("candidate_cache"))
+        .and_then(|cache| cache.get("records"))
+        .and_then(serde_json::Value::as_array)
+        .expect("records");
+    assert_eq!(records.len(), 2);
 }
 
 #[test]
@@ -2535,6 +2988,54 @@ fn preflight_allows_script_dense_root() {
 }
 
 #[test]
+fn stateless_root_preflight_does_not_register_or_scan_the_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let registered = temp.path().join("registered");
+    let candidate = temp.path().join("candidate");
+    std::fs::create_dir_all(&registered).expect("registered root");
+    std::fs::create_dir_all(&candidate).expect("candidate root");
+    std::fs::write(registered.join("Existing.jsx"), "alert('existing');").expect("existing");
+    std::fs::write(candidate.join("Tool.jsx"), "alert('tool');").expect("script");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "StatelessPreflight"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("registered", &registered),
+        ])
+        .expect("registered root");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("registered scan");
+    engine.config_mut().cache.idle_lifetime_millis = 0;
+    let result = engine.preflight_root(scriptmetakit::RootRegistration::file_list_and_metadata(
+        "candidate",
+        &candidate,
+    ));
+
+    assert_eq!(result.roots.len(), 1);
+    assert_eq!(result.roots[0].status, scriptmetakit::RootStatus::Ready);
+    assert!(result.file_list_snapshots.is_empty());
+    assert!(result.catalog_snapshot.is_none());
+    assert_eq!(engine.roots().len(), 1);
+    assert_eq!(engine.roots()[0].root_id.as_ref(), "registered");
+    assert!(
+        engine
+            .snapshot(&scriptmetakit::RootId::from("registered"))
+            .is_some(),
+        "preflight must not expire an unrelated resident cache"
+    );
+    assert!(
+        engine
+            .snapshot(&scriptmetakit::RootId::from("candidate"))
+            .is_none()
+    );
+}
+
+#[test]
 fn metadata_scan_reports_low_script_density_preflight_issue() {
     let temp = tempfile::tempdir().expect("tempdir");
     for index in 0..12 {
@@ -2681,6 +3182,33 @@ fn rejects_restricted_registered_root_before_scanning() {
         result.root.error.as_ref().map(|error| error.code.as_str()),
         Some("restricted_root")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolved_symlink_root_cannot_bypass_trash_preflight() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let target = temp.path().join(".Trashes").join("scripts");
+    std::fs::create_dir_all(&target).expect("trash target");
+    std::fs::write(target.join("Tool.jsx"), "alert('tool');").expect("script");
+    let link = temp.path().join("Scripts");
+    symlink(&target, &link).expect("root symlink");
+
+    let output = scriptmetakit::scanner::scan_file_list_root(
+        &scriptmetakit::RootId::from("root"),
+        &link,
+        &scriptmetakit::ScannerOptions::default(),
+        &scriptmetakit::ExtensionPolicy::default(),
+    );
+
+    assert_eq!(output.root.status, scriptmetakit::RootStatus::Unreadable);
+    assert_eq!(
+        output.root.error.as_ref().map(|error| error.code.as_str()),
+        Some("trash")
+    );
+    assert!(output.children.is_empty());
 }
 
 fn low_script_density_preflight_options() -> scriptmetakit::ScannerOptions {
@@ -3243,6 +3771,48 @@ fn persistent_catalog_cache_filters_mismatched_roots() {
     assert_eq!(
         catalog.candidate_cache.registered_roots[0].root_id,
         root_b_id
+    );
+}
+
+#[test]
+fn repeated_catalog_cache_load_does_not_advance_root_revision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("Tool.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.catalog-reload\n// SCRIPTMETA-END\n",
+    )
+    .expect("script");
+    let root = scriptmetakit::RootRegistration::file_list_and_metadata("root", temp.path());
+    let config = scriptmetakit::ScriptMetaKitConfig::new("Test", "CatalogReload");
+    let mut source = scriptmetakit::ScriptMetaKitEngine::new(config.clone()).expect("source");
+    source.set_roots(vec![root.clone()]).expect("source root");
+    source
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("scan");
+    let cache = source
+        .export_cache(scriptmetakit::CacheScope::Catalog)
+        .expect("cache");
+
+    let mut restored = scriptmetakit::ScriptMetaKitEngine::new(config).expect("restored");
+    restored.set_roots(vec![root]).expect("restored root");
+    restored.load_cache(cache.clone()).expect("first load");
+    let first = restored.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+    restored.load_cache(cache).expect("second load");
+    let second = restored.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+
+    assert_eq!(
+        first.roots[0].state_revision,
+        second.roots[0].state_revision
+    );
+    assert_eq!(
+        first.catalog_snapshot.expect("first catalog").file_items,
+        second.catalog_snapshot.expect("second catalog").file_items
     );
 }
 

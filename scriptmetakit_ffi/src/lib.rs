@@ -20,15 +20,15 @@ use scriptmetakit::{
     CachePolicy, CacheScope, CommentSyntax, DirectoryState,
     DistributionMetadataDraft as KitDistributionMetadataDraft, DistributionResolution,
     FileEntryChange, FileEntryChangeKind, FileIdentity, FileIssue, FileListSnapshot,
-    FileSystemEntry, IgnoredWatchPath, MAX_SCRIPT_METADATA_PREVIEW_BYTES, OperationSummary,
-    RefreshPolicy, RootChangeBatch, RootId, RootPriority, RootPurpose, RootRegistration,
-    RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest, ScanResult,
-    ScannablePathResolution, ScannerOptions, ScriptFileInspection, ScriptIdUniquenessItem,
-    ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration, ScriptMetaBackupOptions,
-    ScriptMetaBackupReason, ScriptMetaBackupRecord as KitScriptMetaBackupRecord,
-    ScriptMetaCatalogSnapshot, ScriptMetaEditState, ScriptMetaItem, ScriptMetaKitConfig,
-    ScriptMetaKitEngine, ScriptMetaWriteMode, ScriptMetaWriteOperation,
-    ScriptMetadataDraft as KitScriptMetadataDraft,
+    FileSystemEntry, IgnoredWatchPath, MAX_CACHE_FILE_BYTES, MAX_SCRIPT_METADATA_PREVIEW_BYTES,
+    OperationSummary, RefreshPolicy, RootChangeBatch, RootId, RootPriority, RootPurpose,
+    RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest,
+    ScanResult, ScannablePathResolution, ScannerOptions, ScriptFileInspection,
+    ScriptIdUniquenessItem, ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration,
+    ScriptMetaBackupOptions, ScriptMetaBackupReason,
+    ScriptMetaBackupRecord as KitScriptMetaBackupRecord, ScriptMetaCatalogSnapshot,
+    ScriptMetaEditState, ScriptMetaItem, ScriptMetaKitConfig, ScriptMetaKitEngine,
+    ScriptMetaWriteMode, ScriptMetaWriteOperation, ScriptMetadataDraft as KitScriptMetadataDraft,
     ScriptMetadataEditPreviewResult as KitScriptMetadataEditPreviewResult,
     ScriptMetadataEditReadResult as KitScriptMetadataEditReadResult,
     ScriptMetadataFileWriteResult as KitScriptMetadataFileWriteResult, ScriptRuntimeKind,
@@ -37,11 +37,11 @@ use scriptmetakit::{
     WatchRenameCandidate, WatchRenameConfidence, WatchRescanReason, WatchRescanTarget,
     can_read_directory_contents, clear_scriptmeta_backups, compare_versions,
     create_scriptmeta_backup, generate_edit_password_sha256, inspect_script_file,
-    is_valid_edit_password_sha256, load_cache_payload, normalize_metadata_url,
+    is_valid_edit_password_sha256, load_cache_payload_with_limit, normalize_metadata_url,
     normalize_version_string, read_script_metadata_draft_from_file,
     read_script_metadata_edit_preview_from_file, render_distribution_metadata_block,
     reset_scriptmeta_backups_with_current_as_initial, resolve_registered_path,
-    restore_scriptmeta_backup, save_cache_payload, script_path_may_affect_metadata,
+    restore_scriptmeta_backup, save_cache_payload_with_limit, script_path_may_affect_metadata,
     scriptmeta_backup_generations, supported_script_extensions_text, validate_script_id_uniqueness,
     verify_edit_password_sha256, write_script_metadata_to_file_if_unchanged,
 };
@@ -778,6 +778,10 @@ struct SmkEngineState {
     watcher: Option<NativeWatcher>,
     #[cfg(feature = "native-watch")]
     watch_plan: Option<WatchPlan>,
+    #[cfg(feature = "native-watch")]
+    watch_callback: SmkWatchNotificationCallback,
+    #[cfg(feature = "native-watch")]
+    watch_context: usize,
 }
 
 pub struct SmkScanResult {
@@ -919,6 +923,10 @@ pub unsafe extern "C" fn smk_engine_create_default(out_engine: *mut *mut SmkEngi
                 watcher: None,
                 #[cfg(feature = "native-watch")]
                 watch_plan: None,
+                #[cfg(feature = "native-watch")]
+                watch_callback: None,
+                #[cfg(feature = "native-watch")]
+                watch_context: 0,
             }),
             cancellation,
             cancellation_reservation: Mutex::new(None),
@@ -1207,19 +1215,26 @@ pub unsafe extern "C" fn smk_engine_set_native_event_latency_millis(
     engine: *mut SmkEngine,
     latency_millis: u64,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        engine
-            .engine
-            .config_mut()
-            .watcher
-            .native_event_latency_millis = latency_millis;
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate.config_mut().watcher.native_event_latency_millis = latency_millis;
+            Ok(())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
         Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1232,23 +1247,35 @@ pub unsafe extern "C" fn smk_engine_set_operational_policy(
     engine: *mut SmkEngine,
     policy: *const SmkOperationalPolicy,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
-        let policy = unsafe { policy.as_ref() }.ok_or((
+        let policy = *unsafe { policy.as_ref() }.ok_or((
             SmkStatus::NullArgument,
             "operational policy must not be null".to_string(),
         ))?;
         engine.clear_error();
-        if let Err(message) = apply_operational_policy(engine.engine.config_mut(), policy) {
-            let message = message.to_string();
-            engine.set_error(&message);
-            return Err((SmkStatus::InvalidArgument, message));
+        let mut candidate_config = engine.engine.config().clone();
+        if let Err(message) = apply_operational_policy(&mut candidate_config, &policy) {
+            engine.set_error(message);
+            return Err((SmkStatus::InvalidArgument, message.to_string()));
         }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            *candidate.config_mut() = candidate_config;
+            Ok(())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
         Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1558,23 +1585,30 @@ pub unsafe extern "C" fn smk_engine_set_roots(
     roots_ptr: *const SmkRootRegistration,
     root_count: usize,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
 
-        match engine.engine.set_roots(roots) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                engine.set_error(&message);
-                Err((SmkStatus::EngineError, message))
-            }
-        }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate
+                .set_roots(roots)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1593,24 +1627,31 @@ pub unsafe extern "C" fn smk_engine_replace_root_group(
     roots_ptr: *const SmkRootRegistration,
     root_count: usize,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
 
-        match engine.engine.replace_root_group(group_id, roots) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                engine.set_error(&message);
-                Err((SmkStatus::EngineError, message))
-            }
-        }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate
+                .replace_root_group(group_id, roots)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1629,24 +1670,31 @@ pub unsafe extern "C" fn smk_engine_insert_roots_into_group(
     roots_ptr: *const SmkRootRegistration,
     root_count: usize,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
 
-        match engine.engine.insert_roots_into_group(group_id, roots) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                engine.set_error(&message);
-                Err((SmkStatus::EngineError, message))
-            }
-        }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate
+                .insert_roots_into_group(group_id, roots)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1662,6 +1710,7 @@ pub unsafe extern "C" fn smk_engine_set_visible_root(
     root_id: SmkUtf8Slice,
     has_root_id: u8,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
@@ -1670,7 +1719,52 @@ pub unsafe extern "C" fn smk_engine_set_visible_root(
         } else {
             Some(required_str_from_slice(root_id, "root_id")?.into())
         };
-        engine.engine.set_visible_root(root_id);
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            if let Some(root_id) = root_id.as_ref()
+                && !candidate
+                    .roots()
+                    .iter()
+                    .any(|root| root.root_id == *root_id)
+            {
+                return Err(format!("unknown visible root_id `{root_id}`"));
+            }
+            candidate.set_visible_root(root_id);
+            Ok(())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine`, `root`, and `out_result` must be live pointers for this call.
+/// The preflight does not register the root or retain scan/catalog state.
+pub unsafe extern "C" fn smk_engine_preflight_root(
+    engine: *mut SmkEngine,
+    root: *const SmkRootRegistration,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let mut engine = engine_mut(engine)?;
+        let root = root_registration_from_ffi(input_ref(root, "root registration")?)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let result = engine.engine.preflight_root(root);
+        *out_result = Box::into_raw(Box::new(SmkScanResult::from_scan_result(result, None)));
         Ok(())
     });
 
@@ -2210,11 +2304,29 @@ pub unsafe extern "C" fn smk_engine_load_cache_file(
     engine: *mut SmkEngine,
     cache_path: SmkUtf8Slice,
 ) -> SmkStatus {
+    // SAFETY: this function has the same pointer and lifetime requirements as
+    // `smk_engine_load_cache_file_with_limit`.
+    unsafe { smk_engine_load_cache_file_with_limit(engine, cache_path, MAX_CACHE_FILE_BYTES) }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `cache_path` must contain a valid
+/// UTF-8 file path. `max_bytes` must be between 1 and `MAX_CACHE_FILE_BYTES`.
+pub unsafe extern "C" fn smk_engine_load_cache_file_with_limit(
+    engine: *mut SmkEngine,
+    cache_path: SmkUtf8Slice,
+    max_bytes: u64,
+) -> SmkStatus {
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
+        let max_bytes = validate_cache_size_limit_ffi(max_bytes).inspect_err(|error| {
+            engine.set_error(&error.1);
+        })?;
         let cache_path = path_from_slice(cache_path)?;
-        let payload = load_cache_payload(&cache_path).map_err(|error| {
+        let payload = load_cache_payload_with_limit(&cache_path, max_bytes).map_err(|error| {
             let message = error.to_string();
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
@@ -2243,15 +2355,37 @@ pub unsafe extern "C" fn smk_engine_save_cache_file(
     scope: u32,
     cache_path: SmkUtf8Slice,
 ) -> SmkStatus {
+    // SAFETY: this function has the same pointer and lifetime requirements as
+    // `smk_engine_save_cache_file_with_limit`.
+    unsafe {
+        smk_engine_save_cache_file_with_limit(engine, scope, cache_path, MAX_CACHE_FILE_BYTES)
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `cache_path` must contain a valid
+/// UTF-8 file path. Parent directories are created by Kit when needed.
+/// `max_bytes` must be between 1 and `MAX_CACHE_FILE_BYTES`.
+pub unsafe extern "C" fn smk_engine_save_cache_file_with_limit(
+    engine: *mut SmkEngine,
+    scope: u32,
+    cache_path: SmkUtf8Slice,
+    max_bytes: u64,
+) -> SmkStatus {
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
 
         let scope = cache_scope_from_u32(scope)?;
+        let max_bytes = validate_cache_size_limit_ffi(max_bytes).inspect_err(|error| {
+            engine.set_error(&error.1);
+        })?;
         let cache_path = path_from_slice(cache_path)?;
         let (existing_payload, existing_fingerprint, existing_load_error) = if cache_path.is_file()
         {
-            match load_cache_payload(&cache_path) {
+            match load_cache_payload_with_limit(&cache_path, max_bytes) {
                 Ok(payload) => match cache_payload_content_fingerprint(&payload) {
                     Ok(fingerprint) => (Some(payload), Some(fingerprint), None),
                     Err(error) => (None, None, Some(error.to_string())),
@@ -2298,7 +2432,7 @@ pub unsafe extern "C" fn smk_engine_save_cache_file(
             engine.engine.mark_cache_persisted(scope);
             return Ok(());
         }
-        save_cache_payload(&cache_path, &payload).map_err(|error| {
+        save_cache_payload_with_limit(&cache_path, &payload, max_bytes).map_err(|error| {
             let message = error.to_string();
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
@@ -3792,26 +3926,106 @@ fn scan_selected_roots(
 }
 
 #[cfg(feature = "native-watch")]
+type PendingWatchNotification = Option<(extern "C" fn(context: *mut c_void), usize)>;
+
+#[cfg(not(feature = "native-watch"))]
+type PendingWatchNotification = ();
+
+#[cfg(feature = "native-watch")]
+fn native_watcher_for_plan(
+    plan: &WatchPlan,
+    callback: SmkWatchNotificationCallback,
+    context: usize,
+) -> Result<NativeWatcher, String> {
+    if plan.physical_roots.is_empty() {
+        return Err("watch plan has no active physical roots".to_string());
+    }
+    if let Some(callback) = callback {
+        NativeWatcher::start_with_notifier(
+            plan,
+            Some(Arc::new(move || {
+                callback(context as *mut c_void);
+            })),
+        )
+    } else {
+        NativeWatcher::start(plan)
+    }
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "native-watch")]
+fn apply_engine_reconfiguration(
+    state: &mut SmkEngineState,
+    mutate: impl FnOnce(&mut ScriptMetaKitEngine) -> Result<(), String>,
+) -> Result<PendingWatchNotification, String> {
+    let mut candidate = state.engine.clone_for_reconfiguration();
+    mutate(&mut candidate)?;
+    let candidate_plan = candidate.watch_plan();
+    let replacement =
+        if state.watcher.is_some() && state.watch_plan.as_ref() != Some(&candidate_plan) {
+            Some(native_watcher_for_plan(
+                &candidate_plan,
+                state.watch_callback,
+                state.watch_context,
+            )?)
+        } else {
+            None
+        };
+
+    state.engine = candidate;
+    if let Some(replacement) = replacement {
+        state.watcher = Some(replacement);
+        state.watch_plan = Some(candidate_plan);
+        state.watch_reconcile_pending = true;
+        return Ok(state
+            .watch_callback
+            .map(|callback| (callback, state.watch_context)));
+    }
+    Ok(None)
+}
+
+#[cfg(not(feature = "native-watch"))]
+fn apply_engine_reconfiguration(
+    state: &mut SmkEngineState,
+    mutate: impl FnOnce(&mut ScriptMetaKitEngine) -> Result<(), String>,
+) -> Result<PendingWatchNotification, String> {
+    let mut candidate = state.engine.clone_for_reconfiguration();
+    mutate(&mut candidate)?;
+    state.engine = candidate;
+    Ok(())
+}
+
+fn emit_pending_watch_notification(notification: PendingWatchNotification) {
+    #[cfg(feature = "native-watch")]
+    if let Some((callback, context)) = notification {
+        callback(context as *mut c_void);
+    }
+    #[cfg(not(feature = "native-watch"))]
+    let () = notification;
+}
+
+fn empty_pending_watch_notification() -> PendingWatchNotification {
+    #[cfg(feature = "native-watch")]
+    {
+        None
+    }
+    #[cfg(not(feature = "native-watch"))]
+    {}
+}
+
+#[cfg(feature = "native-watch")]
 fn start_watching_engine(
     engine: &mut SmkEngineState,
     callback: SmkWatchNotificationCallback,
     context: *mut c_void,
 ) -> Result<(), String> {
     let plan = engine.engine.watch_plan();
-    let watcher = if let Some(callback) = callback {
-        let context = context as usize;
-        NativeWatcher::start_with_notifier(
-            &plan,
-            Some(Arc::new(move || {
-                callback(context as *mut c_void);
-            })),
-        )
-    } else {
-        NativeWatcher::start(&plan)
-    }
-    .map_err(|error| error.to_string())?;
+    let context = context as usize;
+    let watcher = native_watcher_for_plan(&plan, callback, context)?;
     engine.watcher = Some(watcher);
     engine.watch_plan = Some(plan);
+    engine.watch_callback = callback;
+    engine.watch_context = context;
     engine.watch_reconcile_pending = true;
     Ok(())
 }
@@ -3830,6 +4044,8 @@ fn stop_watching_engine(engine: &mut SmkEngineState) {
     engine.watcher = None;
     engine.watch_plan = None;
     engine.watch_reconcile_pending = false;
+    engine.watch_callback = None;
+    engine.watch_context = 0;
 }
 
 #[cfg(not(feature = "native-watch"))]
@@ -5809,7 +6025,7 @@ fn cache_scope_from_u32(value: u32) -> Result<CacheScope, (SmkStatus, String)> {
         0 => Ok(CacheScope::All),
         1 => Ok(CacheScope::Catalog),
         2 => Ok(CacheScope::FileList),
-        3 => Ok(CacheScope::Root),
+        3 => Ok(CacheScope::FileList),
         _ => Err((
             SmkStatus::InvalidArgument,
             format!("unknown cache scope `{value}`"),
@@ -5817,12 +6033,22 @@ fn cache_scope_from_u32(value: u32) -> Result<CacheScope, (SmkStatus, String)> {
     }
 }
 
+fn validate_cache_size_limit_ffi(value: u64) -> Result<u64, (SmkStatus, String)> {
+    if value == 0 || value > MAX_CACHE_FILE_BYTES {
+        return Err((
+            SmkStatus::InvalidArgument,
+            format!("cache size limit must be between 1 and {MAX_CACHE_FILE_BYTES} bytes"),
+        ));
+    }
+    Ok(value)
+}
+
 fn refresh_policy_from_u32(value: u32) -> Result<RefreshPolicy, (SmkStatus, String)> {
     match value {
         0 => Ok(RefreshPolicy::ManualOnly),
         1 => Ok(RefreshPolicy::OnVisible),
         2 => Ok(RefreshPolicy::OnFileEvent),
-        3 => Ok(RefreshPolicy::OnFileEventDeferred),
+        3 => Ok(RefreshPolicy::OnFileEvent),
         4 => Ok(RefreshPolicy::Scheduled),
         _ => Err((
             SmkStatus::InvalidArgument,

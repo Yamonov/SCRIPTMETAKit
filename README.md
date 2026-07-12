@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 1.0
+# SCRIPTMETAKit 1.2.0
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -20,6 +20,51 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 - Preserves `children == nil` versus a valid empty list across the C FFI without changing legacy snapshot struct layouts.
 - Retains last-good content for missing roots and identifies initial, restart, and overflow reconciliation results.
 - Merges persistent cache data by root and scope so memory eviction and idle expiry do not remove unresident durable entries.
+- Makes live root and watcher reconfiguration transactional: a replacement watcher is started before the new engine state is committed.
+- Enforces the configured cache byte limit before atomic replacement, preserving the previous valid cache after an oversized save failure.
+- Adds stateless root preflight, effective root scan priority, integrated single-pass density checks, and Windows watcher reconciliation after a directory handle is restored.
+
+### File-list API contracts
+
+The main Swift entry points are:
+
+```swift
+public func activateFileListRoot(
+    _ rootID: String?,
+    cacheScope: ScriptMetaCacheScope? = .fileList
+) async throws -> ScriptMetaKitFileListState?
+
+public func cachedFileListStates(
+    rootIDs: [String],
+    cacheScope: ScriptMetaCacheScope? = .fileList
+) async throws -> [String: ScriptMetaKitFileListState]
+
+public func watchUpdates(
+    roots: [ScriptMetaKitRoot],
+    replacingGroup groupID: String,
+    cacheScope: ScriptMetaCacheScope? = nil,
+    dirtyOnly: Bool = false
+) async throws -> ScriptMetaKitWatchUpdateSequence
+
+public func preflightRoot(
+    _ root: ScriptMetaKitRoot
+) async throws -> ScriptMetaScanResult
+```
+
+`preflightRoot(_:)` validates a candidate root without registering it, populating the metadata catalog, retaining a file-list tree, or changing a watcher plan. File-list density checks are performed during the real scan traversal, so registered scans do not walk the tree a second time.
+
+`ScriptMetaKitFileListState` separates current root state from last-good content. `freshness` reports filesystem verification, `completeness` reports truncation, and `source` reports memory or persistent provenance. A content revision is reusable only within the same non-empty workspace epoch.
+
+Watch updates start at sequence 1 for each stream ID. A slow consumer can detect a dropped buffered result from a sequence gap, then recover all current registered states with `cachedFileListStates(rootIDs:)`. `watchChanges(...)` remains as a source-compatible adapter over the same native watcher and update pump.
+
+Compatibility enum cases remain available but no longer create distinct behavior:
+
+- `ScriptMetaCacheScope.root` uses the same durable file and FFI scope as `.fileList`; the old `ScriptMetaKitRootCache.cache` filename remains readable for migration.
+- `ScriptMetaRefreshPolicy.onFileEventDeferred` is normalized to `.onFileEvent`.
+- `ScriptMetaRootPriority.userInitiated` scans first, the selected `.visibleWhenSelected` root scans next, and other visible/background roots follow while result ordering remains registration-stable.
+- `ScriptMetaCachePolicy.persistentCatalogOnly` contributes metadata to durable catalog export without retaining a resident catalog solely for that policy.
+
+Persistent cache reads and writes accept 1 through 64 MiB. Invalid limits produce a nonfatal Workspace diagnostic, and an oversized save never deletes or replaces the previous valid file.
 
 ## 1.1.3
 

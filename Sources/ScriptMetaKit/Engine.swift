@@ -37,6 +37,7 @@ public nonisolated enum ScriptMetaVersionOrdering: Int32, Sendable, Codable {
 public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     private let engineBox = ScriptMetaKitFFIEngineBox()
     private static let operationPriority: TaskPriority = .utility
+    public static let maximumCacheFileBytes: UInt64 = 64 * 1024 * 1024
 
     public init() {}
 
@@ -52,9 +53,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         }
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            let result = try await task.value
-            try Task.checkCancellation()
-            return result
+            return try await task.value
         } onCancel: { [engineBox] in
             let shouldCancelActiveOperation = ticket.requestCancellation()
             engineBox.notifyOperationWaiters()
@@ -62,6 +61,19 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
                 engineBox.cancelCurrentOrReservedOperation()
             }
         }
+    }
+
+    private func runTerminationOperation(
+        _ operation: @escaping @Sendable (ScriptMetaKitFFIEngineBox) -> Void
+    ) async {
+        let ticket = ScriptMetaKitOperationTicket()
+        engineBox.registerOperationTicket(ticket)
+        let task = Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.runOperation(ticket: ticket) {
+                operation(engineBox)
+            }
+        }
+        _ = try? await task.value
     }
 
     public static func normalizeVersionString(_ value: String) throws -> String? {
@@ -162,6 +174,12 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         try await setVisibleRoot(nil)
     }
 
+    public func preflightRoot(_ root: ScriptMetaKitRoot) async throws -> ScriptMetaScanResult {
+        try await runOperation { engineBox in
+            try engineBox.preflightRoot(root)
+        }
+    }
+
     func failNextWatcherStartForTesting() async throws {
         try await runOperation { engineBox in
             try engineBox.failNextWatcherStartForTesting()
@@ -180,7 +198,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         if cancelCurrentOperation {
             engineBox.cancelCurrentOrPendingOperation()
         }
-        _ = try? await runOperation { engineBox in
+        await runTerminationOperation { engineBox in
             engineBox.shutdown()
         }
     }
@@ -240,7 +258,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         if cancelCurrentOperation {
             engineBox.cancelCurrentOrPendingOperation()
         }
-        _ = try? await runOperation { engineBox in
+        await runTerminationOperation { engineBox in
             engineBox.stopWatching()
         }
     }
@@ -275,15 +293,22 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         }
     }
 
-    public func loadCache(from fileURL: URL) async throws {
+    public func loadCache(
+        from fileURL: URL,
+        maximumBytes: UInt64 = ScriptMetaKitEngine.maximumCacheFileBytes
+    ) async throws {
         try await runOperation { engineBox in
-            try engineBox.loadCache(from: fileURL)
+            try engineBox.loadCache(from: fileURL, maximumBytes: maximumBytes)
         }
     }
 
-    public func saveCache(to fileURL: URL, scope: ScriptMetaCacheScope = .all) async throws {
+    public func saveCache(
+        to fileURL: URL,
+        scope: ScriptMetaCacheScope = .all,
+        maximumBytes: UInt64 = ScriptMetaKitEngine.maximumCacheFileBytes
+    ) async throws {
         try await runOperation { engineBox in
-            try engineBox.saveCache(to: fileURL, scope: scope)
+            try engineBox.saveCache(to: fileURL, scope: scope, maximumBytes: maximumBytes)
         }
     }
 
@@ -1334,6 +1359,13 @@ private nonisolated func smk_engine_set_visible_root(
     _ hasRootID: UInt8
 ) -> Int32
 
+@_silgen_name("smk_engine_preflight_root")
+private nonisolated func smk_engine_preflight_root(
+    _ engine: OpaquePointer?,
+    _ root: UnsafePointer<SmkRootRegistration>?,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
 @_silgen_name("smk_engine_scan_folders")
 private nonisolated func smk_engine_scan_folders(
     _ engine: OpaquePointer?,
@@ -1512,11 +1544,26 @@ private nonisolated func smk_engine_load_cache_file(
     _ cachePath: SmkUtf8Slice
 ) -> Int32
 
+@_silgen_name("smk_engine_load_cache_file_with_limit")
+private nonisolated func smk_engine_load_cache_file_with_limit(
+    _ engine: OpaquePointer?,
+    _ cachePath: SmkUtf8Slice,
+    _ maximumBytes: UInt64
+) -> Int32
+
 @_silgen_name("smk_engine_save_cache_file")
 private nonisolated func smk_engine_save_cache_file(
     _ engine: OpaquePointer?,
     _ scope: UInt32,
     _ cachePath: SmkUtf8Slice
+) -> Int32
+
+@_silgen_name("smk_engine_save_cache_file_with_limit")
+private nonisolated func smk_engine_save_cache_file_with_limit(
+    _ engine: OpaquePointer?,
+    _ scope: UInt32,
+    _ cachePath: SmkUtf8Slice,
+    _ maximumBytes: UInt64
 ) -> Int32
 
 @_silgen_name("smk_engine_start_watching")
@@ -1860,7 +1907,6 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
     private var engine: ScriptMetaKitFFIEngine?
     private var cancellationEngine: ScriptMetaKitFFIEngine?
     private var watchNotificationSink: ScriptMetaKitWatchNotificationSink?
-    private var visibleRootID: String?
     private var shouldFailNextWatcherStartForTesting = false
 
     deinit {
@@ -1972,7 +2018,6 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         let engineToRelease = engine
         engineToRelease?.stopWatching()
         watchNotificationSink = nil
-        visibleRootID = nil
         shouldFailNextWatcherStartForTesting = false
         engine = nil
         lock.unlock()
@@ -2014,39 +2059,38 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
+        try failWatcherReconfigurationIfNeeded()
         try engine.setRoots(roots)
-        try restartWatcherIfNeeded()
     }
 
     public func replaceRootGroup(_ roots: [ScriptMetaKitRoot], groupID: String) throws {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
+        try failWatcherReconfigurationIfNeeded()
         try engine.replaceRootGroup(roots, groupID: groupID)
-        try restartWatcherIfNeeded()
     }
 
     public func insertRootsIntoGroup(_ roots: [ScriptMetaKitRoot], groupID: String) throws {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
+        try failWatcherReconfigurationIfNeeded()
         try engine.insertRootsIntoGroup(roots, groupID: groupID)
-        try restartWatcherIfNeeded()
     }
 
     public func setVisibleRoot(_ rootID: String?) throws {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
-        let previousRootID = visibleRootID
+        try failWatcherReconfigurationIfNeeded()
         try engine.setVisibleRoot(rootID)
-        do {
-            try restartWatcherIfNeeded()
-            visibleRootID = rootID
-        } catch {
-            try? engine.setVisibleRoot(previousRootID)
-            throw error
-        }
+    }
+
+    public func preflightRoot(_ root: ScriptMetaKitRoot) throws -> ScriptMetaScanResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try ensureEngineLocked().preflightRoot(root)
     }
 
     func failNextWatcherStartForTesting() throws {
@@ -2090,14 +2134,11 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
-        engine.stopWatching()
-        watchNotificationSink = nil
         let sink = ScriptMetaKitWatchNotificationSink(onChange: onChange)
         do {
             try engine.startWatching(notificationSink: sink)
             watchNotificationSink = sink
         } catch {
-            watchNotificationSink = nil
             throw error
         }
     }
@@ -2106,15 +2147,12 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
-        engine.stopWatching()
-        watchNotificationSink = nil
         _ = try engine.scan(folderURLs: folderURLs, checkUpdates: false)
         let sink = ScriptMetaKitWatchNotificationSink(onChange: onChange)
         do {
             try engine.startWatching(notificationSink: sink)
             watchNotificationSink = sink
         } catch {
-            watchNotificationSink = nil
             throw error
         }
     }
@@ -2126,17 +2164,13 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         watchNotificationSink = nil
     }
 
-    private func restartWatcherIfNeeded() throws {
-        guard let sink = watchNotificationSink, let engine else { return }
-        guard try engine.watcherRequiresRestart() else { return }
-        if shouldFailNextWatcherStartForTesting {
-            shouldFailNextWatcherStartForTesting = false
-            throw ScriptMetaKitError.operationFailed(
-                smkStatusEngineError,
-                "injected watcher start failure"
-            )
-        }
-        try engine.startWatching(notificationSink: sink)
+    private func failWatcherReconfigurationIfNeeded() throws {
+        guard watchNotificationSink != nil, shouldFailNextWatcherStartForTesting else { return }
+        shouldFailNextWatcherStartForTesting = false
+        throw ScriptMetaKitError.operationFailed(
+            smkStatusEngineError,
+            "injected watcher start failure"
+        )
     }
 
     public func setResolveMacOSAlias(_ enabled: Bool) throws {
@@ -2154,15 +2188,15 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
     public func setNativeEventLatencyMillis(_ latencyMillis: UInt64) throws {
         lock.lock()
         defer { lock.unlock() }
+        try failWatcherReconfigurationIfNeeded()
         try ensureEngineLocked().setNativeEventLatencyMillis(latencyMillis)
-        try restartWatcherIfNeeded()
     }
 
     public func setOperationalPolicy(_ policy: ScriptMetaKitOperationalPolicy) throws {
         lock.lock()
         defer { lock.unlock() }
+        try failWatcherReconfigurationIfNeeded()
         try ensureEngineLocked().setOperationalPolicy(policy)
-        try restartWatcherIfNeeded()
     }
 
     public func setRootPreflightOptions(_ options: ScriptMetaRootPreflightOptions) throws {
@@ -2171,16 +2205,24 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         try ensureEngineLocked().setRootPreflightOptions(options)
     }
 
-    public func loadCache(from fileURL: URL) throws {
+    public func loadCache(from fileURL: URL, maximumBytes: UInt64) throws {
         lock.lock()
         defer { lock.unlock() }
-        try ensureEngineLocked().loadCache(from: fileURL)
+        try ensureEngineLocked().loadCache(from: fileURL, maximumBytes: maximumBytes)
     }
 
-    public func saveCache(to fileURL: URL, scope: ScriptMetaCacheScope) throws {
+    public func saveCache(
+        to fileURL: URL,
+        scope: ScriptMetaCacheScope,
+        maximumBytes: UInt64
+    ) throws {
         lock.lock()
         defer { lock.unlock() }
-        try ensureEngineLocked().saveCache(to: fileURL, scope: scope)
+        try ensureEngineLocked().saveCache(
+            to: fileURL,
+            scope: scope,
+            maximumBytes: maximumBytes
+        )
     }
 
     public func writeScriptMetadata(
@@ -2493,6 +2535,24 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         }
     }
 
+    public func preflightRoot(_ root: ScriptMetaKitRoot) throws -> ScriptMetaScanResult {
+        let arena = SmkInputStringArena()
+        var registration = rootRegistrations(from: [root], arena: arena)[0]
+        var result: OpaquePointer?
+        let status = withExtendedLifetime(arena) {
+            withUnsafePointer(to: &registration) { rootPointer in
+                smk_engine_preflight_root(handle, rootPointer, &result)
+            }
+        }
+        guard status == smkStatusOK, let result else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+        defer {
+            smk_scan_result_free(result)
+        }
+        return try makeResult(from: result)
+    }
+
     public func scanRegisteredRoots(
         mode: ScriptMetaScanMode,
         checkUpdates: Bool,
@@ -2756,20 +2816,33 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         }
     }
 
-    public func loadCache(from fileURL: URL) throws {
+    public func loadCache(from fileURL: URL, maximumBytes: UInt64) throws {
         let arena = SmkInputStringArena()
         let status = withExtendedLifetime(arena) {
-            smk_engine_load_cache_file(handle, arena.slice(fileURL.standardizedFileURL.path))
+            smk_engine_load_cache_file_with_limit(
+                handle,
+                arena.slice(fileURL.standardizedFileURL.path),
+                maximumBytes
+            )
         }
         guard status == smkStatusOK else {
             throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
         }
     }
 
-    public func saveCache(to fileURL: URL, scope: ScriptMetaCacheScope) throws {
+    public func saveCache(
+        to fileURL: URL,
+        scope: ScriptMetaCacheScope,
+        maximumBytes: UInt64
+    ) throws {
         let arena = SmkInputStringArena()
         let status = withExtendedLifetime(arena) {
-            smk_engine_save_cache_file(handle, scope.rawValue, arena.slice(fileURL.standardizedFileURL.path))
+            smk_engine_save_cache_file_with_limit(
+                handle,
+                scope.rawValue,
+                arena.slice(fileURL.standardizedFileURL.path),
+                maximumBytes
+            )
         }
         guard status == smkStatusOK else {
             throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())

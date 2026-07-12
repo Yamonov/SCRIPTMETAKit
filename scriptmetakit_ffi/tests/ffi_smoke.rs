@@ -22,9 +22,10 @@ use scriptmetakit_ffi::{
     smk_engine_check_update_item, smk_engine_check_updates_for_items, smk_engine_create_default,
     smk_engine_finish_operation_reservation, smk_engine_free,
     smk_engine_generate_edit_password_sha256, smk_engine_last_error, smk_engine_load_cache_file,
-    smk_engine_read_script_metadata_edit_preview_file, smk_engine_render_distribution_metadata,
-    smk_engine_reserve_next_operation, smk_engine_restore_scriptmeta_backup,
-    smk_engine_save_cache_file, smk_engine_scan_folder, smk_engine_scan_folders,
+    smk_engine_preflight_root, smk_engine_read_script_metadata_edit_preview_file,
+    smk_engine_render_distribution_metadata, smk_engine_reserve_next_operation,
+    smk_engine_restore_scriptmeta_backup, smk_engine_save_cache_file,
+    smk_engine_save_cache_file_with_limit, smk_engine_scan_folder, smk_engine_scan_folders,
     smk_engine_scan_folders_with_progress, smk_engine_scan_registered_roots, smk_engine_scan_roots,
     smk_engine_scriptmeta_backup_generations, smk_engine_set_resolve_macos_alias,
     smk_engine_set_roots, smk_engine_set_visible_root, smk_engine_verify_edit_password_sha256,
@@ -624,6 +625,61 @@ fn scans_registered_roots_with_app_supplied_root_ids() {
     unsafe {
         smk_scan_result_free(selected_scan_result);
         smk_scan_result_free(scan_result);
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
+fn preflight_root_does_not_register_the_candidate_through_ffi() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Candidate.jsx"), "alert('candidate');")
+        .expect("candidate script");
+    let path = temp.path().to_string_lossy().into_owned();
+    let root = SmkRootRegistration {
+        root_id: utf8_slice("candidate"),
+        path: utf8_slice(&path),
+        display_name: utf8_slice("Candidate"),
+        purpose: 3,
+        watch_policy: 2,
+        cache_policy: 3,
+        refresh_policy: 2,
+        priority: 0,
+    };
+    let mut engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+
+    let mut preflight_result = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_preflight_root(engine, &root, &mut preflight_result) },
+        SmkStatus::Ok
+    );
+    assert!(!preflight_result.is_null());
+    let mut roots = SmkRootSnapshotSlice::default();
+    assert_eq!(
+        unsafe { smk_scan_result_roots(preflight_result, &mut roots) },
+        SmkStatus::Ok
+    );
+    assert_eq!(roots.len, 1);
+
+    let mut registered_result = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_scan_registered_roots(engine, 2, 0, &mut registered_result) },
+        SmkStatus::Ok
+    );
+    assert!(!registered_result.is_null());
+    let mut registered_roots = SmkRootSnapshotSlice::default();
+    assert_eq!(
+        unsafe { smk_scan_result_roots(registered_result, &mut registered_roots) },
+        SmkStatus::Ok
+    );
+    assert_eq!(registered_roots.len, 0);
+
+    unsafe {
+        smk_scan_result_free(registered_result);
+        smk_scan_result_free(preflight_result);
         smk_engine_free(engine);
     }
 }
@@ -1399,6 +1455,49 @@ fn identical_cache_save_skips_rewriting_the_file() {
 }
 
 #[test]
+fn size_limited_ffi_cache_save_preserves_the_previous_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Example.jsx"), "alert('ok');").expect("script");
+    let cache_path = temp.path().join("cache.json");
+    let cache = cache_path.to_string_lossy().into_owned();
+    let root = temp.path().to_string_lossy().into_owned();
+    let mut engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    let mut scan_result = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_scan_folders(engine, &utf8_slice(&root), 1, 0, &mut scan_result) },
+        SmkStatus::Ok
+    );
+    unsafe { smk_scan_result_free(scan_result) };
+    assert_eq!(
+        unsafe { smk_engine_save_cache_file(engine, 0, utf8_slice(&cache)) },
+        SmkStatus::Ok
+    );
+    let previous = std::fs::read(&cache_path).expect("previous cache");
+
+    assert_eq!(
+        unsafe { smk_engine_save_cache_file_with_limit(engine, 0, utf8_slice(&cache), 1) },
+        SmkStatus::EngineError
+    );
+    assert_eq!(
+        std::fs::read(&cache_path).expect("preserved cache"),
+        previous
+    );
+    assert_eq!(
+        unsafe { smk_engine_save_cache_file_with_limit(engine, 0, utf8_slice(&cache), 0) },
+        SmkStatus::InvalidArgument
+    );
+    assert_eq!(
+        std::fs::read(&cache_path).expect("cache preserved after invalid limit"),
+        previous
+    );
+    unsafe { smk_engine_free(engine) };
+}
+
+#[test]
 fn complete_resident_cache_replaces_a_corrupt_existing_file() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("Example.jsx"), "alert('ok');").expect("script");
@@ -1594,6 +1693,73 @@ fn starts_and_polls_native_watcher_through_ffi() {
 
     // SAFETY: handle was returned by this FFI crate and has not been freed.
     unsafe {
+        smk_engine_free(engine);
+    }
+}
+
+#[cfg(feature = "native-watch")]
+#[test]
+fn empty_watch_plan_is_rejected_and_live_reconfiguration_is_atomic() {
+    let mut empty_engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut empty_engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_start_watching(empty_engine) },
+        SmkStatus::EngineError
+    );
+    unsafe { smk_engine_free(empty_engine) };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Watched.jsx"), "alert('watched');").expect("script");
+    let path = temp.path().to_string_lossy().into_owned();
+    let root = SmkRootRegistration {
+        root_id: utf8_slice("watched"),
+        path: utf8_slice(&path),
+        display_name: SmkUtf8Slice::default(),
+        purpose: 3,
+        watch_policy: 2,
+        cache_policy: 3,
+        refresh_policy: 2,
+        priority: 1,
+    };
+    let mut engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_set_roots(engine, &root, 1) },
+        SmkStatus::Ok
+    );
+    assert_eq!(unsafe { smk_engine_start_watching(engine) }, SmkStatus::Ok);
+
+    assert_eq!(
+        unsafe { smk_engine_set_roots(engine, ptr::null(), 0) },
+        SmkStatus::EngineError
+    );
+    let mut result = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_scan_registered_roots(engine, 2, 0, &mut result) },
+        SmkStatus::Ok
+    );
+    let mut roots = SmkRootSnapshotSlice::default();
+    assert_eq!(
+        unsafe { smk_scan_result_roots(result, &mut roots) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        roots.len, 1,
+        "failed watcher replacement must preserve roots"
+    );
+    assert_eq!(
+        unsafe { smk_engine_stop_watching(engine) },
+        SmkStatus::Ok,
+        "failed watcher replacement must preserve the active watcher"
+    );
+    unsafe {
+        smk_scan_result_free(result);
         smk_engine_free(engine);
     }
 }

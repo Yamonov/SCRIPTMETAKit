@@ -764,6 +764,14 @@ SmkStatus smk_engine_set_visible_root(
     uint8_t has_root_id
 );
 
+/* Validates one candidate root without registering it or retaining scan,
+ * catalog, cache, visible-root, or watcher state. */
+SmkStatus smk_engine_preflight_root(
+    SmkEngine *engine,
+    const SmkRootRegistration *root,
+    SmkScanResult **out_result
+);
+
 SmkStatus smk_engine_scan_registered_roots(
     SmkEngine *engine,
     uint32_t scan_mode,
@@ -871,10 +879,26 @@ SmkStatus smk_engine_load_cache_file(
     SmkUtf8Slice cache_path
 );
 
+/* max_bytes must be in the inclusive range 1...(64 * 1024 * 1024). */
+SmkStatus smk_engine_load_cache_file_with_limit(
+    SmkEngine *engine,
+    SmkUtf8Slice cache_path,
+    uint64_t max_bytes
+);
+
 SmkStatus smk_engine_save_cache_file(
     SmkEngine *engine,
     uint32_t scope,
     SmkUtf8Slice cache_path
+);
+
+/* max_bytes has the same range as the limited load API. An oversized payload
+ * fails before atomic replacement and leaves a previous valid file intact. */
+SmkStatus smk_engine_save_cache_file_with_limit(
+    SmkEngine *engine,
+    uint32_t scope,
+    SmkUtf8Slice cache_path,
+    uint64_t max_bytes
 );
 
 SmkStatus smk_engine_start_watching(SmkEngine *engine);

@@ -1086,6 +1086,7 @@ mod platform {
                 if directory.is_none() {
                     break;
                 }
+                let _ = sender.send(NativeFsEvent::Overflow);
                 continue;
             }
 
@@ -1106,6 +1107,7 @@ mod platform {
                 if directory.is_none() {
                     break;
                 }
+                let _ = sender.send(NativeFsEvent::Overflow);
                 continue;
             }
 
@@ -1124,6 +1126,7 @@ mod platform {
                 if directory.is_none() {
                     break;
                 }
+                let _ = sender.send(NativeFsEvent::Overflow);
                 continue;
             }
 

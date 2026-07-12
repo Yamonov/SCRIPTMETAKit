@@ -271,10 +271,13 @@ final class ScriptMetaKitAPITests: XCTestCase {
         scanTask.cancel()
 
         do {
-            _ = try await scanTask.value
-            XCTFail("cancelled parent task returned a scan result")
+            let result = try await scanTask.value
+            XCTAssertTrue(
+                try XCTUnwrap(result.operation).cancelled,
+                "only a committed native cancellation result may win after task cancellation"
+            )
         } catch is CancellationError {
-            // Expected.
+            // Cancellation before the native result commits is also valid.
         }
     }
 
@@ -936,6 +939,202 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertTrue(diagnostics.contains { $0.code == "cache_load_failed" })
     }
 
+    func testInvalidCacheLimitReportsDiagnosticWithoutDeletingPreviousCache() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.invalid-cache-limit")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitInvalidLimit-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let root = ScriptMetaKitRoot(rootID: "invalid-cache-limit", url: rootURL)
+        let validStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let writer = ScriptMetaKitWorkspace(configuration: .init(cacheStore: validStore))
+        _ = try await writer.scanRoots(
+            [root],
+            replacingGroup: "test.invalid-cache-limit",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        let cacheURL = validStore.writableCacheFileURL(scope: .fileList)
+        let previousCache = try Data(contentsOf: cacheURL)
+
+        let recorder = DiagnosticRecorder()
+        let invalidStore = ScriptMetaKitPersistentCacheStore(
+            directoryURL: cacheDirectory,
+            maximumCacheBytes: 0
+        )
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(
+            cacheStore: invalidStore,
+            diagnosticHandler: { diagnostic in
+                Task { await recorder.append(diagnostic) }
+            }
+        ))
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.invalid-cache-limit",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+
+        XCTAssertEqual(try Data(contentsOf: cacheURL), previousCache)
+        for _ in 0..<20 {
+            if await recorder.diagnostics.contains(where: { $0.code == "cache_limit_invalid" }) {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let diagnostics = await recorder.diagnostics
+        XCTAssertTrue(diagnostics.contains { $0.code == "cache_limit_invalid" })
+    }
+
+    func testRootCacheScopeUsesFileListStorageAndReadsLegacyFile() throws {
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitRootAlias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let store = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        XCTAssertEqual(
+            store.writableCacheFileURL(scope: .root),
+            store.writableCacheFileURL(scope: .fileList)
+        )
+
+        let legacyURL = cacheDirectory.appendingPathComponent("ScriptMetaKitRootCache.cache")
+        try Data("legacy".utf8).write(to: legacyURL)
+        XCTAssertEqual(store.readableCacheFileURL(scope: .root), legacyURL)
+        XCTAssertNil(store.readableCacheFileURL(scope: .fileList))
+        store.enforceSizeLimit(scope: .root)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: legacyURL.path))
+        ScriptMetaKitPersistentCacheStore(
+            directoryURL: cacheDirectory,
+            maximumCacheBytes: 0
+        ).enforceSizeLimit(scope: .root)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: legacyURL.path),
+            "an invalid limit must not delete an existing cache"
+        )
+    }
+
+    func testStatelessPreflightDoesNotRegisterTheCandidateInSwiftEngine() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.swift-preflight")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let engine = ScriptMetaKitEngine()
+        let result = try await engine.preflightRoot(
+            ScriptMetaKitRoot(rootID: "candidate", url: rootURL)
+        )
+        XCTAssertEqual(result.roots.map(\.rootID), ["candidate"])
+        XCTAssertEqual(result.roots.first?.status, "ready")
+        XCTAssertTrue(result.fileListSnapshots.isEmpty)
+        XCTAssertNil(result.catalogSnapshot)
+
+        let registered = try await engine.scanRegisteredRoots(
+            mode: .fileListAndMetadata,
+            checkUpdates: false
+        )
+        XCTAssertTrue(registered.roots.isEmpty)
+    }
+
+    func testShutdownFlushesDelayedCacheSaveQueuedBehindIt() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.delayed-cache")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitDelayedCache-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let root = ScriptMetaKitRoot(rootID: "delayed-cache", url: rootURL)
+        let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(
+            cacheStore: cacheStore,
+            cacheSaveDebounceMillis: 75
+        ))
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.delayed-cache",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        let cacheURL = cacheStore.writableCacheFileURL(scope: .fileList)
+        let previousCache = try Data(contentsOf: cacheURL)
+        try "alert('deferred');\n".write(
+            to: rootURL.appendingPathComponent("Deferred.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.delayed-cache",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: nil
+        )
+
+        let (started, startedContinuation) = AsyncStream<Void>.makeStream()
+        let (release, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let blocker = Task {
+            try await workspace.performExclusiveOperation {
+                startedContinuation.yield()
+                for await _ in release { break }
+            }
+        }
+        var startedIterator = started.makeAsyncIterator()
+        _ = await startedIterator.next()
+        await workspace.schedulePersistentCacheSaveForTesting(scope: .root)
+        let shutdown = Task { await workspace.shutdown() }
+        try await Task.sleep(for: .milliseconds(150))
+        releaseContinuation.yield()
+        try await blocker.value
+        await shutdown.value
+
+        XCTAssertNotEqual(try Data(contentsOf: cacheURL), previousCache)
+        let restored = ScriptMetaKitWorkspace(configuration: .init(cacheStore: cacheStore))
+        try await restored.registerRoots(
+            [root],
+            replacingGroup: "test.delayed-cache",
+            cacheScope: .fileList
+        )
+        let states = try await restored.cachedFileListStates(
+            rootIDs: [root.rootID],
+            cacheScope: nil
+        )
+        XCTAssertTrue(
+            states[root.rootID]?.availableSnapshot?.scriptFileEntries.contains {
+                $0.name == "Deferred.jsx"
+            } == true
+        )
+    }
+
+    func testShutdownCompletesWhenCallingTaskIsAlreadyCancelled() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.cancelled-shutdown")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let root = ScriptMetaKitRoot(rootID: "cancelled-shutdown", url: rootURL)
+        let workspace = ScriptMetaKitWorkspace()
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.cancelled-shutdown",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly
+        )
+
+        let shutdown = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await workspace.shutdown()
+            return true
+        }
+        let didCompleteShutdown = await shutdown.value
+        XCTAssertTrue(didCompleteShutdown)
+        let reused = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.cancelled-shutdown",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly
+        )
+        XCTAssertEqual(reused.roots.first?.status, "ready")
+    }
+
     func testWorkspaceSerializesConcurrentReplacementScansForTheSameGroup() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitWorkspaceRace-\(UUID().uuidString)", isDirectory: true)
@@ -1303,9 +1502,8 @@ final class ScriptMetaKitAPITests: XCTestCase {
             rootIDs: ["watch-gap"],
             mode: .fileListOnly
         )
-        let (legacyStream, legacyContinuation) = AsyncThrowingStream<ScriptMetaScanResult, Error>
+        let (updateStream, updateContinuation) = AsyncThrowingStream<ScriptMetaKitWatchUpdate, Error>
             .makeStream(bufferingPolicy: .bufferingNewest(1))
-        let legacy = ScriptMetaKitWatchSequence(stream: legacyStream)
         for sequence in 1...3 {
             var sequencedResult = result
             sequencedResult.watchDelivery = ScriptMetaKitWatchDelivery(
@@ -1314,14 +1512,16 @@ final class ScriptMetaKitAPITests: XCTestCase {
                 streamID: "deterministic-gap",
                 sequence: UInt64(sequence)
             )
-            legacyContinuation.yield(sequencedResult)
+            updateContinuation.yield(ScriptMetaKitWatchUpdate(
+                streamID: "deterministic-gap",
+                sequence: UInt64(sequence),
+                kind: sequence == 1 ? .reconciliation : .incremental,
+                coversAllWatchedRoots: true,
+                result: sequencedResult
+            ))
         }
-        legacyContinuation.finish()
-        let updates = ScriptMetaKitWatchUpdateSequence(
-            legacy: legacy,
-            watchedRootIDs: ["watch-gap"],
-            streamID: "deterministic-gap"
-        )
+        updateContinuation.finish()
+        let updates = ScriptMetaKitWatchUpdateSequence(stream: updateStream)
         var iterator = updates.makeAsyncIterator()
         let deliveredValue = try await iterator.next()
         let delivered = try XCTUnwrap(deliveredValue)

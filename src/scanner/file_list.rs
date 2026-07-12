@@ -31,7 +31,7 @@ use super::{
     path_resolution::{
         PathKind, PathResolutionStatus, ResolvedPath, path_error_status, resolve_scannable_path,
     },
-    root_preflight::{root_content_preflight_issue, root_location_issue},
+    root_preflight::{RootContentPreflightTracker, root_location_issue},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -151,6 +151,8 @@ fn scan_file_list_root_controlled_with_probe(
         root_error: None,
         cancellation,
         probe_script_headers,
+        preflight_tracker: Some(RootContentPreflightTracker::new(options, extensions)),
+        preflight_issue: None,
     };
 
     let root_resolution = resolve_scannable_path(
@@ -172,6 +174,10 @@ fn scan_file_list_root_controlled_with_probe(
             truncated: false,
             change_summary: None,
         };
+    }
+    if let Some((status, root_error)) = root_location_issue(&root_resolution.resolved_path, options)
+    {
+        return empty_root_output(root, status, root_error);
     }
     let root_metadata = match fs::metadata(&root_resolution.resolved_path) {
         Ok(metadata) => metadata,
@@ -203,18 +209,15 @@ fn scan_file_list_root_controlled_with_probe(
         };
     }
 
-    if let Some((status, root_error)) =
-        root_content_preflight_issue(&root_resolution.resolved_path, options, extensions)
-    {
-        return empty_root_output(root, status, root_error);
-    }
-
     let children = scan_directory(root_path, &root_resolution.resolved_path, 0, &mut state)
         .unwrap_or_default();
     root.item_count = state.visited_nodes;
     root.last_loaded_at = Some(now_timestamp_millis());
     root.is_dirty = false;
-    if let Some(error) = state.root_error {
+    if let Some((status, error)) = state.preflight_issue {
+        root.status = status;
+        root.error = Some(error);
+    } else if let Some(error) = state.root_error {
         root.status = RootStatus::Unreadable;
         root.error = Some(error);
     } else {
@@ -639,6 +642,8 @@ fn scan_file_list_directory(
         root_error: None,
         cancellation,
         probe_script_headers: true,
+        preflight_tracker: None,
+        preflight_issue: None,
     };
     let resolved_directory = normalize_path(source_directory);
     let children = scan_directory(display_directory, source_directory, depth, &mut state);
@@ -675,6 +680,8 @@ struct FileListWalkState<'a> {
     root_error: Option<RootError>,
     cancellation: Option<&'a OperationCancellation>,
     probe_script_headers: bool,
+    preflight_tracker: Option<RootContentPreflightTracker<'a>>,
+    preflight_issue: Option<(RootStatus, RootError)>,
 }
 
 fn scan_directory(
@@ -722,6 +729,14 @@ fn scan_directory(
 
         let source_path = entry.path();
         let display_path = display_directory.join(entry.file_name());
+        if let Some(issue) = state
+            .preflight_tracker
+            .as_mut()
+            .and_then(|tracker| tracker.observe_entry(&entry, &display_path))
+        {
+            state.preflight_issue = Some(issue);
+            break;
+        }
         if should_skip_path(&display_path, state.options) {
             continue;
         }
@@ -892,6 +907,9 @@ fn scan_directory(
 }
 
 fn should_stop(depth: usize, state: &mut FileListWalkState<'_>) -> bool {
+    if state.preflight_issue.is_some() {
+        return true;
+    }
     if state
         .cancellation
         .is_some_and(OperationCancellation::is_cancelled)
