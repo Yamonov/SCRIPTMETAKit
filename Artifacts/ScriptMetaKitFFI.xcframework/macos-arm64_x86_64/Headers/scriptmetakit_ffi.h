@@ -42,6 +42,13 @@ typedef struct SmkRootSnapshot {
     SmkUtf8Slice error_message;
 } SmkRootSnapshot;
 
+typedef struct SmkRootSnapshotRevision {
+    /* Index into the SmkRootSnapshot slice from the same SmkScanResult. */
+    size_t root_index;
+    SmkUtf8Slice workspace_epoch;
+    uint64_t sequence;
+} SmkRootSnapshotRevision;
+
 typedef struct SmkOperationalPolicy {
     size_t max_concurrent_meta_url_checks;
     size_t retry_attempts;
@@ -175,6 +182,15 @@ typedef struct SmkFileListSnapshot {
     size_t child_count;
     uint8_t truncated;
 } SmkFileListSnapshot;
+
+typedef struct SmkFileListSnapshotDetails {
+    /* Index into the SmkFileListSnapshot slice from the same SmkScanResult. */
+    size_t file_list_index;
+    /* 0 means children are unavailable; 1 with child_count=0 is a valid empty list. */
+    uint8_t has_children;
+    SmkUtf8Slice workspace_epoch;
+    uint64_t content_sequence;
+} SmkFileListSnapshotDetails;
 
 typedef struct SmkFileListDirectoryStateRange {
     size_t first_directory_state_index;
@@ -332,6 +348,11 @@ typedef struct SmkRootSnapshotSlice {
     size_t len;
 } SmkRootSnapshotSlice;
 
+typedef struct SmkRootSnapshotRevisionSlice {
+    const SmkRootSnapshotRevision *ptr;
+    size_t len;
+} SmkRootSnapshotRevisionSlice;
+
 typedef struct SmkRegisteredRootSignatureSlice {
     const SmkRegisteredRootSignature *ptr;
     size_t len;
@@ -341,6 +362,11 @@ typedef struct SmkFileListSnapshotSlice {
     const SmkFileListSnapshot *ptr;
     size_t len;
 } SmkFileListSnapshotSlice;
+
+typedef struct SmkFileListSnapshotDetailsSlice {
+    const SmkFileListSnapshotDetails *ptr;
+    size_t len;
+} SmkFileListSnapshotDetailsSlice;
 
 typedef struct SmkFileListDirectoryStateRangeSlice {
     const SmkFileListDirectoryStateRange *ptr;
@@ -431,6 +457,12 @@ typedef struct SmkWatchChangeInfo {
     size_t rename_candidate_count;
     size_t rescan_target_count;
 } SmkWatchChangeInfo;
+
+typedef struct SmkWatchDeliveryInfo {
+    uint8_t is_watch_update;
+    uint8_t is_reconciliation;
+    uint8_t covers_all_watched_roots;
+} SmkWatchDeliveryInfo;
 
 typedef struct SmkWatchPathEvent {
     SmkUtf8Slice root_id;
@@ -876,6 +908,14 @@ SmkStatus smk_scan_result_roots(
     const SmkScanResult *result,
     SmkRootSnapshotSlice *out_roots
 );
+/*
+ * Returns one entry per root, in root-slice order. Borrowed strings and the
+ * returned slice remain valid only while the parent SmkScanResult is live.
+ */
+SmkStatus smk_scan_result_root_revisions(
+    const SmkScanResult *result,
+    SmkRootSnapshotRevisionSlice *out_revisions
+);
 
 SmkStatus smk_scan_result_catalog_info(
     const SmkScanResult *result,
@@ -890,6 +930,15 @@ SmkStatus smk_scan_result_registered_root_signatures(
 SmkStatus smk_scan_result_file_lists(
     const SmkScanResult *result,
     SmkFileListSnapshotSlice *out_file_lists
+);
+/*
+ * Returns one entry per file-list snapshot, in file-list-slice order.
+ * Borrowed strings and the returned slice remain valid only while the parent
+ * SmkScanResult is live.
+ */
+SmkStatus smk_scan_result_file_list_details(
+    const SmkScanResult *result,
+    SmkFileListSnapshotDetailsSlice *out_details
 );
 
 SmkStatus smk_scan_result_file_entries(
@@ -975,6 +1024,10 @@ SmkStatus smk_scan_result_file_issues(
 SmkStatus smk_scan_result_watch_change_info(
     const SmkScanResult *result,
     SmkWatchChangeInfo *out_info
+);
+SmkStatus smk_scan_result_watch_delivery_info(
+    const SmkScanResult *result,
+    SmkWatchDeliveryInfo *out_info
 );
 
 SmkStatus smk_scan_result_watch_events(

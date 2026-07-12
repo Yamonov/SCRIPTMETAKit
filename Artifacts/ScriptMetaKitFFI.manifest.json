@@ -1,9 +1,9 @@
 {
-  "packageVersion": "1.1.3",
-  "gitRevision": "bcf8425ad99bf6ef42f121f16fe437346fc38ab5",
+  "packageVersion": "1.2.0",
+  "gitRevision": "f6503c6d26a2a134fe3773ebd0738fbe31cabf74",
   "sourceState": "clean",
-  "sourceTreeSHA256": "fe5c34cc7cdc98a3fe10eb1cc8989244f2c50b296c9695852994ded02b24e243",
+  "sourceTreeSHA256": "6b353fd83c666f273b577ba5a21d2e7cfc6f56154e4132196e833395d9e00f20",
   "features": "blocking-http,native-watch",
   "architectures": "x86_64 arm64",
-  "dylibSHA256": "a6cabeb7fd66e090fe8f395e092e0fdeef9a70ab6bb7babe31f29f65476611ed"
+  "dylibSHA256": "66f99de3d26ff52711726f99d491cc7dcecd50455475289f3b126ee089152444"
 }
