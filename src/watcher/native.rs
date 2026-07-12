@@ -1043,10 +1043,7 @@ mod platform {
 
     fn watch_root(root: PathBuf, directory: HANDLE, stop_event: HANDLE, sender: NativeEventSender) {
         let mut directory = Some(directory);
-        loop {
-            let Some(directory_handle) = directory else {
-                break;
-            };
+        while let Some(directory_handle) = directory {
             let mut buffer = [0u8; BUFFER_SIZE];
             let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
             let read_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };

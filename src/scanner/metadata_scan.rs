@@ -431,18 +431,17 @@ fn scan_metadata_root_from_file_list<'a>(
     let normalized_dirty_directories = dirty_directories
         .map(|directories| normalize_dirty_directories(directories, &normalized_root_path))
         .filter(|directories| !directories.is_empty());
-    let dirty_refresh_context = normalized_dirty_directories
-        .as_deref()
-        .filter(|directories| {
-            !directories
-                .iter()
-                .any(|directory| directory == &normalized_root_path)
-        })
-        .and_then(|directories| {
-            previous_cache
-                .filter(|cache| cache.is_current_schema())
-                .map(|cache| (cache, directories))
-        });
+    let dirty_refresh_context = previous_cache
+        .filter(|cache| cache.is_current_schema())
+        .zip(
+            normalized_dirty_directories
+                .as_deref()
+                .filter(|directories| {
+                    !directories
+                        .iter()
+                        .any(|directory| directory == &normalized_root_path)
+                }),
+        );
     let mut state = MetadataWalkState {
         root,
         root_path: Arc::new(root.path.clone()),
