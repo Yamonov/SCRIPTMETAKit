@@ -153,7 +153,17 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.1.0")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.1.1")
+    }
+
+    func testRuntimeAcknowledgementsContainKitAndRustDependencyLicenses() {
+        let acknowledgements = ScriptMetaKitRuntime.acknowledgementsText
+
+        XCTAssertFalse(acknowledgements.isEmpty)
+        XCTAssertTrue(acknowledgements.contains("SCRIPTMETAKit Acknowledgements"))
+        XCTAssertTrue(acknowledgements.contains("Rust Dependency Licenses"))
+        XCTAssertTrue(acknowledgements.contains("Apache License"))
+        XCTAssertTrue(acknowledgements.contains("- reqwest "))
     }
 
     func testVersionAndEditPasswordUtilityAPIsArePublic() throws {

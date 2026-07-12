@@ -14,6 +14,10 @@ jobs:
         with:
           toolchain: 1.94.0
           components: clippy,rustfmt
+      - name: Install cargo-about
+        run: cargo install --locked --features cli --version 0.9.1 cargo-about
+      - name: Verify third-party licenses
+        run: ./script/generate_third_party_licenses.sh --check
       - name: Rust formatting
         run: cargo fmt --all --check
       - name: Rust default feature boundary

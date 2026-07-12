@@ -19,7 +19,10 @@ let package = Package(
         ),
         .target(
             name: "ScriptMetaKit",
-            dependencies: ["ScriptMetaKitFFI"]
+            dependencies: ["ScriptMetaKitFFI"],
+            resources: [
+                .process("Resources")
+            ]
         ),
         .testTarget(
             name: "ScriptMetaKitTests",

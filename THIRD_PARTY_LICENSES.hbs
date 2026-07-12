@@ -1,0 +1,18 @@
+Rust Dependency Licenses
+========================
+
+This document is generated from Cargo.lock for the macOS release targets.
+Do not edit it directly. Run script/generate_third_party_licenses.sh instead.
+
+{{#each licenses}}
+-------------------------------------------------------------------------------
+{{name}} (SPDX: {{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

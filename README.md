@@ -8,9 +8,15 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.1.0`
-- Rust FFI crate: `scriptmetakit_ffi` `1.1.0`
+- Rust crate: `scriptmetakit` `1.1.1`
+- Rust FFI crate: `scriptmetakit_ffi` `1.1.1`
 - Swift package product: `ScriptMetaKit`
+
+## 1.1.1
+
+- Bundles the macOS Rust dependency acknowledgements as a Swift Package resource.
+- Exposes the generated text through `ScriptMetaKitRuntime.acknowledgementsText`.
+- Verifies in CI that `THIRD_PARTY_LICENSES.txt` matches `Cargo.lock`.
 
 ## 1.1.0
 
@@ -63,6 +69,26 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 - Fixes update diagnostics for multi-script `SCRIPTMETA-DIST` blocks when the requested `Script-ID` is missing.
 - The resolver now reports the requested missing `Script-ID` instead of reusing another entry's `Script-ID`.
+
+## Third-Party Licenses
+
+The Swift package bundles `THIRD_PARTY_LICENSES.txt` and exposes it through
+`ScriptMetaKitRuntime.acknowledgementsText`. The generated document contains
+the SCRIPTMETAKit license and the licenses of Rust crates used by the macOS
+release targets.
+
+Regenerate the document after changing `Cargo.lock`:
+
+```sh
+cargo install --locked --features cli --version 0.9.1 cargo-about
+./script/generate_third_party_licenses.sh
+```
+
+Verify that the committed resource is current:
+
+```sh
+./script/generate_third_party_licenses.sh --check
+```
 
 ## License
 
