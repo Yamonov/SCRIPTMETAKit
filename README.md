@@ -8,9 +8,15 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.1.1`
-- Rust FFI crate: `scriptmetakit_ffi` `1.1.1`
+- Rust crate: `scriptmetakit` `1.1.2`
+- Rust FFI crate: `scriptmetakit_ffi` `1.1.2`
 - Swift package product: `ScriptMetaKit`
+
+## 1.1.2
+
+- Adds `ScriptMetaKitRuntime.acknowledgementsSummaryText` for concise About-screen component listings.
+- Keeps complete license texts and notices available through `ScriptMetaKitRuntime.acknowledgementsText`.
+- Generates and verifies both acknowledgement resources from the macOS release dependency graph.
 
 ## 1.1.1
 
@@ -72,10 +78,15 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Third-Party Licenses
 
-The Swift package bundles `THIRD_PARTY_LICENSES.txt` and exposes it through
-`ScriptMetaKitRuntime.acknowledgementsText`. The generated document contains
-the SCRIPTMETAKit license and the licenses of Rust crates used by the macOS
-release targets.
+The Swift package provides two generated acknowledgement resources:
+
+- `ScriptMetaKitRuntime.acknowledgementsSummaryText` is a concise component
+  index for an application's About screen. It contains package names, versions,
+  SPDX license expressions, and upstream repository links.
+- `ScriptMetaKitRuntime.acknowledgementsText` contains the complete
+  SCRIPTMETAKit license plus the license texts and notices of Rust crates used
+  by the macOS release targets. Applications should make this complete text
+  available from a license-details action.
 
 Regenerate the document after changing `Cargo.lock`:
 
