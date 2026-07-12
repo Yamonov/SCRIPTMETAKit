@@ -102,6 +102,14 @@ pub struct SmkRootSnapshot {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SmkRootSnapshotRevision {
+    pub root_index: usize,
+    pub workspace_epoch: SmkUtf8Slice,
+    pub sequence: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmkRootRegistration {
     pub root_id: SmkUtf8Slice,
     pub path: SmkUtf8Slice,
@@ -204,6 +212,15 @@ pub struct SmkFileListSnapshot {
     pub first_child_index: usize,
     pub child_count: usize,
     pub truncated: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkFileListSnapshotDetails {
+    pub file_list_index: usize,
+    pub has_children: u8,
+    pub workspace_epoch: SmkUtf8Slice,
+    pub content_sequence: u64,
 }
 
 #[repr(C)]
@@ -426,6 +443,13 @@ pub struct SmkRootSnapshotSlice {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SmkRootSnapshotRevisionSlice {
+    pub ptr: *const SmkRootSnapshotRevision,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmkRegisteredRootSignatureSlice {
     pub ptr: *const SmkRegisteredRootSignature,
     pub len: usize,
@@ -435,6 +459,13 @@ pub struct SmkRegisteredRootSignatureSlice {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SmkFileListSnapshotSlice {
     pub ptr: *const SmkFileListSnapshot,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkFileListSnapshotDetailsSlice {
+    pub ptr: *const SmkFileListSnapshotDetails,
     pub len: usize,
 }
 
@@ -558,6 +589,14 @@ pub struct SmkWatchChangeInfo {
     pub ignored_path_count: usize,
     pub rename_candidate_count: usize,
     pub rescan_target_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchDeliveryInfo {
+    pub is_watch_update: u8,
+    pub is_reconciliation: u8,
+    pub covers_all_watched_roots: u8,
 }
 
 #[repr(C)]
@@ -733,7 +772,6 @@ pub struct SmkEngine {
 struct SmkEngineState {
     engine: ScriptMetaKitEngine,
     last_error: Vec<u8>,
-    saved_cache_fingerprints: BTreeMap<PathBuf, String>,
     #[cfg(feature = "native-watch")]
     watch_reconcile_pending: bool,
     #[cfg(feature = "native-watch")]
@@ -749,7 +787,9 @@ pub struct SmkScanResult {
     catalog_info: SmkCatalogInfo,
     registered_root_signatures: Vec<SmkRegisteredRootSignature>,
     roots: Vec<SmkRootSnapshot>,
+    root_revisions: Vec<SmkRootSnapshotRevision>,
     file_lists: Vec<SmkFileListSnapshot>,
+    file_list_details: Vec<SmkFileListSnapshotDetails>,
     file_list_directory_state_ranges: Vec<SmkFileListDirectoryStateRange>,
     file_entries: Vec<SmkFileEntry>,
     directory_states: Vec<SmkDirectoryStateEntry>,
@@ -767,6 +807,7 @@ pub struct SmkScanResult {
     operation_info: SmkOperationInfo,
     file_issues: Vec<SmkFileIssue>,
     watch_info: SmkWatchChangeInfo,
+    watch_delivery_info: SmkWatchDeliveryInfo,
     watch_events: Vec<SmkWatchPathEvent>,
     ignored_watch_paths: Vec<SmkIgnoredWatchPath>,
     watch_rename_candidates: Vec<SmkWatchRenameCandidate>,
@@ -872,7 +913,6 @@ pub unsafe extern "C" fn smk_engine_create_default(out_engine: *mut *mut SmkEngi
             state: Mutex::new(SmkEngineState {
                 engine,
                 last_error: Vec::new(),
-                saved_cache_fingerprints: BTreeMap::new(),
                 #[cfg(feature = "native-watch")]
                 watch_reconcile_pending: false,
                 #[cfg(feature = "native-watch")]
@@ -2209,22 +2249,53 @@ pub unsafe extern "C" fn smk_engine_save_cache_file(
 
         let scope = cache_scope_from_u32(scope)?;
         let cache_path = path_from_slice(cache_path)?;
-        let payload = engine.engine.export_cache(scope).map_err(|error| {
-            let message = error.to_string();
-            engine.set_error(&message);
-            (SmkStatus::EngineError, message)
-        })?;
+        let (existing_payload, existing_fingerprint, existing_load_error) = if cache_path.is_file()
+        {
+            match load_cache_payload(&cache_path) {
+                Ok(payload) => match cache_payload_content_fingerprint(&payload) {
+                    Ok(fingerprint) => (Some(payload), Some(fingerprint), None),
+                    Err(error) => (None, None, Some(error.to_string())),
+                },
+                Err(error) => (None, None, Some(error.to_string())),
+            }
+        } else {
+            (None, None, None)
+        };
+        let had_valid_existing_payload = existing_payload.is_some();
+        let payload = match engine.engine.export_cache_merged(scope, existing_payload) {
+            Ok(payload) => payload,
+            Err(merge_error) if had_valid_existing_payload => {
+                match engine.engine.export_cache_merged(scope, None) {
+                    Ok(payload) => payload,
+                    Err(standalone_error) => {
+                        let message = format!(
+                            "existing cache cannot be merged ({merge_error}); resident cache cannot replace it ({standalone_error})"
+                        );
+                        engine.set_error(&message);
+                        return Err((SmkStatus::EngineError, message));
+                    }
+                }
+            }
+            Err(export_error) => {
+                let message = existing_load_error.map_or_else(
+                    || export_error.to_string(),
+                    |load_error| {
+                        format!(
+                            "existing cache cannot be loaded ({load_error}); resident cache cannot replace it ({export_error})"
+                        )
+                    },
+                );
+                engine.set_error(&message);
+                return Err((SmkStatus::EngineError, message));
+            }
+        };
         let fingerprint = cache_payload_content_fingerprint(&payload).map_err(|error| {
             let message = error.to_string();
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })?;
-        if engine
-            .saved_cache_fingerprints
-            .get(&cache_path)
-            .is_some_and(|saved| saved == &fingerprint)
-            && cache_path.is_file()
-        {
+        if existing_fingerprint.as_ref() == Some(&fingerprint) && cache_path.is_file() {
+            engine.engine.mark_cache_persisted(scope);
             return Ok(());
         }
         save_cache_payload(&cache_path, &payload).map_err(|error| {
@@ -2232,9 +2303,7 @@ pub unsafe extern "C" fn smk_engine_save_cache_file(
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })?;
-        engine
-            .saved_cache_fingerprints
-            .insert(cache_path, fingerprint);
+        engine.engine.mark_cache_persisted(scope);
         Ok(())
     });
 
@@ -2452,6 +2521,25 @@ pub unsafe extern "C" fn smk_scan_result_roots(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `result` must be a live scan result and `out_revisions` must be writable.
+/// The returned slice remains valid only until `result` is freed.
+pub unsafe extern "C" fn smk_scan_result_root_revisions(
+    result: *const SmkScanResult,
+    out_revisions: *mut SmkRootSnapshotRevisionSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        *out_mut(out_revisions)? = SmkRootSnapshotRevisionSlice {
+            ptr: result.root_revisions.as_ptr(),
+            len: result.root_revisions.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `result` must be a live scan result handle. `out_info` must be a valid,
 /// writable pointer.
 pub unsafe extern "C" fn smk_scan_result_catalog_info(
@@ -2503,6 +2591,25 @@ pub unsafe extern "C" fn smk_scan_result_file_lists(
         *out_file_lists = SmkFileListSnapshotSlice {
             ptr: result.file_lists.as_ptr(),
             len: result.file_lists.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result and `out_details` must be writable.
+/// The returned slice remains valid only until `result` is freed.
+pub unsafe extern "C" fn smk_scan_result_file_list_details(
+    result: *const SmkScanResult,
+    out_details: *mut SmkFileListSnapshotDetailsSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        *out_mut(out_details)? = SmkFileListSnapshotDetailsSlice {
+            ptr: result.file_list_details.as_ptr(),
+            len: result.file_list_details.len(),
         };
         Ok(())
     })
@@ -2836,6 +2943,21 @@ pub unsafe extern "C" fn smk_scan_result_watch_change_info(
         let result = scan_result_ref(result)?;
         let out_info = out_mut(out_info)?;
         *out_info = result.watch_info;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle and `out_info` must be writable.
+pub unsafe extern "C" fn smk_scan_result_watch_delivery_info(
+    result: *const SmkScanResult,
+    out_info: *mut SmkWatchDeliveryInfo,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        *out_mut(out_info)? = result.watch_delivery_info;
         Ok(())
     })
 }
@@ -3730,7 +3852,8 @@ fn poll_watcher_scan(
             batch = Some(next_batch);
         }
     }
-    if engine.watch_reconcile_pending {
+    let plan_reconciliation = engine.watch_reconcile_pending;
+    if plan_reconciliation {
         let reconcile_paths = engine
             .watch_plan
             .as_ref()
@@ -3754,6 +3877,7 @@ fn poll_watcher_scan(
     let Some(mut batch) = batch else {
         return Ok(None);
     };
+    let is_reconciliation = plan_reconciliation || batch.overflowed;
     batch.paths.sort();
     batch.paths.dedup();
 
@@ -3784,6 +3908,24 @@ fn poll_watcher_scan(
     if dirty_only {
         filter_dirty_scan_result(&mut scan_result, &affected_root_ids);
     }
+    let result_root_ids = scan_result
+        .roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<BTreeSet<_>>();
+    let watched_root_ids = engine
+        .watch_plan
+        .as_ref()
+        .map(|plan| {
+            plan.logical_roots
+                .iter()
+                .filter(|root| root.active && root.physical_index.is_some())
+                .map(|root| root.root_id.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    scan_result.watch_reconciliation = is_reconciliation;
+    scan_result.watch_covers_all_roots = watched_root_ids.is_subset(&result_root_ids);
     scan_result.watch_change_batch = Some(change_batch);
     Ok(Some(SmkScanResult::from_scan_result(scan_result, None)))
 }
@@ -3857,7 +3999,9 @@ impl SmkScanResult {
                     Vec::with_capacity(snapshot.candidate_cache.registered_roots.len())
                 }),
             roots: Vec::with_capacity(scan_result.roots.len()),
+            root_revisions: Vec::with_capacity(scan_result.roots.len()),
             file_lists: Vec::with_capacity(scan_result.file_list_snapshots.len()),
+            file_list_details: Vec::with_capacity(scan_result.file_list_snapshots.len()),
             file_list_directory_state_ranges: Vec::with_capacity(
                 scan_result.file_list_snapshots.len(),
             ),
@@ -3898,6 +4042,11 @@ impl SmkScanResult {
             operation_info: SmkOperationInfo::default(),
             file_issues: Vec::with_capacity(scan_result.file_issues.len()),
             watch_info: SmkWatchChangeInfo::default(),
+            watch_delivery_info: SmkWatchDeliveryInfo {
+                is_watch_update: bool_byte(scan_result.watch_change_batch.is_some()),
+                is_reconciliation: bool_byte(scan_result.watch_reconciliation),
+                covers_all_watched_roots: bool_byte(scan_result.watch_covers_all_roots),
+            },
             watch_events: Vec::new(),
             ignored_watch_paths: Vec::new(),
             watch_rename_candidates: Vec::new(),
@@ -3967,7 +4116,9 @@ impl SmkScanResult {
             catalog_info: SmkCatalogInfo::default(),
             registered_root_signatures: Vec::new(),
             roots: Vec::new(),
+            root_revisions: Vec::new(),
             file_lists: Vec::new(),
+            file_list_details: Vec::new(),
             file_list_directory_state_ranges: Vec::new(),
             file_entries: Vec::new(),
             directory_states: Vec::new(),
@@ -3985,6 +4136,7 @@ impl SmkScanResult {
             operation_info: SmkOperationInfo::default(),
             file_issues: Vec::new(),
             watch_info: SmkWatchChangeInfo::default(),
+            watch_delivery_info: SmkWatchDeliveryInfo::default(),
             watch_events: Vec::new(),
             ignored_watch_paths: Vec::new(),
             watch_rename_candidates: Vec::new(),
@@ -3997,6 +4149,7 @@ impl SmkScanResult {
     }
 
     fn push_root(&mut self, root: &RootSnapshot) {
+        let root_index = self.roots.len();
         let (has_last_loaded_at, last_loaded_at) = optional_u64(root.last_loaded_at);
         let (has_last_event_at, last_event_at) = optional_u64(root.last_event_at);
         let ffi_root = SmkRootSnapshot {
@@ -4014,6 +4167,12 @@ impl SmkScanResult {
                 .push_string(root.error.as_ref().map(|error| error.message.as_str())),
         };
         self.roots.push(ffi_root);
+        let workspace_epoch = self.push_string(Some(&root.state_revision.workspace_epoch));
+        self.root_revisions.push(SmkRootSnapshotRevision {
+            root_index,
+            workspace_epoch,
+            sequence: root.state_revision.sequence,
+        });
     }
 
     fn push_catalog_info(&mut self, snapshot: &ScriptMetaCatalogSnapshot) {
@@ -4085,11 +4244,19 @@ impl SmkScanResult {
             .get(snapshot.root.root_id.as_ref())
             .copied()
             .unwrap_or(usize::MAX);
+        let file_list_index = self.file_lists.len();
         self.file_lists.push(SmkFileListSnapshot {
             root_index,
             first_child_index,
             child_count,
             truncated: bool_byte(snapshot.truncated),
+        });
+        let workspace_epoch = self.push_string(Some(&snapshot.content_revision.workspace_epoch));
+        self.file_list_details.push(SmkFileListSnapshotDetails {
+            file_list_index,
+            has_children: bool_byte(snapshot.children.is_some()),
+            workspace_epoch,
+            content_sequence: snapshot.content_revision.sequence,
         });
     }
 
@@ -4805,7 +4972,9 @@ fn total_string_bytes(
                     )
                 })
                 .sum::<usize>();
-            entry_bytes.saturating_add(directory_state_bytes)
+            entry_bytes
+                .saturating_add(directory_state_bytes)
+                .saturating_add(snapshot.content_revision.workspace_epoch.len())
         })
         .sum::<usize>();
     let item_bytes = scan_result.catalog_snapshot.as_ref().map_or(0, |snapshot| {
@@ -4875,6 +5044,7 @@ fn root_string_bytes(root: &RootSnapshot) -> usize {
     root.root_id
         .len()
         .saturating_add(root.path.to_string_lossy().len())
+        .saturating_add(root.state_revision.workspace_epoch.len())
         .saturating_add(root.error.as_ref().map_or(0, |error| {
             error.code.len().saturating_add(error.message.len())
         }))
@@ -5976,6 +6146,32 @@ fn script_meta_backup_reason_string(reason: ScriptMetaBackupReason) -> &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn legacy_snapshot_struct_layout_is_unchanged() {
+        assert_eq!(std::mem::size_of::<SmkRootSnapshot>(), 120);
+        assert_eq!(std::mem::align_of::<SmkRootSnapshot>(), 8);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, root_id), 0);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, path), 16);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, status), 32);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, is_dirty), 48);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, last_loaded_at), 56);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, last_event_at), 72);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, item_count), 80);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, error_code), 88);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, error_message), 104);
+
+        assert_eq!(std::mem::size_of::<SmkFileListSnapshot>(), 32);
+        assert_eq!(std::mem::align_of::<SmkFileListSnapshot>(), 8);
+        assert_eq!(std::mem::offset_of!(SmkFileListSnapshot, root_index), 0);
+        assert_eq!(
+            std::mem::offset_of!(SmkFileListSnapshot, first_child_index),
+            8
+        );
+        assert_eq!(std::mem::offset_of!(SmkFileListSnapshot, child_count), 16);
+        assert_eq!(std::mem::offset_of!(SmkFileListSnapshot, truncated), 24);
+    }
 
     fn slice_text(slice: SmkUtf8Slice) -> String {
         if slice.len == 0 {

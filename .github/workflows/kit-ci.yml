@@ -1,4 +1,4 @@
-name: SCRIPTMETAKit macOS
+name: SCRIPTMETAKit
 
 on:
   push:
@@ -42,3 +42,22 @@ jobs:
         run: swift test -Xswiftc -swift-version -Xswiftc 5
       - name: Swift 6 strict concurrency
         run: swift test -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -strict-concurrency=complete
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: clippy,rustfmt
+      - name: Rust default feature boundary
+        run: cargo check --workspace --no-default-features
+      - name: Rust all feature boundary
+        run: cargo check --workspace --all-features
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace --all-features
+      - name: Build release FFI DLL
+        run: cargo build -p scriptmetakit_ffi --features blocking-http,native-watch --release

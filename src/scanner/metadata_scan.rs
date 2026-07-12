@@ -1425,10 +1425,14 @@ fn should_skip_path(path: &Path, options: &ScannerOptions) -> bool {
 }
 
 fn is_package_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some("app" | "bundle" | "framework" | "plugin" | "appex")
-    )
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "app" | "bundle" | "framework" | "plugin" | "appex"
+            )
+        })
 }
 
 fn missing_root_error() -> RootError {
@@ -1610,6 +1614,7 @@ mod tests {
             children: Some(file_list.children),
             directory_states: file_list.directory_states,
             truncated: file_list.truncated,
+            content_revision: Default::default(),
         };
         let shared = scan_metadata_roots_scoped_with_file_lists_controlled(
             [&root],
@@ -1673,6 +1678,7 @@ mod tests {
             children: Some(initial_file_list.children),
             directory_states: initial_file_list.directory_states,
             truncated: initial_file_list.truncated,
+            content_revision: Default::default(),
         };
 
         fs::write(
@@ -1694,6 +1700,7 @@ mod tests {
             children: Some(refreshed_file_list.children),
             directory_states: refreshed_file_list.directory_states,
             truncated: refreshed_file_list.truncated,
+            content_revision: Default::default(),
         };
         let dirty_by_root = BTreeMap::from([(root.root_id.clone(), dirty_directories)]);
 
@@ -1746,5 +1753,11 @@ mod tests {
         assert_eq!(output.roots[0].status, RootStatus::Overflowed);
         assert_eq!(output.roots[0].item_count, 0);
         assert!(output.candidate_cache.records.is_empty());
+    }
+
+    #[test]
+    fn package_detection_is_case_insensitive() {
+        assert!(is_package_path(Path::new("Example.APP")));
+        assert!(is_package_path(Path::new("Example.Framework")));
     }
 }

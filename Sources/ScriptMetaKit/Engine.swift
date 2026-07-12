@@ -162,6 +162,12 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         try await setVisibleRoot(nil)
     }
 
+    func failNextWatcherStartForTesting() async throws {
+        try await runOperation { engineBox in
+            try engineBox.failNextWatcherStartForTesting()
+        }
+    }
+
     public func cancelCurrentOperation() {
         engineBox.cancelCurrentOperation()
     }
@@ -396,6 +402,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
 
 private nonisolated let smkStatusOK: Int32 = 0
 private nonisolated let smkStatusInvalidArgument: Int32 = 3
+private nonisolated let smkStatusEngineError: Int32 = 4
 private nonisolated let smkStatusConflict: Int32 = 6
 
 private nonisolated struct SmkUtf8Slice {
@@ -468,6 +475,12 @@ private nonisolated struct SmkRootSnapshot {
     var itemCount: Int
     var errorCode: SmkUtf8Slice
     var errorMessage: SmkUtf8Slice
+}
+
+private nonisolated struct SmkRootSnapshotRevision {
+    var rootIndex: Int
+    var workspaceEpoch: SmkUtf8Slice
+    var sequence: UInt64
 }
 
 private nonisolated struct SmkFileIdentity {
@@ -748,6 +761,12 @@ private nonisolated struct SmkWatchChangeInfo {
     }
 }
 
+private nonisolated struct SmkWatchDeliveryInfo {
+    var isWatchUpdate: UInt8 = 0
+    var isReconciliation: UInt8 = 0
+    var coversAllWatchedRoots: UInt8 = 0
+}
+
 private nonisolated struct SmkWatchPathEvent {
     var rootID: SmkUtf8Slice
     var path: SmkUtf8Slice
@@ -801,6 +820,33 @@ private nonisolated struct SmkFileListSnapshotSlice {
     var len: Int
 
     init(ptr: UnsafePointer<SmkFileListSnapshot>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
+private nonisolated struct SmkRootSnapshotRevisionSlice {
+    var ptr: UnsafePointer<SmkRootSnapshotRevision>?
+    var len: Int
+
+    init(ptr: UnsafePointer<SmkRootSnapshotRevision>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
+private nonisolated struct SmkFileListSnapshotDetails {
+    var fileListIndex: Int
+    var hasChildren: UInt8
+    var workspaceEpoch: SmkUtf8Slice
+    var contentSequence: UInt64
+}
+
+private nonisolated struct SmkFileListSnapshotDetailsSlice {
+    var ptr: UnsafePointer<SmkFileListSnapshotDetails>?
+    var len: Int
+
+    init(ptr: UnsafePointer<SmkFileListSnapshotDetails>? = nil, len: Int = 0) {
         self.ptr = ptr
         self.len = len
     }
@@ -1509,6 +1555,9 @@ private nonisolated func smk_engine_poll_watcher_scan_dirty_only(
 @_silgen_name("smk_scan_result_roots")
 private nonisolated func smk_scan_result_roots(_ result: OpaquePointer?, _ outRoots: UnsafeMutablePointer<SmkRootSnapshotSlice>) -> Int32
 
+@_silgen_name("smk_scan_result_root_revisions")
+private nonisolated func smk_scan_result_root_revisions(_ result: OpaquePointer?, _ outRevisions: UnsafeMutablePointer<SmkRootSnapshotRevisionSlice>) -> Int32
+
 @_silgen_name("smk_scan_result_catalog_info")
 private nonisolated func smk_scan_result_catalog_info(_ result: OpaquePointer?, _ outInfo: UnsafeMutablePointer<SmkCatalogInfo>) -> Int32
 
@@ -1520,6 +1569,9 @@ private nonisolated func smk_scan_result_registered_root_signatures(
 
 @_silgen_name("smk_scan_result_file_lists")
 private nonisolated func smk_scan_result_file_lists(_ result: OpaquePointer?, _ outFileLists: UnsafeMutablePointer<SmkFileListSnapshotSlice>) -> Int32
+
+@_silgen_name("smk_scan_result_file_list_details")
+private nonisolated func smk_scan_result_file_list_details(_ result: OpaquePointer?, _ outDetails: UnsafeMutablePointer<SmkFileListSnapshotDetailsSlice>) -> Int32
 
 @_silgen_name("smk_scan_result_file_entries")
 private nonisolated func smk_scan_result_file_entries(_ result: OpaquePointer?, _ outFileEntries: UnsafeMutablePointer<SmkFileEntrySlice>) -> Int32
@@ -1580,6 +1632,9 @@ private nonisolated func smk_scan_result_file_issues(_ result: OpaquePointer?, _
 
 @_silgen_name("smk_scan_result_watch_change_info")
 private nonisolated func smk_scan_result_watch_change_info(_ result: OpaquePointer?, _ outInfo: UnsafeMutablePointer<SmkWatchChangeInfo>) -> Int32
+
+@_silgen_name("smk_scan_result_watch_delivery_info")
+private nonisolated func smk_scan_result_watch_delivery_info(_ result: OpaquePointer?, _ outInfo: UnsafeMutablePointer<SmkWatchDeliveryInfo>) -> Int32
 
 @_silgen_name("smk_scan_result_watch_events")
 private nonisolated func smk_scan_result_watch_events(_ result: OpaquePointer?, _ outEvents: UnsafeMutablePointer<SmkWatchPathEventSlice>) -> Int32
@@ -1805,6 +1860,8 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
     private var engine: ScriptMetaKitFFIEngine?
     private var cancellationEngine: ScriptMetaKitFFIEngine?
     private var watchNotificationSink: ScriptMetaKitWatchNotificationSink?
+    private var visibleRootID: String?
+    private var shouldFailNextWatcherStartForTesting = false
 
     deinit {
         shutdown()
@@ -1915,6 +1972,8 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         let engineToRelease = engine
         engineToRelease?.stopWatching()
         watchNotificationSink = nil
+        visibleRootID = nil
+        shouldFailNextWatcherStartForTesting = false
         engine = nil
         lock.unlock()
 
@@ -1979,8 +2038,22 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
+        let previousRootID = visibleRootID
         try engine.setVisibleRoot(rootID)
-        try restartWatcherIfNeeded()
+        do {
+            try restartWatcherIfNeeded()
+            visibleRootID = rootID
+        } catch {
+            try? engine.setVisibleRoot(previousRootID)
+            throw error
+        }
+    }
+
+    func failNextWatcherStartForTesting() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        _ = try ensureEngineLocked()
+        shouldFailNextWatcherStartForTesting = true
     }
 
     public func scanRegisteredRoots(
@@ -2056,13 +2129,14 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
     private func restartWatcherIfNeeded() throws {
         guard let sink = watchNotificationSink, let engine else { return }
         guard try engine.watcherRequiresRestart() else { return }
-        engine.stopWatching()
-        do {
-            try engine.startWatching(notificationSink: sink)
-        } catch {
-            watchNotificationSink = nil
-            throw error
+        if shouldFailNextWatcherStartForTesting {
+            shouldFailNextWatcherStartForTesting = false
+            throw ScriptMetaKitError.operationFailed(
+                smkStatusEngineError,
+                "injected watcher start failure"
+            )
         }
+        try engine.startWatching(notificationSink: sink)
     }
 
     public func setResolveMacOSAlias(_ enabled: Bool) throws {
@@ -2628,6 +2702,14 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
     }
 
     public func setOperationalPolicy(_ policy: ScriptMetaKitOperationalPolicy) throws {
+        guard policy.maxConcurrentMetaURLChecks >= 0,
+              policy.retryAttempts >= 0,
+              policy.watcherMaxPendingPaths >= 0 else {
+            throw ScriptMetaKitError.operationFailed(
+                smkStatusInvalidArgument,
+                "operational policy limits must not be negative"
+            )
+        }
         var ffiPolicy = SmkOperationalPolicy(
             maxConcurrentMetaURLChecks: policy.maxConcurrentMetaURLChecks,
             retryAttempts: policy.retryAttempts,
@@ -3039,11 +3121,19 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
 private nonisolated func makeResult(from result: OpaquePointer) throws -> ScriptMetaScanResult {
     var rootSlice = SmkRootSnapshotSlice()
     try check(smk_scan_result_roots(result, &rootSlice))
-    let roots = buffer(from: rootSlice).map { root -> RootSnapshot in
+    var rootRevisionSlice = SmkRootSnapshotRevisionSlice()
+    try check(smk_scan_result_root_revisions(result, &rootRevisionSlice))
+    let rootRevisions = buffer(from: rootRevisionSlice)
+    try validateSnapshotSidecarIndices(
+        expectedCount: rootSlice.len,
+        indices: rootRevisions.map(\.rootIndex),
+        label: "root revision"
+    )
+    let roots = buffer(from: rootSlice).enumerated().map { index, root -> RootSnapshot in
         let code = string(root.errorCode)
         let message = string(root.errorMessage)
         let error = code.isEmpty && message.isEmpty ? nil : RootError(code: code, message: message)
-        return RootSnapshot(
+        var snapshot = RootSnapshot(
             rootID: string(root.rootID),
             path: string(root.path),
             status: string(root.status),
@@ -3053,6 +3143,11 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
             itemCount: root.itemCount,
             error: error
         )
+        snapshot.stateRevision = ScriptMetaKitRevision(
+            workspaceEpoch: string(rootRevisions[index].workspaceEpoch),
+            sequence: rootRevisions[index].sequence
+        )
+        return snapshot
     }
 
     var fileEntrySlice = SmkFileEntrySlice()
@@ -3069,6 +3164,14 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
 
     var fileListSlice = SmkFileListSnapshotSlice()
     try check(smk_scan_result_file_lists(result, &fileListSlice))
+    var fileListDetailsSlice = SmkFileListSnapshotDetailsSlice()
+    try check(smk_scan_result_file_list_details(result, &fileListDetailsSlice))
+    let fileListDetails = buffer(from: fileListDetailsSlice)
+    try validateSnapshotSidecarIndices(
+        expectedCount: fileListSlice.len,
+        indices: fileListDetails.map(\.fileListIndex),
+        label: "file-list details"
+    )
     let fileListSnapshots = buffer(from: fileListSlice).enumerated().map { index, snapshot -> FileListSnapshot in
         let root = roots.indices.contains(snapshot.rootIndex)
             ? roots[snapshot.rootIndex]
@@ -3085,13 +3188,14 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
         let directoryStateRange = ffiDirectoryStateRanges.indices.contains(index)
             ? ffiDirectoryStateRanges[index]
             : SmkFileListDirectoryStateRange(firstDirectoryStateIndex: 0, directoryStateCount: 0)
-        return FileListSnapshot(
+        let details = fileListDetails[index]
+        var fileList = FileListSnapshot(
             root: root,
-            children: fileEntries(
+            children: details.hasChildren != 0 ? fileEntries(
                 from: ffiFileEntries,
                 firstIndex: snapshot.firstChildIndex,
                 count: snapshot.childCount
-            ),
+            ) : nil,
             directoryStates: directoryStates(
                 from: ffiDirectoryStates,
                 firstIndex: directoryStateRange.firstDirectoryStateIndex,
@@ -3099,6 +3203,11 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
             ),
             truncated: snapshot.truncated != 0
         )
+        fileList.contentRevision = ScriptMetaKitRevision(
+            workspaceEpoch: string(details.workspaceEpoch),
+            sequence: details.contentSequence
+        )
+        return fileList
     }
 
     var itemSlice = SmkScriptItemSlice()
@@ -3134,6 +3243,8 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
         catalog = nil
     }
 
+    var watchDeliveryInfo = SmkWatchDeliveryInfo()
+    try check(smk_scan_result_watch_delivery_info(result, &watchDeliveryInfo))
     return ScriptMetaScanResult(
         roots: roots,
         fileListSnapshots: fileListSnapshots,
@@ -3142,8 +3253,28 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
         fileIssues: fileIssues,
         updateCheckResult: updateCheckResult,
         changeSummary: changeSummary,
-        watchChangeBatch: try watchChangeBatch(from: result)
+        watchChangeBatch: try watchChangeBatch(from: result),
+        watchDelivery: watchDeliveryInfo.isWatchUpdate != 0 ? ScriptMetaKitWatchDelivery(
+            isReconciliation: watchDeliveryInfo.isReconciliation != 0,
+            coversAllWatchedRoots: watchDeliveryInfo.coversAllWatchedRoots != 0,
+            streamID: nil,
+            sequence: nil
+        ) : nil
     )
+}
+
+nonisolated func validateSnapshotSidecarIndices(
+    expectedCount: Int,
+    indices: [Int],
+    label: String
+) throws {
+    guard indices.count == expectedCount,
+          indices.enumerated().allSatisfy({ $0.offset == $0.element }) else {
+        throw ScriptMetaKitError.operationFailed(
+            smkStatusInvalidArgument,
+            "invalid \(label) sidecar"
+        )
+    }
 }
 
 private nonisolated func catalogInfo(from result: OpaquePointer) throws -> SmkCatalogInfo {
@@ -3801,8 +3932,8 @@ private nonisolated func fileEntries(
 
 private nonisolated func safeRange(start: Int, count: Int, upperBound: Int) -> Range<Int>? {
     guard start >= 0, count >= 0, start <= upperBound else { return nil }
-    let end = start + count
-    guard end >= start, end <= upperBound else { return nil }
+    let (end, overflowed) = start.addingReportingOverflow(count)
+    guard !overflowed, end >= start, end <= upperBound else { return nil }
     return start..<end
 }
 
@@ -3826,6 +3957,10 @@ private nonisolated func buffer(from slice: SmkRootSnapshotSlice) -> UnsafeBuffe
     buffer(ptr: slice.ptr, len: slice.len)
 }
 
+private nonisolated func buffer(from slice: SmkRootSnapshotRevisionSlice) -> UnsafeBufferPointer<SmkRootSnapshotRevision> {
+    buffer(ptr: slice.ptr, len: slice.len)
+}
+
 private nonisolated func array(from slice: SmkRegisteredRootSignatureSlice) -> [SmkRegisteredRootSignature] {
     copyArray(ptr: slice.ptr, len: slice.len)
 }
@@ -3835,6 +3970,10 @@ private nonisolated func array(from slice: SmkFileListSnapshotSlice) -> [SmkFile
 }
 
 private nonisolated func buffer(from slice: SmkFileListSnapshotSlice) -> UnsafeBufferPointer<SmkFileListSnapshot> {
+    buffer(ptr: slice.ptr, len: slice.len)
+}
+
+private nonisolated func buffer(from slice: SmkFileListSnapshotDetailsSlice) -> UnsafeBufferPointer<SmkFileListSnapshotDetails> {
     buffer(ptr: slice.ptr, len: slice.len)
 }
 

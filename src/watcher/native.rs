@@ -316,12 +316,15 @@ fn path_has_package_component(path: &Path, watch_roots: &[PathBuf]) -> bool {
         .components()
         .any(|component| {
             let component_path = Path::new(component.as_os_str());
-            matches!(
-                component_path
-                    .extension()
-                    .and_then(|extension| extension.to_str()),
-                Some("app" | "bundle" | "framework" | "plugin" | "appex")
-            )
+            component_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "app" | "bundle" | "framework" | "plugin" | "appex"
+                    )
+                })
         })
 }
 
@@ -786,12 +789,38 @@ mod platform {
                 | fs::kFSEventStreamEventFlagUnmount)
             != 0;
         let identifies_folder = flags & fs::kFSEventStreamEventFlagItemIsDir != 0;
+        let removes_path = flags
+            & (fs::kFSEventStreamEventFlagItemRemoved | fs::kFSEventStreamEventFlagItemRenamed)
+            != 0;
 
         NativeFsEvent::Changed {
             path,
             may_change_directory_tree,
             identifies_folder,
-            removes_path: false,
+            removes_path,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::PathBuf;
+
+        use super::{NativeFsEvent, event_from_flags, fs};
+
+        #[test]
+        fn removed_fsevent_keeps_deleted_paths_for_reconciliation() {
+            let event = event_from_flags(
+                PathBuf::from("/tmp/folder.data"),
+                fs::kFSEventStreamEventFlagItemRemoved,
+            );
+
+            assert!(matches!(
+                event,
+                NativeFsEvent::Changed {
+                    removes_path: true,
+                    ..
+                }
+            ));
         }
     }
 }

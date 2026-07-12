@@ -1700,6 +1700,7 @@ fn load_backup_index(
                     index.schema_version
                 )));
             }
+            validate_backup_file_names(&index.generations)?;
             index.file_id = file_id;
             index.original_path = original_path;
             index.file_name = file_name;
@@ -1750,6 +1751,9 @@ fn legacy_scripta_backup_index(
             "unsupported legacy backup schema {}",
             legacy_index.schema_version
         )));
+    }
+    for record in &legacy_index.generations {
+        validate_backup_file_name(&record.backup_file_name)?;
     }
 
     let backup_directory = backup_generations_directory(path, options);
@@ -1835,6 +1839,25 @@ fn legacy_scripta_backup_reason(reason: &str) -> ScriptMetaBackupReason {
         "resetInitial" => ScriptMetaBackupReason::ResetInitial,
         _ => ScriptMetaBackupReason::BeforeSave,
     }
+}
+
+fn validate_backup_file_names(records: &[ScriptMetaBackupIndexRecord]) -> ScriptMetaKitResult<()> {
+    for record in records {
+        validate_backup_file_name(&record.backup_file_name)?;
+    }
+    Ok(())
+}
+
+fn validate_backup_file_name(file_name: &str) -> ScriptMetaKitResult<()> {
+    let mut components = Path::new(file_name).components();
+    let is_single_file_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !is_single_file_name {
+        return Err(ScriptMetaKitError::Cache(format!(
+            "backup file name `{file_name}` must not contain a directory path"
+        )));
+    }
+    Ok(())
 }
 
 fn scriptmeta_backup_record_from_index(
@@ -2374,13 +2397,14 @@ mod tests {
     use super::{
         DistributionMetadataDraft, ScriptIdUniquenessItem, ScriptMetaBackupOptions,
         ScriptMetaBackupReason, ScriptMetaCommentStyle, ScriptMetaWriteMode, ScriptMetadataDraft,
-        append_script_metadata_to_text, backup_file_directory, clear_scriptmeta_backups,
-        create_scriptmeta_backup, generate_edit_password_sha256, is_valid_edit_password_sha256,
-        read_script_metadata_draft_from_file, render_distribution_metadata_block,
-        render_script_metadata_for_style, reset_scriptmeta_backups_with_current_as_initial,
-        restore_scriptmeta_backup, scriptmeta_backup_generations, validate_script_id_uniqueness,
-        verify_edit_password_sha256, write_script_metadata_to_file,
-        write_script_metadata_to_file_if_unchanged, write_script_metadata_to_text,
+        append_script_metadata_to_text, backup_file_directory, backup_index_path,
+        clear_scriptmeta_backups, create_scriptmeta_backup, generate_edit_password_sha256,
+        is_valid_edit_password_sha256, read_script_metadata_draft_from_file,
+        render_distribution_metadata_block, render_script_metadata_for_style,
+        reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
+        scriptmeta_backup_generations, validate_script_id_uniqueness, verify_edit_password_sha256,
+        write_script_metadata_to_file, write_script_metadata_to_file_if_unchanged,
+        write_script_metadata_to_text,
     };
     use crate::core::{parse_distribution_metadata_for_script, parse_script_metadata};
 
@@ -2665,6 +2689,45 @@ mod tests {
         );
 
         clear_scriptmeta_backups(&script_path, &backup_options).expect("clear backups");
+    }
+
+    #[test]
+    fn rejects_backup_index_paths_outside_the_generation_directory() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("example.jsx");
+        fs::write(&script_path, "alert('current');\n").expect("write script");
+        let backup_options = ScriptMetaBackupOptions {
+            root_directory: directory.path().join("backups"),
+        };
+        let index_path = backup_index_path(&script_path, &backup_options);
+        fs::create_dir_all(index_path.parent().expect("index parent")).expect("backup directory");
+        fs::write(
+            &index_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "file_id": "ignored",
+                "original_path": script_path,
+                "file_name": "example.jsx",
+                "first_generation_id": "malicious",
+                "generations": [{
+                    "id": "malicious",
+                    "created_at_millis": 1,
+                    "backup_file_name": "../../outside.jsx",
+                    "file_size": 1,
+                    "reason": "before_save"
+                }]
+            }))
+            .expect("index json"),
+        )
+        .expect("index");
+
+        let error = scriptmeta_backup_generations(&script_path, &backup_options)
+            .expect_err("unsafe backup path");
+        assert!(
+            error
+                .to_string()
+                .contains("must not contain a directory path")
+        );
     }
 
     #[cfg(not(windows))]

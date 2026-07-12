@@ -1065,10 +1065,14 @@ fn root_io_error(error: &io::Error, fallback_code: &'static str) -> (RootStatus,
 }
 
 fn is_package_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some("app" | "bundle" | "framework" | "plugin" | "appex")
-    )
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "app" | "bundle" | "framework" | "plugin" | "appex"
+            )
+        })
 }
 
 fn normalize_dirty_directories(directories: &[PathBuf], root_path: &Path) -> Vec<PathBuf> {
@@ -1599,6 +1603,12 @@ mod tests {
             .map(|entry| display_name(&entry.display_path).into_owned())
             .collect();
         assert_eq!(ordered, ["_folder", "a-folder", "a.jsx", "b.jsx"]);
+    }
+
+    #[test]
+    fn package_detection_is_case_insensitive() {
+        assert!(is_package_path(Path::new("Example.APP")));
+        assert!(is_package_path(Path::new("Example.Framework")));
     }
 
     #[test]

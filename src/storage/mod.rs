@@ -171,19 +171,20 @@ pub fn save_cache_payload(
             path: temp_path.clone(),
             message: error.to_string(),
         })?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(SizeLimitedWriter::new(file, MAX_CACHE_FILE_BYTES));
     serde_json::to_writer(&mut writer, payload)
         .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
     writer.flush().map_err(|error| ScriptMetaKitError::Io {
         path: temp_path.clone(),
         message: error.to_string(),
     })?;
-    let file = writer
+    let writer = writer
         .into_inner()
         .map_err(|error| ScriptMetaKitError::Io {
             path: temp_path.clone(),
             message: error.to_string(),
         })?;
+    let file = writer.into_inner();
     file.sync_all().map_err(|error| ScriptMetaKitError::Io {
         path: temp_path.clone(),
         message: error.to_string(),
@@ -248,6 +249,50 @@ fn temporary_cache_path(path: &Path) -> PathBuf {
         .unwrap_or_default();
     file_name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
     path.with_file_name(file_name)
+}
+
+struct SizeLimitedWriter<W> {
+    inner: W,
+    max_bytes: u64,
+    written_bytes: u64,
+}
+
+impl<W> SizeLimitedWriter<W> {
+    fn new(inner: W, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            max_bytes,
+            written_bytes: 0,
+        }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for SizeLimitedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.max_bytes.saturating_sub(self.written_bytes);
+        if u64::try_from(buffer.len()).unwrap_or(u64::MAX) > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "cache file exceeds the {} byte safety limit",
+                    self.max_bytes
+                ),
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written_bytes = self
+            .written_bytes
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 struct TemporaryCacheFile {
@@ -328,4 +373,23 @@ fn replace_cache_file(temp_path: &Path, destination: &Path) -> ScriptMetaKitResu
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::SizeLimitedWriter;
+
+    #[test]
+    fn size_limited_writer_rejects_data_beyond_its_limit() {
+        let mut output = Vec::new();
+        let mut writer = SizeLimitedWriter::new(&mut output, 4);
+
+        writer.write_all(b"1234").expect("within limit");
+        let error = writer.write_all(b"5").expect_err("over limit");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(output, b"1234");
+    }
 }

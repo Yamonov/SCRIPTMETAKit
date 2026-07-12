@@ -499,9 +499,544 @@ fn memory_node_limit_evicts_one_root_without_clearing_every_cache() {
             .count(),
         1
     );
+    let exported = engine
+        .export_cache(scriptmetakit::CacheScope::All)
+        .expect("evicted roots remain available to the next durable merge");
+    let file_lists = exported
+        .data
+        .get("file_list_snapshots")
+        .and_then(serde_json::Value::as_object)
+        .expect("file-list cache map");
+    assert_eq!(file_lists.len(), 2);
+}
+
+#[test]
+fn durable_file_list_merge_preserves_evicted_roots_and_applies_tombstones() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first = temp.path().join("First");
+    let second = temp.path().join("Second");
+    std::fs::create_dir_all(&first).expect("first root");
+    std::fs::create_dir_all(&second).expect("second root");
+    std::fs::write(first.join("First.jsx"), "alert('first');").expect("first script");
+    std::fs::write(second.join("Second.jsx"), "alert('second');").expect("second script");
+
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "DurableMerge");
+    config.cache.max_memory_nodes = 2;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    let first_root = scriptmetakit::RootRegistration::file_list_and_metadata("first", &first);
+    let second_root = scriptmetakit::RootRegistration::file_list_and_metadata("second", &second);
+    engine
+        .set_roots(vec![first_root.clone(), second_root.clone()])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("initial scan");
+    let baseline = engine
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("baseline");
+    engine.mark_cache_persisted(scriptmetakit::CacheScope::FileList);
+
+    std::fs::write(first.join("Added.jsx"), "alert('added');").expect("added script");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest {
+            root_ids: vec!["first".into()],
+            mode: scriptmetakit::ScanMode::FileListOnly,
+        })
+        .expect("refresh first");
+    let merged = engine
+        .export_cache_merged(scriptmetakit::CacheScope::FileList, Some(baseline.clone()))
+        .expect("merge");
+    let snapshots: std::collections::BTreeMap<
+        scriptmetakit::RootId,
+        std::sync::Arc<scriptmetakit::FileListSnapshot>,
+    > = serde_json::from_value(merged.data.clone()).expect("file-list snapshots");
+    assert_eq!(snapshots.len(), 2);
     assert!(
-        engine.export_cache(scriptmetakit::CacheScope::All).is_err(),
-        "a partial in-memory cache must not overwrite a complete persistent cache"
+        snapshots["first"]
+            .children
+            .as_ref()
+            .expect("first children")
+            .iter()
+            .any(|entry| entry.display_path.ends_with("Added.jsx"))
+    );
+
+    engine
+        .set_roots(vec![first_root])
+        .expect("unregister second");
+    let tombstoned = engine
+        .export_cache_merged(scriptmetakit::CacheScope::FileList, Some(merged))
+        .expect("tombstone merge");
+    let snapshots = tombstoned.data.as_object().expect("snapshot object");
+    assert_eq!(snapshots.len(), 1);
+    assert!(snapshots.contains_key("first"));
+}
+
+#[test]
+fn persistent_restore_does_not_overwrite_newer_memory_snapshot() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_path = temp.path().join("Root");
+    std::fs::create_dir_all(&root_path).expect("root");
+    std::fs::write(root_path.join("Initial.jsx"), "alert('initial');").expect("initial");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "RestoreMerge"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", &root_path),
+        ])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("initial scan");
+    let old_cache = engine
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("old cache");
+    std::fs::write(root_path.join("New.jsx"), "alert('new');").expect("new");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("new scan");
+    engine.load_cache(old_cache).expect("restore missing only");
+    let cached = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    assert!(
+        cached.file_list_snapshots[0]
+            .children
+            .as_ref()
+            .expect("children")
+            .iter()
+            .any(|entry| entry.display_path.ends_with("New.jsx"))
+    );
+}
+
+#[test]
+fn idle_expiry_can_restore_and_resume_file_list_export() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Tool.jsx"), "alert('tool');").expect("tool");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "IdleRestore");
+    config.cache.idle_lifetime_millis = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", temp.path()),
+        ])
+        .expect("root");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("scan");
+    let resident_snapshot = engine
+        .snapshot(&scriptmetakit::RootId::from("root"))
+        .expect("resident snapshot");
+    let durable = engine
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("durable cache");
+    engine.mark_cache_persisted(scriptmetakit::CacheScope::FileList);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let expired = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    assert!(expired.file_list_snapshots.is_empty());
+    assert_eq!(std::sync::Arc::strong_count(&resident_snapshot), 1);
+    let merged = engine
+        .export_cache_merged(scriptmetakit::CacheScope::FileList, Some(durable.clone()))
+        .expect("safe merge after expiry");
+    assert_eq!(merged.data.as_object().expect("snapshots").len(), 1);
+    engine.load_cache(durable).expect("restore");
+    let restored = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    assert_eq!(restored.file_list_snapshots.len(), 1);
+    engine
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("export resumes");
+}
+
+#[test]
+fn idle_expiry_releases_already_persisted_catalog_storage() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("Tool.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.idle-catalog\n// SCRIPTMETA-END\n",
+    )
+    .expect("tool");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "IdleCatalog");
+    config.cache.idle_lifetime_millis = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", temp.path()),
+        ])
+        .expect("root");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::MetadataOnly,
+        ))
+        .expect("scan");
+    let resident_catalog = engine.catalog_snapshot().expect("resident catalog");
+    engine
+        .export_cache(scriptmetakit::CacheScope::Catalog)
+        .expect("durable catalog");
+    engine.mark_cache_persisted(scriptmetakit::CacheScope::Catalog);
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let expired = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+    assert!(expired.catalog_snapshot.is_none());
+    assert_eq!(std::sync::Arc::strong_count(&resident_catalog), 1);
+}
+
+#[test]
+fn file_list_content_revision_is_stable_until_display_content_changes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script = temp.path().join("Tool.jsx");
+    std::fs::write(&script, "alert('tool');").expect("tool");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "Revisions"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", temp.path()),
+        ])
+        .expect("root");
+    let first = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("first scan");
+    let first_content = first.file_list_snapshots[0].content_revision.clone();
+    let first_state = first.roots[0].state_revision.clone();
+    assert!(first_content.is_available());
+    assert!(first_state.is_available());
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let second = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("no-op scan");
+    assert_eq!(
+        second.file_list_snapshots[0].content_revision,
+        first_content
+    );
+    assert_ne!(second.roots[0].state_revision, first_state);
+
+    engine
+        .mark_changed_paths(scriptmetakit::RawChangeBatch {
+            paths: vec![script.clone()],
+            overflowed: false,
+        })
+        .expect("dirty event");
+    let dirty = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    assert_eq!(dirty.file_list_snapshots[0].content_revision, first_content);
+    assert_ne!(
+        dirty.roots[0].state_revision,
+        second.roots[0].state_revision
+    );
+
+    std::fs::write(temp.path().join("Added.jsx"), "alert('added');").expect("added");
+    let changed = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("changed scan");
+    assert_ne!(
+        changed.file_list_snapshots[0].content_revision,
+        first_content
+    );
+    let mut cloned = engine.clone();
+    let cloned_result = cloned.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    assert_ne!(
+        cloned_result.file_list_snapshots[0]
+            .content_revision
+            .workspace_epoch,
+        changed.file_list_snapshots[0]
+            .content_revision
+            .workspace_epoch
+    );
+}
+
+#[test]
+fn rename_metadata_change_and_delete_advance_content_revision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let original = temp.path().join("Tool.jsx");
+    let renamed = temp.path().join("Renamed.jsx");
+    std::fs::write(
+        &original,
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.revision-projection\n// Name=Original\n// SCRIPTMETA-END\n",
+    )
+    .expect("script");
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "RevisionProjection"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", temp.path()),
+        ])
+        .expect("root");
+
+    let initial = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("initial scan");
+    let initial_revision = initial.file_list_snapshots[0].content_revision.clone();
+
+    std::fs::rename(&original, &renamed).expect("rename");
+    let after_rename = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("rename scan");
+    let rename_revision = after_rename.file_list_snapshots[0].content_revision.clone();
+    assert_ne!(rename_revision, initial_revision);
+
+    std::fs::write(
+        &renamed,
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.revision-projection\n// Name=Updated\n// SCRIPTMETA-END\n",
+    )
+    .expect("metadata update");
+    let after_metadata = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("metadata scan");
+    let metadata_revision = after_metadata.file_list_snapshots[0]
+        .content_revision
+        .clone();
+    assert_ne!(metadata_revision, rename_revision);
+
+    std::fs::remove_file(&renamed).expect("delete");
+    let after_delete = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("delete scan");
+    let empty_snapshot = &after_delete.file_list_snapshots[0];
+    assert_eq!(empty_snapshot.children.as_deref(), Some(&[][..]));
+    assert!(empty_snapshot.content_revision.is_available());
+    assert_ne!(empty_snapshot.content_revision, metadata_revision);
+}
+
+#[test]
+fn truncated_state_change_advances_content_revision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("One.jsx"), "alert('one');").expect("one");
+    std::fs::write(temp.path().join("Two.jsx"), "alert('two');").expect("two");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "TruncatedRevision");
+    config.scanner.max_nodes_per_root = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", temp.path()),
+        ])
+        .expect("root");
+    let truncated = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("truncated scan");
+    assert!(truncated.file_list_snapshots[0].truncated);
+    let revision = truncated.file_list_snapshots[0].content_revision.clone();
+    engine.config_mut().scanner.max_nodes_per_root = 10;
+    let complete = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("complete scan");
+    assert!(!complete.file_list_snapshots[0].truncated);
+    assert_ne!(complete.file_list_snapshots[0].content_revision, revision);
+}
+
+#[test]
+fn old_cache_revisions_are_reissued_and_survive_no_op_reconcile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first = temp.path().join("First");
+    let second = temp.path().join("Second");
+    std::fs::create_dir_all(&first).expect("first");
+    std::fs::create_dir_all(&second).expect("second");
+    std::fs::write(first.join("One.jsx"), "alert('one');").expect("one");
+    std::fs::write(second.join("Two.jsx"), "alert('two');").expect("two");
+    let roots = vec![
+        scriptmetakit::RootRegistration::file_list_and_metadata("first", &first),
+        scriptmetakit::RootRegistration::file_list_and_metadata("second", &second),
+    ];
+    let config = scriptmetakit::ScriptMetaKitConfig::new("Test", "OldRevisions");
+    let mut source = scriptmetakit::ScriptMetaKitEngine::new(config.clone()).expect("source");
+    source.set_roots(roots.clone()).expect("roots");
+    source
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("scan");
+    let mut payload = source
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("cache");
+    for snapshot in payload
+        .data
+        .as_object_mut()
+        .expect("snapshot map")
+        .values_mut()
+    {
+        let snapshot = snapshot.as_object_mut().expect("snapshot");
+        snapshot.remove("content_revision");
+        snapshot
+            .get_mut("root")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("root")
+            .remove("state_revision");
+    }
+
+    let mut restored = scriptmetakit::ScriptMetaKitEngine::new(config).expect("restored");
+    restored.set_roots(roots).expect("roots");
+    restored.load_cache(payload).expect("old cache");
+    let cached = restored.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::FileListOnly,
+    ));
+    let root_revisions = cached
+        .roots
+        .iter()
+        .map(|root| root.state_revision.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        root_revisions
+            .iter()
+            .all(|revision| revision.is_available())
+    );
+    assert_ne!(root_revisions[0], root_revisions[1]);
+    let revisions = cached
+        .file_list_snapshots
+        .iter()
+        .map(|snapshot| snapshot.content_revision.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(revisions.len(), 2);
+    assert!(revisions.iter().all(|revision| revision.is_available()));
+    assert_ne!(revisions[0], revisions[1]);
+    let reconciled = restored
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("reconcile");
+    assert_eq!(
+        reconciled.file_list_snapshots[0].content_revision,
+        revisions[0]
+    );
+    assert_eq!(
+        reconciled.file_list_snapshots[1].content_revision,
+        revisions[1]
+    );
+}
+
+#[test]
+fn durable_catalog_merge_preserves_unresident_roots_and_newer_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first = temp.path().join("First");
+    let second = temp.path().join("Second");
+    std::fs::create_dir_all(&first).expect("first");
+    std::fs::create_dir_all(&second).expect("second");
+    let first_script = first.join("First.jsx");
+    std::fs::write(
+        &first_script,
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.catalog.first\n// Version=1.0.0\n// SCRIPTMETA-END\n",
+    )
+    .expect("first script");
+    std::fs::write(
+        second.join("Second.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.catalog.second\n// Version=1.0.0\n// SCRIPTMETA-END\n",
+    )
+    .expect("second script");
+    let first_root = scriptmetakit::RootRegistration::file_list_and_metadata("first", &first);
+    let second_root = scriptmetakit::RootRegistration::file_list_and_metadata("second", &second);
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "CatalogMerge");
+    config.cache.max_memory_nodes = 2;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config.clone()).expect("engine");
+    engine
+        .set_roots(vec![first_root.clone(), second_root.clone()])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListAndMetadata,
+        ))
+        .expect("initial scan");
+    let baseline = engine
+        .export_cache(scriptmetakit::CacheScope::Catalog)
+        .expect("baseline catalog");
+    engine.mark_cache_persisted(scriptmetakit::CacheScope::Catalog);
+
+    std::fs::write(
+        &first_script,
+        "// SCRIPTMETA-BEGIN\n// Script-ID=com.example.catalog.first\n// Version=2.0.0\n// SCRIPTMETA-END\n",
+    )
+    .expect("updated first");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest {
+            root_ids: vec!["first".into()],
+            mode: scriptmetakit::ScanMode::FileListAndMetadata,
+        })
+        .expect("refresh first");
+    let merged = engine
+        .export_cache_merged(scriptmetakit::CacheScope::Catalog, Some(baseline))
+        .expect("merged catalog");
+
+    config.cache.max_memory_nodes = 100;
+    let mut restored = scriptmetakit::ScriptMetaKitEngine::new(config).expect("restored");
+    restored
+        .set_roots(vec![first_root.clone(), second_root])
+        .expect("restored roots");
+    restored.load_cache(merged.clone()).expect("load merged");
+    let cached = restored.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+    let versions = cached
+        .catalog_snapshot
+        .expect("catalog")
+        .file_items
+        .iter()
+        .map(|item| (item.script_id.clone(), item.version.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(
+        versions["com.example.catalog.first"].as_deref(),
+        Some("2.0.0")
+    );
+    assert_eq!(
+        versions["com.example.catalog.second"].as_deref(),
+        Some("1.0.0")
+    );
+
+    engine
+        .set_roots(vec![first_root])
+        .expect("unregister second");
+    let tombstoned = engine
+        .export_cache_merged(scriptmetakit::CacheScope::Catalog, Some(merged))
+        .expect("catalog tombstone");
+    let catalog = tombstoned
+        .data
+        .get("catalog_snapshot")
+        .expect("catalog snapshot");
+    assert_eq!(
+        catalog
+            .get("candidate_cache")
+            .and_then(|cache| cache.get("registered_roots"))
+            .and_then(serde_json::Value::as_array)
+            .expect("registered roots")
+            .len(),
+        1
     );
 }
 
@@ -2661,7 +3196,7 @@ fn saves_and_loads_cache_payload() {
 }
 
 #[test]
-fn persistent_catalog_cache_rejects_mismatched_roots() {
+fn persistent_catalog_cache_filters_mismatched_roots() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root_a = temp.path().join("A");
     let root_b = temp.path().join("B");
@@ -2694,11 +3229,21 @@ fn persistent_catalog_cache_rejects_mismatched_roots() {
             scriptmetakit::RootPurpose::FileListAndMetadata,
         )
         .expect("set roots");
+    let root_b_id = next_engine.roots()[0].root_id.clone();
 
-    let error = next_engine
+    next_engine
         .load_cache(payload)
-        .expect_err("mismatched roots");
-    assert!(error.to_string().contains("root signature"));
+        .expect("filter mismatched roots");
+    let cached = next_engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+    let catalog = cached.catalog_snapshot.expect("catalog");
+    assert!(catalog.file_items.is_empty());
+    assert_eq!(catalog.candidate_cache.registered_roots.len(), 1);
+    assert_eq!(
+        catalog.candidate_cache.registered_roots[0].root_id,
+        root_b_id
+    );
 }
 
 #[test]

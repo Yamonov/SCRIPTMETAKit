@@ -9,32 +9,32 @@ use std::{
 use scriptmetakit_ffi::{
     SmkDistributionMetadataDraft, SmkDistributionResolutionEntrySlice, SmkEditResult, SmkEngine,
     SmkFileEntryChangeSlice, SmkFileEntrySlice, SmkFileIssueSlice,
-    SmkFileListDirectoryStateRangeSlice, SmkFileListSnapshotSlice, SmkOperationInfo,
-    SmkRootRegistration, SmkRootSnapshotSlice, SmkScanChangeInfo, SmkScanResult,
-    SmkScriptItemSlice, SmkScriptMetaBackupGenerationSlice, SmkScriptMetaBackupRecord,
-    SmkScriptMetadataDraft, SmkScriptMetadataEditPreviewResult, SmkScriptMetadataFileWriteResult,
-    SmkScriptMetadataWriteRequest, SmkStatus, SmkUpdateCheckInfo, SmkUpdateProgress,
-    SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_compare_versions,
+    SmkFileListDirectoryStateRangeSlice, SmkFileListSnapshotDetailsSlice, SmkFileListSnapshotSlice,
+    SmkOperationInfo, SmkRootRegistration, SmkRootSnapshotRevisionSlice, SmkRootSnapshotSlice,
+    SmkScanChangeInfo, SmkScanResult, SmkScriptItemSlice, SmkScriptMetaBackupGenerationSlice,
+    SmkScriptMetaBackupRecord, SmkScriptMetadataDraft, SmkScriptMetadataEditPreviewResult,
+    SmkScriptMetadataFileWriteResult, SmkScriptMetadataWriteRequest, SmkStatus, SmkUpdateCheckInfo,
+    SmkUpdateProgress, SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_compare_versions,
     smk_edit_result_backup_generations, smk_edit_result_backup_record,
     smk_edit_result_file_write_result, smk_edit_result_free,
     smk_edit_result_metadata_edit_preview_result, smk_edit_result_text,
     smk_engine_cancel_current_operation, smk_engine_cancel_current_or_reserved_operation,
     smk_engine_check_update_item, smk_engine_check_updates_for_items, smk_engine_create_default,
     smk_engine_finish_operation_reservation, smk_engine_free,
-    smk_engine_generate_edit_password_sha256, smk_engine_last_error,
+    smk_engine_generate_edit_password_sha256, smk_engine_last_error, smk_engine_load_cache_file,
     smk_engine_read_script_metadata_edit_preview_file, smk_engine_render_distribution_metadata,
     smk_engine_reserve_next_operation, smk_engine_restore_scriptmeta_backup,
     smk_engine_save_cache_file, smk_engine_scan_folder, smk_engine_scan_folders,
     smk_engine_scan_folders_with_progress, smk_engine_scan_registered_roots, smk_engine_scan_roots,
     smk_engine_scriptmeta_backup_generations, smk_engine_set_resolve_macos_alias,
     smk_engine_set_roots, smk_engine_set_visible_root, smk_engine_verify_edit_password_sha256,
-    smk_engine_watcher_requires_restart, smk_engine_write_script_metadata_file,
-    smk_engine_write_script_metadata_file_if_unchanged, smk_normalize_version_string,
-    smk_scan_result_change_info, smk_scan_result_file_entries, smk_scan_result_file_entry_changes,
-    smk_scan_result_file_issues, smk_scan_result_file_items,
-    smk_scan_result_file_list_directory_state_ranges, smk_scan_result_file_lists,
-    smk_scan_result_free, smk_scan_result_items, smk_scan_result_operation_info,
-    smk_scan_result_roots, smk_scan_result_update_info, smk_scan_result_update_resolutions,
+    smk_engine_write_script_metadata_file, smk_engine_write_script_metadata_file_if_unchanged,
+    smk_normalize_version_string, smk_scan_result_change_info, smk_scan_result_file_entries,
+    smk_scan_result_file_entry_changes, smk_scan_result_file_issues, smk_scan_result_file_items,
+    smk_scan_result_file_list_details, smk_scan_result_file_list_directory_state_ranges,
+    smk_scan_result_file_lists, smk_scan_result_free, smk_scan_result_items,
+    smk_scan_result_operation_info, smk_scan_result_root_revisions, smk_scan_result_roots,
+    smk_scan_result_update_info, smk_scan_result_update_resolutions,
     smk_scan_result_update_statuses, smk_validate_edit_password_sha256_format,
     smk_validate_version_string,
 };
@@ -44,6 +44,7 @@ use scriptmetakit_ffi::{SmkPathResolution, smk_resolve_registered_path};
 use scriptmetakit_ffi::{
     smk_engine_poll_watcher_scan, smk_engine_poll_watcher_scan_dirty_only,
     smk_engine_start_watching, smk_engine_start_watching_with_callback, smk_engine_stop_watching,
+    smk_engine_watcher_requires_restart,
 };
 
 #[test]
@@ -214,6 +215,19 @@ fn scans_items_through_opaque_handle_and_slice() {
         SmkStatus::Ok
     );
     assert_eq!(roots.len, 1);
+    let mut root_revisions = SmkRootSnapshotRevisionSlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    assert_eq!(
+        unsafe { smk_scan_result_root_revisions(scan_result, &mut root_revisions) },
+        SmkStatus::Ok
+    );
+    assert_eq!(root_revisions.len, roots.len);
+    let root_revisions = unsafe { slice::from_raw_parts(root_revisions.ptr, root_revisions.len) };
+    assert_eq!(root_revisions[0].root_index, 0);
+    assert!(!utf8(root_revisions[0].workspace_epoch).is_empty());
+    assert!(root_revisions[0].sequence > 0);
 
     let mut file_lists = SmkFileListSnapshotSlice {
         ptr: ptr::null(),
@@ -225,6 +239,21 @@ fn scans_items_through_opaque_handle_and_slice() {
         SmkStatus::Ok
     );
     assert_eq!(file_lists.len, 1);
+    let mut file_list_details = SmkFileListSnapshotDetailsSlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    assert_eq!(
+        unsafe { smk_scan_result_file_list_details(scan_result, &mut file_list_details) },
+        SmkStatus::Ok
+    );
+    assert_eq!(file_list_details.len, file_lists.len);
+    let file_list_details =
+        unsafe { slice::from_raw_parts(file_list_details.ptr, file_list_details.len) };
+    assert_eq!(file_list_details[0].file_list_index, 0);
+    assert_eq!(file_list_details[0].has_children, 1);
+    assert!(!utf8(file_list_details[0].workspace_epoch).is_empty());
+    assert!(file_list_details[0].content_sequence > 0);
 
     let mut file_entries = SmkFileEntrySlice {
         ptr: ptr::null(),
@@ -595,6 +624,73 @@ fn scans_registered_roots_with_app_supplied_root_ids() {
     unsafe {
         smk_scan_result_free(selected_scan_result);
         smk_scan_result_free(scan_result);
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
+fn file_list_details_distinguish_empty_from_unavailable_children() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let empty_root = temp.path().join("empty");
+    let missing_root = temp.path().join("missing");
+    std::fs::create_dir_all(&empty_root).expect("empty root");
+    let empty_path = empty_root.to_string_lossy().into_owned();
+    let missing_path = missing_root.to_string_lossy().into_owned();
+    let roots = [
+        SmkRootRegistration {
+            root_id: utf8_slice("empty"),
+            path: utf8_slice(&empty_path),
+            display_name: SmkUtf8Slice::default(),
+            purpose: 0,
+            watch_policy: 2,
+            cache_policy: 3,
+            refresh_policy: 2,
+            priority: 1,
+        },
+        SmkRootRegistration {
+            root_id: utf8_slice("missing"),
+            path: utf8_slice(&missing_path),
+            display_name: SmkUtf8Slice::default(),
+            purpose: 0,
+            watch_policy: 2,
+            cache_policy: 3,
+            refresh_policy: 2,
+            priority: 1,
+        },
+    ];
+    let mut engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_set_roots(engine, roots.as_ptr(), roots.len()) },
+        SmkStatus::Ok
+    );
+    let mut result = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_scan_registered_roots(engine, 0, 0, &mut result) },
+        SmkStatus::Ok
+    );
+    let mut details = SmkFileListSnapshotDetailsSlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    assert_eq!(
+        unsafe { smk_scan_result_file_list_details(result, &mut details) },
+        SmkStatus::Ok
+    );
+    assert_eq!(details.len, 2);
+    let details = unsafe { slice::from_raw_parts(details.ptr, details.len) };
+    assert_eq!(details[0].file_list_index, 0);
+    assert_eq!(details[0].has_children, 1);
+    assert!(details[0].content_sequence > 0);
+    assert_eq!(details[1].file_list_index, 1);
+    assert_eq!(details[1].has_children, 0);
+    assert_eq!(details[1].content_sequence, 0);
+    assert!(utf8(details[1].workspace_epoch).is_empty());
+    unsafe {
+        smk_scan_result_free(result);
         smk_engine_free(engine);
     }
 }
@@ -1300,6 +1396,50 @@ fn identical_cache_save_skips_rewriting_the_file() {
         .expect("second modified");
     assert_eq!(first_modified, second_modified);
     unsafe { smk_engine_free(engine) };
+}
+
+#[test]
+fn complete_resident_cache_replaces_a_corrupt_existing_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("Example.jsx"), "alert('ok');").expect("script");
+    let cache_path = temp.path().join("cache.json");
+    let cache = cache_path.to_string_lossy().into_owned();
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    let root = temp.path().to_string_lossy().into_owned();
+    let mut scan_result: *mut SmkScanResult = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_scan_folders(engine, &utf8_slice(&root), 1, 0, &mut scan_result) },
+        SmkStatus::Ok
+    );
+    unsafe { smk_scan_result_free(scan_result) };
+    assert_eq!(
+        unsafe { smk_engine_save_cache_file(engine, 0, utf8_slice(&cache)) },
+        SmkStatus::Ok
+    );
+
+    std::fs::write(&cache_path, b"not a cache payload").expect("replace cache externally");
+    assert_eq!(
+        unsafe { smk_engine_save_cache_file(engine, 0, utf8_slice(&cache)) },
+        SmkStatus::Ok
+    );
+
+    let mut restored: *mut SmkEngine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut restored) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_load_cache_file(restored, utf8_slice(&cache)) },
+        SmkStatus::Ok
+    );
+    unsafe {
+        smk_engine_free(restored);
+        smk_engine_free(engine);
+    }
 }
 
 #[test]

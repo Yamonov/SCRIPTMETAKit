@@ -8,9 +8,18 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.1.3`
-- Rust FFI crate: `scriptmetakit_ffi` `1.1.3`
+- Rust crate: `scriptmetakit` `1.2.0`
+- Rust FFI crate: `scriptmetakit_ffi` `1.2.0`
 - Swift package product: `ScriptMetaKit`
+
+## 1.2.0
+
+- Adds root-state and file-list-content revisions with stable content identity across no-op reconciliation.
+- Exposes current root state, last-good content, freshness, completeness, and cache provenance through public Swift file-list state APIs.
+- Adds atomic visible-root activation with watcher rollback, multi-root cached-state recovery, sequenced watch updates, and watch-session generation protection.
+- Preserves `children == nil` versus a valid empty list across the C FFI without changing legacy snapshot struct layouts.
+- Retains last-good content for missing roots and identifies initial, restart, and overflow reconciliation results.
+- Merges persistent cache data by root and scope so memory eviction and idle expiry do not remove unresident durable entries.
 
 ## 1.1.3
 
