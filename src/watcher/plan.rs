@@ -551,12 +551,15 @@ fn path_has_package_component(path: &Path, root_path: &Path) -> bool {
         .components()
         .any(|component| {
             let component_path = Path::new(component.as_os_str());
-            matches!(
-                component_path
-                    .extension()
-                    .and_then(|extension| extension.to_str()),
-                Some("app" | "bundle" | "framework" | "plugin" | "appex")
-            )
+            component_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "app" | "bundle" | "framework" | "plugin" | "appex"
+                    )
+                })
         })
 }
 

@@ -375,7 +375,7 @@ public nonisolated struct ScriptMetaKitRoot: Codable, Identifiable, Sendable {
         purpose: ScriptMetaRootPurpose = .fileListAndMetadata,
         watchPolicy: ScriptMetaWatchPolicy = .visibleOnly,
         cachePolicy: ScriptMetaCachePolicy = .memoryAndPersistent,
-        refreshPolicy: ScriptMetaRefreshPolicy = .onFileEventDeferred,
+        refreshPolicy: ScriptMetaRefreshPolicy = .onFileEvent,
         priority: ScriptMetaRootPriority = .userInitiated
     ) {
         self.rootID = rootID
@@ -429,6 +429,7 @@ public nonisolated struct ScriptMetaScanResult: Codable, Sendable {
     public var updateCheckResult: UpdateCheckResult?
     public var changeSummary: ScanChangeSummary?
     public var watchChangeBatch: WatchChangeBatch?
+    public var watchDelivery: ScriptMetaKitWatchDelivery?
 
     enum CodingKeys: String, CodingKey {
         case roots
@@ -439,6 +440,7 @@ public nonisolated struct ScriptMetaScanResult: Codable, Sendable {
         case updateCheckResult = "update_check_result"
         case changeSummary = "change_summary"
         case watchChangeBatch = "watch_change_batch"
+        case watchDelivery = "watch_delivery"
     }
 
     public var allItems: [ScriptMetaItem] {
@@ -454,6 +456,13 @@ public nonisolated struct ScriptMetaScanResult: Codable, Sendable {
             snapshot.children?.flatMap(\.flattened) ?? []
         }
     }
+}
+
+public nonisolated struct ScriptMetaKitWatchDelivery: Codable, Sendable {
+    public var isReconciliation: Bool
+    public var coversAllWatchedRoots: Bool
+    public var streamID: String?
+    public var sequence: UInt64?
 }
 
 public nonisolated struct OperationInfo: Codable, Sendable {
@@ -500,6 +509,19 @@ public nonisolated struct FileIssue: Codable, Identifiable, Sendable {
     }
 }
 
+public nonisolated struct ScriptMetaKitRevision: Codable, Hashable, Sendable {
+    public let workspaceEpoch: String
+    public let sequence: UInt64
+
+    public static let unavailable = ScriptMetaKitRevision(workspaceEpoch: "", sequence: 0)
+    public var isAvailable: Bool { !workspaceEpoch.isEmpty && sequence > 0 }
+
+    enum CodingKeys: String, CodingKey {
+        case workspaceEpoch = "workspace_epoch"
+        case sequence
+    }
+}
+
 public nonisolated struct RootSnapshot: Codable, Identifiable, Sendable {
     public var rootID: String
     public var path: String
@@ -509,8 +531,46 @@ public nonisolated struct RootSnapshot: Codable, Identifiable, Sendable {
     public var lastEventAt: UInt64?
     public var itemCount: Int
     public var error: RootError?
+    public var stateRevision: ScriptMetaKitRevision = .unavailable
 
     public var id: String { rootID }
+
+    init(
+        rootID: String,
+        path: String,
+        status: String,
+        isDirty: Bool,
+        lastLoadedAt: UInt64?,
+        lastEventAt: UInt64?,
+        itemCount: Int,
+        error: RootError?,
+        stateRevision: ScriptMetaKitRevision = .unavailable
+    ) {
+        self.rootID = rootID
+        self.path = path
+        self.status = status
+        self.isDirty = isDirty
+        self.lastLoadedAt = lastLoadedAt
+        self.lastEventAt = lastEventAt
+        self.itemCount = itemCount
+        self.error = error
+        self.stateRevision = stateRevision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            rootID: try values.decode(String.self, forKey: .rootID),
+            path: try values.decode(String.self, forKey: .path),
+            status: try values.decode(String.self, forKey: .status),
+            isDirty: try values.decode(Bool.self, forKey: .isDirty),
+            lastLoadedAt: try values.decodeIfPresent(UInt64.self, forKey: .lastLoadedAt),
+            lastEventAt: try values.decodeIfPresent(UInt64.self, forKey: .lastEventAt),
+            itemCount: try values.decode(Int.self, forKey: .itemCount),
+            error: try values.decodeIfPresent(RootError.self, forKey: .error),
+            stateRevision: try values.decodeIfPresent(ScriptMetaKitRevision.self, forKey: .stateRevision) ?? .unavailable
+        )
+    }
 
     enum CodingKeys: String, CodingKey {
         case rootID = "root_id"
@@ -521,6 +581,7 @@ public nonisolated struct RootSnapshot: Codable, Identifiable, Sendable {
         case lastEventAt = "last_event_at"
         case itemCount = "item_count"
         case error
+        case stateRevision = "state_revision"
     }
 }
 
@@ -534,12 +595,39 @@ public nonisolated struct FileListSnapshot: Codable, Sendable {
     public var children: [FileSystemEntry]?
     public var directoryStates: [String: DirectoryState]
     public var truncated: Bool
+    public var contentRevision: ScriptMetaKitRevision = .unavailable
+
+    init(
+        root: RootSnapshot,
+        children: [FileSystemEntry]?,
+        directoryStates: [String: DirectoryState],
+        truncated: Bool,
+        contentRevision: ScriptMetaKitRevision = .unavailable
+    ) {
+        self.root = root
+        self.children = children
+        self.directoryStates = directoryStates
+        self.truncated = truncated
+        self.contentRevision = contentRevision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            root: try values.decode(RootSnapshot.self, forKey: .root),
+            children: try values.decodeIfPresent([FileSystemEntry].self, forKey: .children),
+            directoryStates: try values.decode([String: DirectoryState].self, forKey: .directoryStates),
+            truncated: try values.decode(Bool.self, forKey: .truncated),
+            contentRevision: try values.decodeIfPresent(ScriptMetaKitRevision.self, forKey: .contentRevision) ?? .unavailable
+        )
+    }
 
     enum CodingKeys: String, CodingKey {
         case root
         case children
         case directoryStates = "directory_states"
         case truncated
+        case contentRevision = "content_revision"
     }
 }
 

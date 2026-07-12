@@ -2,6 +2,182 @@ import XCTest
 @testable import ScriptMetaKit
 
 final class ScriptMetaKitAPITests: XCTestCase {
+    func testFileListStateAndRevisionsDistinguishEmptyCurrentContent() async throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitEmpty-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let root = ScriptMetaKitRoot(rootID: "empty", url: rootURL)
+        let workspace = ScriptMetaKitWorkspace()
+        let result = try await workspace.scanRoots(
+            [root], replacingGroup: "test.empty", rootIDs: [root.rootID], mode: .fileListOnly
+        )
+        let snapshot = try XCTUnwrap(result.fileListSnapshots.first)
+        XCTAssertEqual(snapshot.children?.count, 0)
+        XCTAssertTrue(snapshot.contentRevision.isAvailable)
+        XCTAssertTrue(try XCTUnwrap(result.roots.first).stateRevision.isAvailable)
+
+        let activatedState = try await workspace.activateFileListRoot(root.rootID)
+        let state = try XCTUnwrap(activatedState)
+        XCTAssertEqual(state.freshness, .current)
+        XCTAssertEqual(state.completeness, .complete)
+        XCTAssertEqual(state.source, .memoryCache)
+        XCTAssertTrue(state.isFullyCurrent)
+        XCTAssertEqual(state.availableSnapshot?.contentRevision, snapshot.contentRevision)
+    }
+
+    func testCurrentTruncatedFileListStateIsNotFullyCurrent() async {
+        let revision = ScriptMetaKitRevision(workspaceEpoch: "test", sequence: 1)
+        let root = RootSnapshot(
+            rootID: "truncated",
+            path: "/tmp/truncated",
+            status: "ready",
+            isDirty: false,
+            lastLoadedAt: 1,
+            lastEventAt: nil,
+            itemCount: 1,
+            error: nil,
+            stateRevision: revision
+        )
+        let snapshot = FileListSnapshot(
+            root: root,
+            children: [],
+            directoryStates: [:],
+            truncated: true,
+            contentRevision: revision
+        )
+        let state = await ScriptMetaKitWorkspace().makeFileListState(
+            root: root,
+            snapshot: snapshot
+        )
+        XCTAssertEqual(state.freshness, .current)
+        XCTAssertEqual(state.completeness, .truncated)
+        XCTAssertFalse(state.reconciliationRequired)
+        XCTAssertFalse(state.isFullyCurrent)
+    }
+
+    func testDirtyFileListStateRequiresReconciliationWithoutDiscardingContent() async {
+        let revision = ScriptMetaKitRevision(workspaceEpoch: "test", sequence: 1)
+        let root = RootSnapshot(
+            rootID: "dirty",
+            path: "/tmp/dirty",
+            status: "dirty",
+            isDirty: true,
+            lastLoadedAt: 1,
+            lastEventAt: 2,
+            itemCount: 1,
+            error: nil,
+            stateRevision: revision
+        )
+        let snapshot = FileListSnapshot(
+            root: root,
+            children: [],
+            directoryStates: [:],
+            truncated: false,
+            contentRevision: revision
+        )
+        let state = await ScriptMetaKitWorkspace().makeFileListState(
+            root: root,
+            snapshot: snapshot
+        )
+        XCTAssertEqual(state.freshness, .cachedUnverified)
+        XCTAssertEqual(state.completeness, .complete)
+        XCTAssertNotNil(state.availableSnapshot)
+        XCTAssertTrue(state.reconciliationRequired)
+        XCTAssertFalse(state.isFullyCurrent)
+    }
+
+    func testOldCodableSnapshotsDefaultMissingRevisionsToUnavailable() throws {
+        let data = Data(#"{"root_id":"old","path":"/tmp/old","status":"ready","is_dirty":false,"last_loaded_at":null,"last_event_at":null,"item_count":0,"error":null}"#.utf8)
+        let root = try JSONDecoder().decode(RootSnapshot.self, from: data)
+        XCTAssertEqual(root.stateRevision, .unavailable)
+    }
+
+    func testSnapshotSidecarValidationRejectsCountAndIndexMismatch() throws {
+        XCTAssertThrowsError(
+            try validateSnapshotSidecarIndices(
+                expectedCount: 2,
+                indices: [0],
+                label: "root revision"
+            )
+        )
+        XCTAssertThrowsError(
+            try validateSnapshotSidecarIndices(
+                expectedCount: 2,
+                indices: [0, 2],
+                label: "file-list details"
+            )
+        )
+    }
+
+    func testMissingRootDoesNotBecomeAValidEmptyFileList() async throws {
+        let missingURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitMissing-\(UUID().uuidString)", isDirectory: true)
+        let root = ScriptMetaKitRoot(rootID: "missing", url: missingURL)
+        let workspace = ScriptMetaKitWorkspace()
+        _ = try await workspace.scanRoots(
+            [root], replacingGroup: "test.missing", rootIDs: [root.rootID], mode: .fileListOnly
+        )
+        let states = try await workspace.cachedFileListStates(
+            rootIDs: [root.rootID], cacheScope: nil
+        )
+        let state = try XCTUnwrap(states[root.rootID])
+        XCTAssertEqual(state.root.status, "missing")
+        XCTAssertNil(state.availableSnapshot)
+        XCTAssertEqual(state.freshness, .unavailable)
+        XCTAssertEqual(state.completeness, .unavailable)
+        XCTAssertEqual(state.source, .none)
+    }
+
+    func testMissingRootRetainsLastGoodContentAndRevision() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.last-good")
+        let root = ScriptMetaKitRoot(rootID: "last-good", url: rootURL)
+        let workspace = ScriptMetaKitWorkspace()
+        let initial = try await workspace.scanRoots(
+            [root], replacingGroup: "test.last-good", rootIDs: [root.rootID], mode: .fileListOnly
+        )
+        let revision = try XCTUnwrap(initial.fileListSnapshots.first).contentRevision
+        try FileManager.default.removeItem(at: rootURL)
+        _ = try await workspace.scanRoots(
+            [root], replacingGroup: "test.last-good", rootIDs: [root.rootID], mode: .fileListOnly
+        )
+        let states = try await workspace.cachedFileListStates(
+            rootIDs: [root.rootID], cacheScope: nil
+        )
+        let state = try XCTUnwrap(states[root.rootID])
+        XCTAssertEqual(state.root.status, "missing")
+        XCTAssertEqual(state.freshness, .failedRetainingLastGood)
+        XCTAssertEqual(state.availableSnapshot?.contentRevision, revision)
+        XCTAssertTrue(
+            state.availableSnapshot?.children?.contains { $0.name == "sample.jsx" } ?? false
+        )
+    }
+
+    func testCachedFileListStatesReturnsMultipleRootsAtomically() async throws {
+        let firstURL = try makeTemporaryScriptRoot(scriptID: "com.example.states.first")
+        let secondURL = try makeTemporaryScriptRoot(scriptID: "com.example.states.second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+        }
+        let roots = [
+            ScriptMetaKitRoot(rootID: "states-first", url: firstURL),
+            ScriptMetaKitRoot(rootID: "states-second", url: secondURL),
+        ]
+        let workspace = ScriptMetaKitWorkspace()
+        _ = try await workspace.scanRoots(
+            roots,
+            replacingGroup: "test.states",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListOnly
+        )
+        let states = try await workspace.cachedFileListStates(
+            rootIDs: roots.map(\.rootID), cacheScope: nil
+        )
+        XCTAssertEqual(Set(states.keys), Set(roots.map(\.rootID)))
+        XCTAssertTrue(states.values.allSatisfy(\.isFullyCurrent))
+    }
+
     func testOperationalPolicyPresetsAndCacheLimitArePublic() async throws {
         XCTAssertEqual(ScriptMetaKitPersistentCacheStore.defaultMaximumCacheBytes, 64 * 1024 * 1024)
         XCTAssertLessThan(
@@ -20,6 +196,14 @@ final class ScriptMetaKitAPITests: XCTestCase {
         do {
             try await engine.setOperationalPolicy(invalid)
             XCTFail("invalid operational policy was accepted")
+        } catch let ScriptMetaKitError.operationFailed(status, _) {
+            XCTAssertEqual(status, 3)
+        }
+        invalid = .balanced
+        invalid.watcherMaxPendingPaths = -1
+        do {
+            try await engine.setOperationalPolicy(invalid)
+            XCTFail("negative watcher capacity was accepted")
         } catch let ScriptMetaKitError.operationFailed(status, _) {
             XCTAssertEqual(status, 3)
         }
@@ -87,10 +271,13 @@ final class ScriptMetaKitAPITests: XCTestCase {
         scanTask.cancel()
 
         do {
-            _ = try await scanTask.value
-            XCTFail("cancelled parent task returned a scan result")
+            let result = try await scanTask.value
+            XCTAssertTrue(
+                try XCTUnwrap(result.operation).cancelled,
+                "only a committed native cancellation result may win after task cancellation"
+            )
         } catch is CancellationError {
-            // Expected.
+            // Cancellation before the native result commits is also valid.
         }
     }
 
@@ -153,7 +340,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.1.3")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.2.0")
     }
 
     func testRuntimeAcknowledgementSummaryIsConciseAndLinksToComponents() {
@@ -668,6 +855,98 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(cached?.allItems.map(\.scriptID), ["com.example.swiftapi.clearvolatile"])
     }
 
+    func testPersistentFileListStateIsUnverifiedUntilReconciled() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.persistent-state")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitFileListCache-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let root = ScriptMetaKitRoot(rootID: "persistent-state", url: rootURL)
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(
+            cacheStore: ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        ))
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.persistent-state",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        await workspace.clearVolatileState()
+        try await workspace.registerRoots(
+            [root], replacingGroup: "test.persistent-state", cacheScope: .fileList
+        )
+        let cachedStates = try await workspace.cachedFileListStates(
+            rootIDs: [root.rootID], cacheScope: nil
+        )
+        let cached = try XCTUnwrap(cachedStates[root.rootID])
+        XCTAssertEqual(cached.freshness, .cachedUnverified)
+        XCTAssertEqual(cached.source, .persistentCache)
+        XCTAssertTrue(cached.reconciliationRequired)
+        let cachedRevision = try XCTUnwrap(cached.availableSnapshot).contentRevision
+
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.persistent-state",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        let currentStates = try await workspace.cachedFileListStates(
+            rootIDs: [root.rootID], cacheScope: nil
+        )
+        let current = try XCTUnwrap(currentStates[root.rootID])
+        XCTAssertEqual(current.freshness, .current)
+        XCTAssertEqual(current.source, .memoryCache)
+        XCTAssertEqual(current.availableSnapshot?.contentRevision, cachedRevision)
+    }
+
+    func testPersistentLoadRecordsEveryRootAdoptedFromTheCacheFile() async throws {
+        let firstURL = try makeTemporaryScriptRoot(scriptID: "com.example.persistent-first")
+        let secondURL = try makeTemporaryScriptRoot(scriptID: "com.example.persistent-second")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitMultiRootCache-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let roots = [
+            ScriptMetaKitRoot(rootID: "persistent-first", url: firstURL),
+            ScriptMetaKitRoot(rootID: "persistent-second", url: secondURL)
+        ]
+        let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let writer = ScriptMetaKitWorkspace(configuration: .init(cacheStore: cacheStore))
+        _ = try await writer.scanRoots(
+            roots,
+            replacingGroup: "test.multi-root-persistent",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        await writer.shutdown()
+
+        let reader = ScriptMetaKitWorkspace(configuration: .init(cacheStore: cacheStore))
+        try await reader.registerRoots(
+            roots,
+            replacingGroup: "test.multi-root-persistent",
+            cacheScope: nil
+        )
+        let first = try await reader.cachedFileListStates(
+            rootIDs: [roots[0].rootID],
+            cacheScope: .fileList
+        )
+        XCTAssertEqual(first[roots[0].rootID]?.source, .persistentCache)
+
+        let second = try await reader.cachedFileListStates(
+            rootIDs: [roots[1].rootID],
+            cacheScope: nil
+        )
+        XCTAssertEqual(second[roots[1].rootID]?.source, .persistentCache)
+    }
+
     func testWorkspaceReportsNonfatalCacheDiagnostics() async throws {
         let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.diagnostic")
         let cacheDirectory = FileManager.default.temporaryDirectory
@@ -702,6 +981,202 @@ final class ScriptMetaKitAPITests: XCTestCase {
         }
         let diagnostics = await recorder.diagnostics
         XCTAssertTrue(diagnostics.contains { $0.code == "cache_load_failed" })
+    }
+
+    func testInvalidCacheLimitReportsDiagnosticWithoutDeletingPreviousCache() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.invalid-cache-limit")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitInvalidLimit-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let root = ScriptMetaKitRoot(rootID: "invalid-cache-limit", url: rootURL)
+        let validStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let writer = ScriptMetaKitWorkspace(configuration: .init(cacheStore: validStore))
+        _ = try await writer.scanRoots(
+            [root],
+            replacingGroup: "test.invalid-cache-limit",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        let cacheURL = validStore.writableCacheFileURL(scope: .fileList)
+        let previousCache = try Data(contentsOf: cacheURL)
+
+        let recorder = DiagnosticRecorder()
+        let invalidStore = ScriptMetaKitPersistentCacheStore(
+            directoryURL: cacheDirectory,
+            maximumCacheBytes: 0
+        )
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(
+            cacheStore: invalidStore,
+            diagnosticHandler: { diagnostic in
+                Task { await recorder.append(diagnostic) }
+            }
+        ))
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.invalid-cache-limit",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+
+        XCTAssertEqual(try Data(contentsOf: cacheURL), previousCache)
+        for _ in 0..<20 {
+            if await recorder.diagnostics.contains(where: { $0.code == "cache_limit_invalid" }) {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let diagnostics = await recorder.diagnostics
+        XCTAssertTrue(diagnostics.contains { $0.code == "cache_limit_invalid" })
+    }
+
+    func testRootCacheScopeUsesFileListStorageAndReadsLegacyFile() throws {
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitRootAlias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let store = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        XCTAssertEqual(
+            store.writableCacheFileURL(scope: .root),
+            store.writableCacheFileURL(scope: .fileList)
+        )
+
+        let legacyURL = cacheDirectory.appendingPathComponent("ScriptMetaKitRootCache.cache")
+        try Data("legacy".utf8).write(to: legacyURL)
+        XCTAssertEqual(store.readableCacheFileURL(scope: .root), legacyURL)
+        XCTAssertNil(store.readableCacheFileURL(scope: .fileList))
+        store.enforceSizeLimit(scope: .root)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: legacyURL.path))
+        ScriptMetaKitPersistentCacheStore(
+            directoryURL: cacheDirectory,
+            maximumCacheBytes: 0
+        ).enforceSizeLimit(scope: .root)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: legacyURL.path),
+            "an invalid limit must not delete an existing cache"
+        )
+    }
+
+    func testStatelessPreflightDoesNotRegisterTheCandidateInSwiftEngine() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.swift-preflight")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let engine = ScriptMetaKitEngine()
+        let result = try await engine.preflightRoot(
+            ScriptMetaKitRoot(rootID: "candidate", url: rootURL)
+        )
+        XCTAssertEqual(result.roots.map(\.rootID), ["candidate"])
+        XCTAssertEqual(result.roots.first?.status, "ready")
+        XCTAssertTrue(result.fileListSnapshots.isEmpty)
+        XCTAssertNil(result.catalogSnapshot)
+
+        let registered = try await engine.scanRegisteredRoots(
+            mode: .fileListAndMetadata,
+            checkUpdates: false
+        )
+        XCTAssertTrue(registered.roots.isEmpty)
+    }
+
+    func testShutdownFlushesDelayedCacheSaveQueuedBehindIt() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.delayed-cache")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitDelayedCache-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let root = ScriptMetaKitRoot(rootID: "delayed-cache", url: rootURL)
+        let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(
+            cacheStore: cacheStore,
+            cacheSaveDebounceMillis: 75
+        ))
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.delayed-cache",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        let cacheURL = cacheStore.writableCacheFileURL(scope: .fileList)
+        let previousCache = try Data(contentsOf: cacheURL)
+        try "alert('deferred');\n".write(
+            to: rootURL.appendingPathComponent("Deferred.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.delayed-cache",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: nil
+        )
+
+        let (started, startedContinuation) = AsyncStream<Void>.makeStream()
+        let (release, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let blocker = Task {
+            try await workspace.performExclusiveOperation {
+                startedContinuation.yield()
+                for await _ in release { break }
+            }
+        }
+        var startedIterator = started.makeAsyncIterator()
+        _ = await startedIterator.next()
+        await workspace.schedulePersistentCacheSaveForTesting(scope: .root)
+        let shutdown = Task { await workspace.shutdown() }
+        try await Task.sleep(for: .milliseconds(150))
+        releaseContinuation.yield()
+        try await blocker.value
+        await shutdown.value
+
+        XCTAssertNotEqual(try Data(contentsOf: cacheURL), previousCache)
+        let restored = ScriptMetaKitWorkspace(configuration: .init(cacheStore: cacheStore))
+        try await restored.registerRoots(
+            [root],
+            replacingGroup: "test.delayed-cache",
+            cacheScope: .fileList
+        )
+        let states = try await restored.cachedFileListStates(
+            rootIDs: [root.rootID],
+            cacheScope: nil
+        )
+        XCTAssertTrue(
+            states[root.rootID]?.availableSnapshot?.scriptFileEntries.contains {
+                $0.name == "Deferred.jsx"
+            } == true
+        )
+    }
+
+    func testShutdownCompletesWhenCallingTaskIsAlreadyCancelled() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.cancelled-shutdown")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let root = ScriptMetaKitRoot(rootID: "cancelled-shutdown", url: rootURL)
+        let workspace = ScriptMetaKitWorkspace()
+        _ = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.cancelled-shutdown",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly
+        )
+
+        let shutdown = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await workspace.shutdown()
+            return true
+        }
+        let didCompleteShutdown = await shutdown.value
+        XCTAssertTrue(didCompleteShutdown)
+        let reused = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.cancelled-shutdown",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly
+        )
+        XCTAssertEqual(reused.roots.first?.status, "ready")
     }
 
     func testWorkspaceSerializesConcurrentReplacementScansForTheSameGroup() async throws {
@@ -906,6 +1381,329 @@ final class ScriptMetaKitAPITests: XCTestCase {
                 $0.name == "sequence-added.jsx"
             } ?? false
         )
+    }
+
+    func testActivationWatcherRestartFailureRollsBackToPreviousWatcher() async throws {
+        let firstURL = try makeTemporaryScriptRoot(scriptID: "com.example.activation.first")
+        let secondURL = try makeTemporaryScriptRoot(scriptID: "com.example.activation.second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+        }
+        let roots = [
+            ScriptMetaKitRoot(rootID: "activation-first", url: firstURL),
+            ScriptMetaKitRoot(rootID: "activation-second", url: secondURL),
+        ]
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        _ = try await workspace.scanRoots(
+            roots,
+            replacingGroup: "test.activation",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListOnly
+        )
+        _ = try await workspace.activateFileListRoot(roots[0].rootID)
+        let sequence = try await workspace.watchChanges(
+            roots: roots,
+            replacingGroup: "test.activation",
+            dirtyOnly: true
+        )
+        let recorder = WatchResultRecorder()
+        let consumer = Task {
+            do {
+                for try await result in sequence {
+                    await recorder.append(result)
+                }
+            } catch {
+                await recorder.record(error)
+            }
+        }
+        _ = try await waitForRecordedWatchResult(recorder, at: 0)
+
+        try await workspace.failNextWatcherStartForTesting()
+        do {
+            _ = try await workspace.activateFileListRoot(roots[1].rootID)
+            XCTFail("injected watcher restart failure was not returned")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("injected watcher start failure"))
+        }
+
+        try "alert('still watched');\n".write(
+            to: firstURL.appendingPathComponent("after-rollback.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let result = try await waitForRecordedWatchResult(recorder, at: 1)
+        XCTAssertTrue(
+            result.fileListSnapshots.first?.children?.contains { $0.name == "after-rollback.jsx" }
+                ?? false
+        )
+        consumer.cancel()
+        await workspace.stopWatching()
+    }
+
+    func testCancelledActivationKeepsPreviousVisibleRoot() async throws {
+        let firstURL = try makeTemporaryScriptRoot(scriptID: "com.example.cancel-activation.first")
+        let secondURL = try makeTemporaryScriptRoot(scriptID: "com.example.cancel-activation.second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+        }
+        let roots = [
+            ScriptMetaKitRoot(rootID: "cancel-first", url: firstURL),
+            ScriptMetaKitRoot(rootID: "cancel-second", url: secondURL),
+        ]
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        _ = try await workspace.scanRoots(
+            roots,
+            replacingGroup: "test.cancel-activation",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListOnly
+        )
+        _ = try await workspace.activateFileListRoot(roots[0].rootID)
+        let activation = Task {
+            await Task.yield()
+            return try await workspace.activateFileListRoot(roots[1].rootID)
+        }
+        activation.cancel()
+        do {
+            _ = try await activation.value
+            XCTFail("cancelled activation completed")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let sequence = try await workspace.watchChanges(
+            roots: roots,
+            replacingGroup: "test.cancel-activation",
+            dirtyOnly: true
+        )
+        var iterator = sequence.makeAsyncIterator()
+        let initialValue = try await iterator.next()
+        let initial = try XCTUnwrap(initialValue)
+        XCTAssertEqual(initial.roots.map(\.rootID), [roots[0].rootID])
+        await workspace.stopWatching()
+    }
+
+    func testActivationRejectsUnknownRootAndCanClearVisibleRoot() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.activation-errors")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let root = ScriptMetaKitRoot(rootID: "activation-errors", url: rootURL)
+        let workspace = ScriptMetaKitWorkspace()
+        _ = try await workspace.scanRoots(
+            [root], replacingGroup: "test.activation-errors", rootIDs: [root.rootID], mode: .fileListOnly
+        )
+        do {
+            _ = try await workspace.activateFileListRoot("unknown")
+            XCTFail("unknown root activation succeeded")
+        } catch let ScriptMetaKitWorkspaceError.unknownRootID(rootID) {
+            XCTAssertEqual(rootID, "unknown")
+        }
+        _ = try await workspace.activateFileListRoot(root.rootID)
+        let cleared = try await workspace.activateFileListRoot(nil)
+        XCTAssertNil(cleared)
+    }
+
+    func testWatchUpdatesIdentifiesReconciliationAndIncrementalDelivery() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.watch-updates")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let root = ScriptMetaKitRoot(
+            rootID: "watch-updates",
+            url: rootURL,
+            watchPolicy: .allRegistered
+        )
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let updates = try await workspace.watchUpdates(
+            roots: [root],
+            replacingGroup: "test.watch-updates",
+            dirtyOnly: true
+        )
+        var iterator = updates.makeAsyncIterator()
+        let initialValue = try await iterator.next()
+        let initial = try XCTUnwrap(initialValue)
+        XCTAssertEqual(initial.sequence, 1)
+        XCTAssertEqual(initial.kind, .reconciliation)
+        XCTAssertTrue(initial.coversAllWatchedRoots)
+
+        try "alert('incremental');\n".write(
+            to: rootURL.appendingPathComponent("incremental.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let incrementalValue = try await iterator.next()
+        let incremental = try XCTUnwrap(incrementalValue)
+        XCTAssertEqual(incremental.sequence, 2)
+        XCTAssertEqual(incremental.kind, .incremental)
+        await workspace.stopWatching()
+    }
+
+    func testWatchUpdateBufferDropProducesDetectableSequenceGap() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.watch-gap")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let workspace = ScriptMetaKitWorkspace()
+        let result = try await workspace.scanRoots(
+            [ScriptMetaKitRoot(rootID: "watch-gap", url: rootURL)],
+            replacingGroup: "test.watch-gap",
+            rootIDs: ["watch-gap"],
+            mode: .fileListOnly
+        )
+        let (updateStream, updateContinuation) = AsyncThrowingStream<ScriptMetaKitWatchUpdate, Error>
+            .makeStream(bufferingPolicy: .bufferingNewest(1))
+        for sequence in 1...3 {
+            var sequencedResult = result
+            sequencedResult.watchDelivery = ScriptMetaKitWatchDelivery(
+                isReconciliation: sequence == 1,
+                coversAllWatchedRoots: true,
+                streamID: "deterministic-gap",
+                sequence: UInt64(sequence)
+            )
+            updateContinuation.yield(ScriptMetaKitWatchUpdate(
+                streamID: "deterministic-gap",
+                sequence: UInt64(sequence),
+                kind: sequence == 1 ? .reconciliation : .incremental,
+                coversAllWatchedRoots: true,
+                result: sequencedResult
+            ))
+        }
+        updateContinuation.finish()
+        let updates = ScriptMetaKitWatchUpdateSequence(stream: updateStream)
+        var iterator = updates.makeAsyncIterator()
+        let deliveredValue = try await iterator.next()
+        let delivered = try XCTUnwrap(deliveredValue)
+        XCTAssertEqual(delivered.sequence, 3)
+        XCTAssertGreaterThan(delivered.sequence, 1)
+    }
+
+    func testOldWatchSequenceTerminationDoesNotStopNewSession() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.watch-session")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let root = ScriptMetaKitRoot(
+            rootID: "watch-session",
+            url: rootURL,
+            watchPolicy: .allRegistered
+        )
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let first = try await workspace.watchChanges(
+            roots: [root],
+            replacingGroup: "test.watch-session",
+            dirtyOnly: true
+        )
+        let (terminationStream, terminationContinuation) = AsyncStream<Void>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let firstConsumer = Task {
+            do {
+                for try await _ in first {}
+            } catch {}
+            terminationContinuation.yield()
+            terminationContinuation.finish()
+        }
+
+        let second = try await workspace.watchUpdates(
+            roots: [root],
+            replacingGroup: "test.watch-session",
+            dirtyOnly: true
+        )
+        var terminationIterator = terminationStream.makeAsyncIterator()
+        _ = await terminationIterator.next()
+        var secondIterator = second.makeAsyncIterator()
+        let initialValue = try await secondIterator.next()
+        let initial = try XCTUnwrap(initialValue)
+        XCTAssertEqual(initial.kind, .reconciliation)
+
+        try "alert('new session');\n".write(
+            to: rootURL.appendingPathComponent("new-session.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let changedValue = try await secondIterator.next()
+        let changed = try XCTUnwrap(changedValue)
+        XCTAssertEqual(changed.kind, .incremental)
+        XCTAssertTrue(
+            changed.result.fileListSnapshots.first?.children?.contains {
+                $0.name == "new-session.jsx"
+            } ?? false
+        )
+        firstConsumer.cancel()
+        await workspace.stopWatching()
+    }
+
+    func testShutdownFinishesActiveWatchSequence() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.watch-shutdown")
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let sequence = try await workspace.watchChanges(
+            roots: [ScriptMetaKitRoot(
+                rootID: "watch-shutdown",
+                url: rootURL,
+                watchPolicy: .allRegistered
+            )],
+            replacingGroup: "test.watch-shutdown",
+            dirtyOnly: true
+        )
+        let recorder = WatchResultRecorder()
+        let consumer = Task {
+            do {
+                for try await result in sequence {
+                    await recorder.append(result)
+                }
+                await recorder.markFinished()
+            } catch {
+                await recorder.record(error)
+            }
+        }
+        _ = try await waitForRecordedWatchResult(recorder, at: 0)
+
+        await workspace.shutdown()
+        for _ in 0..<20 {
+            if await recorder.didFinish {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        let didFinish = await recorder.didFinish
+        XCTAssertTrue(didFinish)
+        consumer.cancel()
+    }
+
+    func testWorkspaceReappliesConfigurationAfterShutdown() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitShutdown-\(UUID().uuidString)", isDirectory: true)
+        let rootURL = container
+            .appendingPathComponent(".Trashes", isDirectory: true)
+            .appendingPathComponent("scripts", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        try "alert('ok');\n".write(
+            to: rootURL.appendingPathComponent("example.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(
+            rootPreflightOptions: ScriptMetaRootPreflightOptions(
+                rejectTrashRoots: false,
+                rejectRestrictedRoots: false,
+                rejectLowScriptDensityLargeRoots: false
+            )
+        ))
+        let root = ScriptMetaKitRoot(rootID: "shutdown-reuse", url: rootURL)
+
+        let first = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.shutdown-reuse",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly
+        )
+        XCTAssertEqual(first.roots.first?.status, "ready")
+
+        await workspace.shutdown()
+        let second = try await workspace.scanRoots(
+            [root],
+            replacingGroup: "test.shutdown-reuse",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly
+        )
+        XCTAssertEqual(second.roots.first?.status, "ready")
     }
 
     func testRequiredWatchPlanRestartSchedulesAReconcile() async throws {
@@ -1148,6 +1946,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
 private actor WatchResultRecorder {
     private var results: [ScriptMetaScanResult] = []
     private(set) var errorMessage: String?
+    private(set) var didFinish = false
 
     func append(_ result: ScriptMetaScanResult) {
         results.append(result)
@@ -1155,6 +1954,10 @@ private actor WatchResultRecorder {
 
     func record(_ error: Error) {
         errorMessage = String(describing: error)
+    }
+
+    func markFinished() {
+        didFinish = true
     }
 
     func result(at index: Int) -> ScriptMetaScanResult? {

@@ -153,6 +153,15 @@ pub fn save_cache_payload(
     path: impl AsRef<Path>,
     payload: &CachePayload,
 ) -> ScriptMetaKitResult<()> {
+    save_cache_payload_with_limit(path, payload, MAX_CACHE_FILE_BYTES)
+}
+
+pub fn save_cache_payload_with_limit(
+    path: impl AsRef<Path>,
+    payload: &CachePayload,
+    max_bytes: u64,
+) -> ScriptMetaKitResult<()> {
+    validate_cache_size_limit(max_bytes)?;
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| ScriptMetaKitError::Io {
@@ -171,19 +180,20 @@ pub fn save_cache_payload(
             path: temp_path.clone(),
             message: error.to_string(),
         })?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(SizeLimitedWriter::new(file, max_bytes));
     serde_json::to_writer(&mut writer, payload)
         .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
     writer.flush().map_err(|error| ScriptMetaKitError::Io {
         path: temp_path.clone(),
         message: error.to_string(),
     })?;
-    let file = writer
+    let writer = writer
         .into_inner()
         .map_err(|error| ScriptMetaKitError::Io {
             path: temp_path.clone(),
             message: error.to_string(),
         })?;
+    let file = writer.into_inner();
     file.sync_all().map_err(|error| ScriptMetaKitError::Io {
         path: temp_path.clone(),
         message: error.to_string(),
@@ -219,6 +229,14 @@ pub fn cache_payload_content_fingerprint(payload: &CachePayload) -> ScriptMetaKi
 }
 
 pub fn load_cache_payload(path: impl AsRef<Path>) -> ScriptMetaKitResult<CachePayload> {
+    load_cache_payload_with_limit(path, MAX_CACHE_FILE_BYTES)
+}
+
+pub fn load_cache_payload_with_limit(
+    path: impl AsRef<Path>,
+    max_bytes: u64,
+) -> ScriptMetaKitResult<CachePayload> {
+    validate_cache_size_limit(max_bytes)?;
     let path = path.as_ref();
     let file_size = fs::metadata(path)
         .map_err(|error| ScriptMetaKitError::Io {
@@ -226,10 +244,10 @@ pub fn load_cache_payload(path: impl AsRef<Path>) -> ScriptMetaKitResult<CachePa
             message: error.to_string(),
         })?
         .len();
-    if file_size > MAX_CACHE_FILE_BYTES {
+    if file_size > max_bytes {
         return Err(ScriptMetaKitError::Cache(format!(
             "cache file exceeds the {} byte safety limit",
-            MAX_CACHE_FILE_BYTES
+            max_bytes
         )));
     }
     let file = File::open(path).map_err(|error| ScriptMetaKitError::Io {
@@ -241,6 +259,15 @@ pub fn load_cache_payload(path: impl AsRef<Path>) -> ScriptMetaKitResult<CachePa
     payload.migrate()
 }
 
+fn validate_cache_size_limit(max_bytes: u64) -> ScriptMetaKitResult<()> {
+    if max_bytes == 0 || max_bytes > MAX_CACHE_FILE_BYTES {
+        return Err(ScriptMetaKitError::InvalidConfig(format!(
+            "cache size limit must be between 1 and {MAX_CACHE_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn temporary_cache_path(path: &Path) -> PathBuf {
     let mut file_name = path
         .file_name()
@@ -248,6 +275,50 @@ fn temporary_cache_path(path: &Path) -> PathBuf {
         .unwrap_or_default();
     file_name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
     path.with_file_name(file_name)
+}
+
+struct SizeLimitedWriter<W> {
+    inner: W,
+    max_bytes: u64,
+    written_bytes: u64,
+}
+
+impl<W> SizeLimitedWriter<W> {
+    fn new(inner: W, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            max_bytes,
+            written_bytes: 0,
+        }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for SizeLimitedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.max_bytes.saturating_sub(self.written_bytes);
+        if u64::try_from(buffer.len()).unwrap_or(u64::MAX) > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "cache file exceeds the {} byte safety limit",
+                    self.max_bytes
+                ),
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written_bytes = self
+            .written_bytes
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 struct TemporaryCacheFile {
@@ -328,4 +399,47 @@ fn replace_cache_file(temp_path: &Path, destination: &Path) -> ScriptMetaKitResu
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::{CachePayload, SizeLimitedWriter, save_cache_payload_with_limit};
+
+    #[test]
+    fn size_limited_writer_rejects_data_beyond_its_limit() {
+        let mut output = Vec::new();
+        let mut writer = SizeLimitedWriter::new(&mut output, 4);
+
+        writer.write_all(b"1234").expect("within limit");
+        let error = writer.write_all(b"5").expect_err("over limit");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(output, b"1234");
+    }
+
+    #[test]
+    fn limited_cache_save_preserves_the_previous_file_when_the_new_payload_is_too_large() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_path = temp.path().join("cache.json");
+        std::fs::write(&cache_path, b"previous").expect("previous cache");
+        let payload = CachePayload::new(
+            crate::CacheScope::Catalog,
+            serde_json::json!({"payload": "larger than the configured limit"}),
+        );
+
+        save_cache_payload_with_limit(&cache_path, &payload, 8).expect_err("size limit");
+
+        assert_eq!(
+            std::fs::read(&cache_path).expect("preserved cache"),
+            b"previous"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("cache directory")
+                .count(),
+            1
+        );
+    }
 }

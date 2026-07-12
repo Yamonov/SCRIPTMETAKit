@@ -316,12 +316,15 @@ fn path_has_package_component(path: &Path, watch_roots: &[PathBuf]) -> bool {
         .components()
         .any(|component| {
             let component_path = Path::new(component.as_os_str());
-            matches!(
-                component_path
-                    .extension()
-                    .and_then(|extension| extension.to_str()),
-                Some("app" | "bundle" | "framework" | "plugin" | "appex")
-            )
+            component_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "app" | "bundle" | "framework" | "plugin" | "appex"
+                    )
+                })
         })
 }
 
@@ -786,12 +789,38 @@ mod platform {
                 | fs::kFSEventStreamEventFlagUnmount)
             != 0;
         let identifies_folder = flags & fs::kFSEventStreamEventFlagItemIsDir != 0;
+        let removes_path = flags
+            & (fs::kFSEventStreamEventFlagItemRemoved | fs::kFSEventStreamEventFlagItemRenamed)
+            != 0;
 
         NativeFsEvent::Changed {
             path,
             may_change_directory_tree,
             identifies_folder,
-            removes_path: false,
+            removes_path,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::PathBuf;
+
+        use super::{NativeFsEvent, event_from_flags, fs};
+
+        #[test]
+        fn removed_fsevent_keeps_deleted_paths_for_reconciliation() {
+            let event = event_from_flags(
+                PathBuf::from("/tmp/folder.data"),
+                fs::kFSEventStreamEventFlagItemRemoved,
+            );
+
+            assert!(matches!(
+                event,
+                NativeFsEvent::Changed {
+                    removes_path: true,
+                    ..
+                }
+            ));
         }
     }
 }
@@ -1014,10 +1043,7 @@ mod platform {
 
     fn watch_root(root: PathBuf, directory: HANDLE, stop_event: HANDLE, sender: NativeEventSender) {
         let mut directory = Some(directory);
-        loop {
-            let Some(directory_handle) = directory else {
-                break;
-            };
+        while let Some(directory_handle) = directory {
             let mut buffer = [0u8; BUFFER_SIZE];
             let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
             let read_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
@@ -1057,6 +1083,7 @@ mod platform {
                 if directory.is_none() {
                     break;
                 }
+                let _ = sender.send(NativeFsEvent::Overflow);
                 continue;
             }
 
@@ -1077,6 +1104,7 @@ mod platform {
                 if directory.is_none() {
                     break;
                 }
+                let _ = sender.send(NativeFsEvent::Overflow);
                 continue;
             }
 
@@ -1095,6 +1123,7 @@ mod platform {
                 if directory.is_none() {
                     break;
                 }
+                let _ = sender.send(NativeFsEvent::Overflow);
                 continue;
             }
 

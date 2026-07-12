@@ -14,5 +14,6 @@ pub use snapshot::{
     CacheInvalidationReason, CacheScope, DirectoryState, DirectoryStateMap, FileEntryChange,
     FileEntryChangeKind, FileIdentity, FileListSnapshot, RefreshRequest, RootError, RootSnapshot,
     RootStatus, ScanChangeSummary, ScanMode, ScanRequest, ScanResult, ScriptMetaCatalogSnapshot,
-    UpdateCheckRequest, UpdateCheckResult, UpdateFailure, UpdateStatus, unresolved_distribution,
+    SnapshotRevision, UpdateCheckRequest, UpdateCheckResult, UpdateFailure, UpdateStatus,
+    unresolved_distribution,
 };

@@ -17,8 +17,9 @@ pub use catalog::{
     ProgressUpdate, RefreshPolicy, RefreshRequest, RootError, RootPriority, RootPurpose,
     RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest,
     ScanResult, ScriptMetaCatalogSnapshot, ScriptMetaKitConfig, ScriptMetaKitEvent,
-    UpdateCheckOptions, UpdateCheckProgress, UpdateCheckProgressPhase, UpdateCheckRequest,
-    UpdateCheckResult, UpdateFailure, UpdateStatus, WatcherOptions, path_based_root_id,
+    SnapshotRevision, UpdateCheckOptions, UpdateCheckProgress, UpdateCheckProgressPhase,
+    UpdateCheckRequest, UpdateCheckResult, UpdateFailure, UpdateStatus, WatcherOptions,
+    path_based_root_id,
 };
 pub use core::{
     DistributionMetadata, DistributionResolution, FileIssue, OperationCancellation,
@@ -60,7 +61,8 @@ pub use scanner::{
 };
 pub use storage::{
     CachePayload, CacheSchema, MAX_CACHE_FILE_BYTES, cache_payload_content_fingerprint,
-    load_cache_payload, save_cache_payload,
+    load_cache_payload, load_cache_payload_with_limit, save_cache_payload,
+    save_cache_payload_with_limit,
 };
 #[cfg(feature = "native-watch")]
 pub use watcher::NativeWatcher;
@@ -102,6 +104,6 @@ mod tests {
     #[test]
     fn exposes_package_metadata() {
         assert_eq!(package_name(), "scriptmetakit");
-        assert_eq!(package_version(), "1.1.3");
+        assert_eq!(package_version(), "1.2.0");
     }
 }

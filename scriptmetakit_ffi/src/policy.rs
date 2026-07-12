@@ -1,5 +1,7 @@
 use scriptmetakit::ScriptMetaKitConfig;
 
+const MAX_WATCHER_PENDING_PATHS: usize = 1_048_576;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SmkOperationalPolicy {
@@ -27,6 +29,7 @@ pub(crate) fn apply_operational_policy(
         || policy.request_timeout_millis == 0
         || policy.resource_timeout_millis == 0
         || policy.watcher_max_pending_paths == 0
+        || policy.watcher_max_pending_paths > MAX_WATCHER_PENDING_PATHS
     {
         return Err("operational policy contains an invalid limit");
     }
@@ -41,4 +44,28 @@ pub(crate) fn apply_operational_policy(
     config.watcher.max_delivery_delay_millis = policy.watcher_max_delivery_delay_millis;
     config.watcher.max_pending_paths = policy.watcher_max_pending_paths;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_WATCHER_PENDING_PATHS, SmkOperationalPolicy, apply_operational_policy};
+
+    #[test]
+    fn rejects_an_excessive_watcher_queue_capacity() {
+        let mut config = scriptmetakit::ScriptMetaKitConfig::default();
+        let policy = SmkOperationalPolicy {
+            max_concurrent_meta_url_checks: 6,
+            retry_attempts: 2,
+            retry_initial_delay_millis: 500,
+            retry_backoff_multiplier: 3,
+            max_retry_delay_millis: 30_000,
+            request_timeout_millis: 15_000,
+            resource_timeout_millis: 15_000,
+            watcher_debounce_delay_millis: 500,
+            watcher_max_delivery_delay_millis: 2_000,
+            watcher_max_pending_paths: MAX_WATCHER_PENDING_PATHS + 1,
+        };
+
+        assert!(apply_operational_policy(&mut config, &policy).is_err());
+    }
 }

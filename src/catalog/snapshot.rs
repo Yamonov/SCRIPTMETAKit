@@ -15,6 +15,21 @@ use crate::{
 
 pub type DirectoryStateMap = BTreeMap<String, DirectoryState>;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRevision {
+    #[serde(default)]
+    pub workspace_epoch: String,
+    #[serde(default)]
+    pub sequence: u64,
+}
+
+impl SnapshotRevision {
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        !self.workspace_epoch.is_empty() && self.sequence > 0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryState {
     pub modification_time_millis: Option<TimestampMillis>,
@@ -47,6 +62,8 @@ pub struct RootSnapshot {
     pub last_event_at: Option<TimestampMillis>,
     pub item_count: usize,
     pub error: Option<RootError>,
+    #[serde(default)]
+    pub state_revision: SnapshotRevision,
 }
 
 impl RootSnapshot {
@@ -61,6 +78,7 @@ impl RootSnapshot {
             last_event_at: None,
             item_count: 0,
             error: None,
+            state_revision: SnapshotRevision::default(),
         }
     }
 }
@@ -91,6 +109,8 @@ pub struct FileListSnapshot {
     pub children: Option<Vec<FileSystemEntry>>,
     pub directory_states: DirectoryStateMap,
     pub truncated: bool,
+    #[serde(default)]
+    pub content_revision: SnapshotRevision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -158,6 +178,10 @@ pub struct ScanResult {
     pub change_summary: Option<ScanChangeSummary>,
     #[serde(default)]
     pub watch_change_batch: Option<crate::watcher::RootChangeBatch>,
+    #[serde(default)]
+    pub watch_reconciliation: bool,
+    #[serde(default)]
+    pub watch_covers_all_roots: bool,
 }
 
 impl ScanResult {

@@ -20,15 +20,15 @@ use scriptmetakit::{
     CachePolicy, CacheScope, CommentSyntax, DirectoryState,
     DistributionMetadataDraft as KitDistributionMetadataDraft, DistributionResolution,
     FileEntryChange, FileEntryChangeKind, FileIdentity, FileIssue, FileListSnapshot,
-    FileSystemEntry, IgnoredWatchPath, MAX_SCRIPT_METADATA_PREVIEW_BYTES, OperationSummary,
-    RefreshPolicy, RootChangeBatch, RootId, RootPriority, RootPurpose, RootRegistration,
-    RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest, ScanResult,
-    ScannablePathResolution, ScannerOptions, ScriptFileInspection, ScriptIdUniquenessItem,
-    ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration, ScriptMetaBackupOptions,
-    ScriptMetaBackupReason, ScriptMetaBackupRecord as KitScriptMetaBackupRecord,
-    ScriptMetaCatalogSnapshot, ScriptMetaEditState, ScriptMetaItem, ScriptMetaKitConfig,
-    ScriptMetaKitEngine, ScriptMetaWriteMode, ScriptMetaWriteOperation,
-    ScriptMetadataDraft as KitScriptMetadataDraft,
+    FileSystemEntry, IgnoredWatchPath, MAX_CACHE_FILE_BYTES, MAX_SCRIPT_METADATA_PREVIEW_BYTES,
+    OperationSummary, RefreshPolicy, RootChangeBatch, RootId, RootPriority, RootPurpose,
+    RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest,
+    ScanResult, ScannablePathResolution, ScannerOptions, ScriptFileInspection,
+    ScriptIdUniquenessItem, ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration,
+    ScriptMetaBackupOptions, ScriptMetaBackupReason,
+    ScriptMetaBackupRecord as KitScriptMetaBackupRecord, ScriptMetaCatalogSnapshot,
+    ScriptMetaEditState, ScriptMetaItem, ScriptMetaKitConfig, ScriptMetaKitEngine,
+    ScriptMetaWriteMode, ScriptMetaWriteOperation, ScriptMetadataDraft as KitScriptMetadataDraft,
     ScriptMetadataEditPreviewResult as KitScriptMetadataEditPreviewResult,
     ScriptMetadataEditReadResult as KitScriptMetadataEditReadResult,
     ScriptMetadataFileWriteResult as KitScriptMetadataFileWriteResult, ScriptRuntimeKind,
@@ -37,11 +37,11 @@ use scriptmetakit::{
     WatchRenameCandidate, WatchRenameConfidence, WatchRescanReason, WatchRescanTarget,
     can_read_directory_contents, clear_scriptmeta_backups, compare_versions,
     create_scriptmeta_backup, generate_edit_password_sha256, inspect_script_file,
-    is_valid_edit_password_sha256, load_cache_payload, normalize_metadata_url,
+    is_valid_edit_password_sha256, load_cache_payload_with_limit, normalize_metadata_url,
     normalize_version_string, read_script_metadata_draft_from_file,
     read_script_metadata_edit_preview_from_file, render_distribution_metadata_block,
     reset_scriptmeta_backups_with_current_as_initial, resolve_registered_path,
-    restore_scriptmeta_backup, save_cache_payload, script_path_may_affect_metadata,
+    restore_scriptmeta_backup, save_cache_payload_with_limit, script_path_may_affect_metadata,
     scriptmeta_backup_generations, supported_script_extensions_text, validate_script_id_uniqueness,
     verify_edit_password_sha256, write_script_metadata_to_file_if_unchanged,
 };
@@ -98,6 +98,14 @@ pub struct SmkRootSnapshot {
     pub item_count: usize,
     pub error_code: SmkUtf8Slice,
     pub error_message: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkRootSnapshotRevision {
+    pub root_index: usize,
+    pub workspace_epoch: SmkUtf8Slice,
+    pub sequence: u64,
 }
 
 #[repr(C)]
@@ -204,6 +212,15 @@ pub struct SmkFileListSnapshot {
     pub first_child_index: usize,
     pub child_count: usize,
     pub truncated: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkFileListSnapshotDetails {
+    pub file_list_index: usize,
+    pub has_children: u8,
+    pub workspace_epoch: SmkUtf8Slice,
+    pub content_sequence: u64,
 }
 
 #[repr(C)]
@@ -426,6 +443,13 @@ pub struct SmkRootSnapshotSlice {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SmkRootSnapshotRevisionSlice {
+    pub ptr: *const SmkRootSnapshotRevision,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmkRegisteredRootSignatureSlice {
     pub ptr: *const SmkRegisteredRootSignature,
     pub len: usize,
@@ -435,6 +459,13 @@ pub struct SmkRegisteredRootSignatureSlice {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SmkFileListSnapshotSlice {
     pub ptr: *const SmkFileListSnapshot,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkFileListSnapshotDetailsSlice {
+    pub ptr: *const SmkFileListSnapshotDetails,
     pub len: usize,
 }
 
@@ -558,6 +589,14 @@ pub struct SmkWatchChangeInfo {
     pub ignored_path_count: usize,
     pub rename_candidate_count: usize,
     pub rescan_target_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchDeliveryInfo {
+    pub is_watch_update: u8,
+    pub is_reconciliation: u8,
+    pub covers_all_watched_roots: u8,
 }
 
 #[repr(C)]
@@ -733,13 +772,16 @@ pub struct SmkEngine {
 struct SmkEngineState {
     engine: ScriptMetaKitEngine,
     last_error: Vec<u8>,
-    saved_cache_fingerprints: BTreeMap<PathBuf, String>,
     #[cfg(feature = "native-watch")]
     watch_reconcile_pending: bool,
     #[cfg(feature = "native-watch")]
     watcher: Option<NativeWatcher>,
     #[cfg(feature = "native-watch")]
     watch_plan: Option<WatchPlan>,
+    #[cfg(feature = "native-watch")]
+    watch_callback: SmkWatchNotificationCallback,
+    #[cfg(feature = "native-watch")]
+    watch_context: usize,
 }
 
 pub struct SmkScanResult {
@@ -749,7 +791,9 @@ pub struct SmkScanResult {
     catalog_info: SmkCatalogInfo,
     registered_root_signatures: Vec<SmkRegisteredRootSignature>,
     roots: Vec<SmkRootSnapshot>,
+    root_revisions: Vec<SmkRootSnapshotRevision>,
     file_lists: Vec<SmkFileListSnapshot>,
+    file_list_details: Vec<SmkFileListSnapshotDetails>,
     file_list_directory_state_ranges: Vec<SmkFileListDirectoryStateRange>,
     file_entries: Vec<SmkFileEntry>,
     directory_states: Vec<SmkDirectoryStateEntry>,
@@ -767,6 +811,7 @@ pub struct SmkScanResult {
     operation_info: SmkOperationInfo,
     file_issues: Vec<SmkFileIssue>,
     watch_info: SmkWatchChangeInfo,
+    watch_delivery_info: SmkWatchDeliveryInfo,
     watch_events: Vec<SmkWatchPathEvent>,
     ignored_watch_paths: Vec<SmkIgnoredWatchPath>,
     watch_rename_candidates: Vec<SmkWatchRenameCandidate>,
@@ -872,13 +917,16 @@ pub unsafe extern "C" fn smk_engine_create_default(out_engine: *mut *mut SmkEngi
             state: Mutex::new(SmkEngineState {
                 engine,
                 last_error: Vec::new(),
-                saved_cache_fingerprints: BTreeMap::new(),
                 #[cfg(feature = "native-watch")]
                 watch_reconcile_pending: false,
                 #[cfg(feature = "native-watch")]
                 watcher: None,
                 #[cfg(feature = "native-watch")]
                 watch_plan: None,
+                #[cfg(feature = "native-watch")]
+                watch_callback: None,
+                #[cfg(feature = "native-watch")]
+                watch_context: 0,
             }),
             cancellation,
             cancellation_reservation: Mutex::new(None),
@@ -1167,19 +1215,26 @@ pub unsafe extern "C" fn smk_engine_set_native_event_latency_millis(
     engine: *mut SmkEngine,
     latency_millis: u64,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        engine
-            .engine
-            .config_mut()
-            .watcher
-            .native_event_latency_millis = latency_millis;
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate.config_mut().watcher.native_event_latency_millis = latency_millis;
+            Ok(())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
         Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1192,23 +1247,35 @@ pub unsafe extern "C" fn smk_engine_set_operational_policy(
     engine: *mut SmkEngine,
     policy: *const SmkOperationalPolicy,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
-        let policy = unsafe { policy.as_ref() }.ok_or((
+        let policy = *unsafe { policy.as_ref() }.ok_or((
             SmkStatus::NullArgument,
             "operational policy must not be null".to_string(),
         ))?;
         engine.clear_error();
-        if let Err(message) = apply_operational_policy(engine.engine.config_mut(), policy) {
-            let message = message.to_string();
-            engine.set_error(&message);
-            return Err((SmkStatus::InvalidArgument, message));
+        let mut candidate_config = engine.engine.config().clone();
+        if let Err(message) = apply_operational_policy(&mut candidate_config, &policy) {
+            engine.set_error(message);
+            return Err((SmkStatus::InvalidArgument, message.to_string()));
         }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            *candidate.config_mut() = candidate_config;
+            Ok(())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
         Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1518,23 +1585,30 @@ pub unsafe extern "C" fn smk_engine_set_roots(
     roots_ptr: *const SmkRootRegistration,
     root_count: usize,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
 
-        match engine.engine.set_roots(roots) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                engine.set_error(&message);
-                Err((SmkStatus::EngineError, message))
-            }
-        }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate
+                .set_roots(roots)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1553,24 +1627,31 @@ pub unsafe extern "C" fn smk_engine_replace_root_group(
     roots_ptr: *const SmkRootRegistration,
     root_count: usize,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
 
-        match engine.engine.replace_root_group(group_id, roots) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                engine.set_error(&message);
-                Err((SmkStatus::EngineError, message))
-            }
-        }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate
+                .replace_root_group(group_id, roots)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1589,24 +1670,31 @@ pub unsafe extern "C" fn smk_engine_insert_roots_into_group(
     roots_ptr: *const SmkRootRegistration,
     root_count: usize,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
         let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
         let roots = root_registrations_from_raw(roots_ptr, root_count)?;
 
-        match engine.engine.insert_roots_into_group(group_id, roots) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                engine.set_error(&message);
-                Err((SmkStatus::EngineError, message))
-            }
-        }
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate
+                .insert_roots_into_group(group_id, roots)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1622,6 +1710,7 @@ pub unsafe extern "C" fn smk_engine_set_visible_root(
     root_id: SmkUtf8Slice,
     has_root_id: u8,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
@@ -1630,7 +1719,52 @@ pub unsafe extern "C" fn smk_engine_set_visible_root(
         } else {
             Some(required_str_from_slice(root_id, "root_id")?.into())
         };
-        engine.engine.set_visible_root(root_id);
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            if let Some(root_id) = root_id.as_ref()
+                && !candidate
+                    .roots()
+                    .iter()
+                    .any(|root| root.root_id == *root_id)
+            {
+                return Err(format!("unknown visible root_id `{root_id}`"));
+            }
+            candidate.set_visible_root(root_id);
+            Ok(())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine`, `root`, and `out_result` must be live pointers for this call.
+/// The preflight does not register the root or retain scan/catalog state.
+pub unsafe extern "C" fn smk_engine_preflight_root(
+    engine: *mut SmkEngine,
+    root: *const SmkRootRegistration,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let mut engine = engine_mut(engine)?;
+        let root = root_registration_from_ffi(input_ref(root, "root registration")?)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let result = engine.engine.preflight_root(root);
+        *out_result = Box::into_raw(Box::new(SmkScanResult::from_scan_result(result, None)));
         Ok(())
     });
 
@@ -2170,11 +2304,29 @@ pub unsafe extern "C" fn smk_engine_load_cache_file(
     engine: *mut SmkEngine,
     cache_path: SmkUtf8Slice,
 ) -> SmkStatus {
+    // SAFETY: this function has the same pointer and lifetime requirements as
+    // `smk_engine_load_cache_file_with_limit`.
+    unsafe { smk_engine_load_cache_file_with_limit(engine, cache_path, MAX_CACHE_FILE_BYTES) }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `cache_path` must contain a valid
+/// UTF-8 file path. `max_bytes` must be between 1 and `MAX_CACHE_FILE_BYTES`.
+pub unsafe extern "C" fn smk_engine_load_cache_file_with_limit(
+    engine: *mut SmkEngine,
+    cache_path: SmkUtf8Slice,
+    max_bytes: u64,
+) -> SmkStatus {
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
+        let max_bytes = validate_cache_size_limit_ffi(max_bytes).inspect_err(|error| {
+            engine.set_error(&error.1);
+        })?;
         let cache_path = path_from_slice(cache_path)?;
-        let payload = load_cache_payload(&cache_path).map_err(|error| {
+        let payload = load_cache_payload_with_limit(&cache_path, max_bytes).map_err(|error| {
             let message = error.to_string();
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
@@ -2203,38 +2355,89 @@ pub unsafe extern "C" fn smk_engine_save_cache_file(
     scope: u32,
     cache_path: SmkUtf8Slice,
 ) -> SmkStatus {
+    // SAFETY: this function has the same pointer and lifetime requirements as
+    // `smk_engine_save_cache_file_with_limit`.
+    unsafe {
+        smk_engine_save_cache_file_with_limit(engine, scope, cache_path, MAX_CACHE_FILE_BYTES)
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `cache_path` must contain a valid
+/// UTF-8 file path. Parent directories are created by Kit when needed.
+/// `max_bytes` must be between 1 and `MAX_CACHE_FILE_BYTES`.
+pub unsafe extern "C" fn smk_engine_save_cache_file_with_limit(
+    engine: *mut SmkEngine,
+    scope: u32,
+    cache_path: SmkUtf8Slice,
+    max_bytes: u64,
+) -> SmkStatus {
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
 
         let scope = cache_scope_from_u32(scope)?;
-        let cache_path = path_from_slice(cache_path)?;
-        let payload = engine.engine.export_cache(scope).map_err(|error| {
-            let message = error.to_string();
-            engine.set_error(&message);
-            (SmkStatus::EngineError, message)
+        let max_bytes = validate_cache_size_limit_ffi(max_bytes).inspect_err(|error| {
+            engine.set_error(&error.1);
         })?;
+        let cache_path = path_from_slice(cache_path)?;
+        let (existing_payload, existing_fingerprint, existing_load_error) = if cache_path.is_file()
+        {
+            match load_cache_payload_with_limit(&cache_path, max_bytes) {
+                Ok(payload) => match cache_payload_content_fingerprint(&payload) {
+                    Ok(fingerprint) => (Some(payload), Some(fingerprint), None),
+                    Err(error) => (None, None, Some(error.to_string())),
+                },
+                Err(error) => (None, None, Some(error.to_string())),
+            }
+        } else {
+            (None, None, None)
+        };
+        let had_valid_existing_payload = existing_payload.is_some();
+        let payload = match engine.engine.export_cache_merged(scope, existing_payload) {
+            Ok(payload) => payload,
+            Err(merge_error) if had_valid_existing_payload => {
+                match engine.engine.export_cache_merged(scope, None) {
+                    Ok(payload) => payload,
+                    Err(standalone_error) => {
+                        let message = format!(
+                            "existing cache cannot be merged ({merge_error}); resident cache cannot replace it ({standalone_error})"
+                        );
+                        engine.set_error(&message);
+                        return Err((SmkStatus::EngineError, message));
+                    }
+                }
+            }
+            Err(export_error) => {
+                let message = existing_load_error.map_or_else(
+                    || export_error.to_string(),
+                    |load_error| {
+                        format!(
+                            "existing cache cannot be loaded ({load_error}); resident cache cannot replace it ({export_error})"
+                        )
+                    },
+                );
+                engine.set_error(&message);
+                return Err((SmkStatus::EngineError, message));
+            }
+        };
         let fingerprint = cache_payload_content_fingerprint(&payload).map_err(|error| {
             let message = error.to_string();
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })?;
-        if engine
-            .saved_cache_fingerprints
-            .get(&cache_path)
-            .is_some_and(|saved| saved == &fingerprint)
-            && cache_path.is_file()
-        {
+        if existing_fingerprint.as_ref() == Some(&fingerprint) && cache_path.is_file() {
+            engine.engine.mark_cache_persisted(scope);
             return Ok(());
         }
-        save_cache_payload(&cache_path, &payload).map_err(|error| {
+        save_cache_payload_with_limit(&cache_path, &payload, max_bytes).map_err(|error| {
             let message = error.to_string();
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })?;
-        engine
-            .saved_cache_fingerprints
-            .insert(cache_path, fingerprint);
+        engine.engine.mark_cache_persisted(scope);
         Ok(())
     });
 
@@ -2452,6 +2655,25 @@ pub unsafe extern "C" fn smk_scan_result_roots(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `result` must be a live scan result and `out_revisions` must be writable.
+/// The returned slice remains valid only until `result` is freed.
+pub unsafe extern "C" fn smk_scan_result_root_revisions(
+    result: *const SmkScanResult,
+    out_revisions: *mut SmkRootSnapshotRevisionSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        *out_mut(out_revisions)? = SmkRootSnapshotRevisionSlice {
+            ptr: result.root_revisions.as_ptr(),
+            len: result.root_revisions.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `result` must be a live scan result handle. `out_info` must be a valid,
 /// writable pointer.
 pub unsafe extern "C" fn smk_scan_result_catalog_info(
@@ -2503,6 +2725,25 @@ pub unsafe extern "C" fn smk_scan_result_file_lists(
         *out_file_lists = SmkFileListSnapshotSlice {
             ptr: result.file_lists.as_ptr(),
             len: result.file_lists.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result and `out_details` must be writable.
+/// The returned slice remains valid only until `result` is freed.
+pub unsafe extern "C" fn smk_scan_result_file_list_details(
+    result: *const SmkScanResult,
+    out_details: *mut SmkFileListSnapshotDetailsSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        *out_mut(out_details)? = SmkFileListSnapshotDetailsSlice {
+            ptr: result.file_list_details.as_ptr(),
+            len: result.file_list_details.len(),
         };
         Ok(())
     })
@@ -2836,6 +3077,21 @@ pub unsafe extern "C" fn smk_scan_result_watch_change_info(
         let result = scan_result_ref(result)?;
         let out_info = out_mut(out_info)?;
         *out_info = result.watch_info;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle and `out_info` must be writable.
+pub unsafe extern "C" fn smk_scan_result_watch_delivery_info(
+    result: *const SmkScanResult,
+    out_info: *mut SmkWatchDeliveryInfo,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        *out_mut(out_info)? = result.watch_delivery_info;
         Ok(())
     })
 }
@@ -3670,26 +3926,106 @@ fn scan_selected_roots(
 }
 
 #[cfg(feature = "native-watch")]
+type PendingWatchNotification = Option<(extern "C" fn(context: *mut c_void), usize)>;
+
+#[cfg(not(feature = "native-watch"))]
+type PendingWatchNotification = ();
+
+#[cfg(feature = "native-watch")]
+fn native_watcher_for_plan(
+    plan: &WatchPlan,
+    callback: SmkWatchNotificationCallback,
+    context: usize,
+) -> Result<NativeWatcher, String> {
+    if plan.physical_roots.is_empty() {
+        return Err("watch plan has no active physical roots".to_string());
+    }
+    if let Some(callback) = callback {
+        NativeWatcher::start_with_notifier(
+            plan,
+            Some(Arc::new(move || {
+                callback(context as *mut c_void);
+            })),
+        )
+    } else {
+        NativeWatcher::start(plan)
+    }
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "native-watch")]
+fn apply_engine_reconfiguration(
+    state: &mut SmkEngineState,
+    mutate: impl FnOnce(&mut ScriptMetaKitEngine) -> Result<(), String>,
+) -> Result<PendingWatchNotification, String> {
+    let mut candidate = state.engine.clone_for_reconfiguration();
+    mutate(&mut candidate)?;
+    let candidate_plan = candidate.watch_plan();
+    let replacement =
+        if state.watcher.is_some() && state.watch_plan.as_ref() != Some(&candidate_plan) {
+            Some(native_watcher_for_plan(
+                &candidate_plan,
+                state.watch_callback,
+                state.watch_context,
+            )?)
+        } else {
+            None
+        };
+
+    state.engine = candidate;
+    if let Some(replacement) = replacement {
+        state.watcher = Some(replacement);
+        state.watch_plan = Some(candidate_plan);
+        state.watch_reconcile_pending = true;
+        return Ok(state
+            .watch_callback
+            .map(|callback| (callback, state.watch_context)));
+    }
+    Ok(None)
+}
+
+#[cfg(not(feature = "native-watch"))]
+fn apply_engine_reconfiguration(
+    state: &mut SmkEngineState,
+    mutate: impl FnOnce(&mut ScriptMetaKitEngine) -> Result<(), String>,
+) -> Result<PendingWatchNotification, String> {
+    let mut candidate = state.engine.clone_for_reconfiguration();
+    mutate(&mut candidate)?;
+    state.engine = candidate;
+    Ok(())
+}
+
+fn emit_pending_watch_notification(notification: PendingWatchNotification) {
+    #[cfg(feature = "native-watch")]
+    if let Some((callback, context)) = notification {
+        callback(context as *mut c_void);
+    }
+    #[cfg(not(feature = "native-watch"))]
+    let () = notification;
+}
+
+fn empty_pending_watch_notification() -> PendingWatchNotification {
+    #[cfg(feature = "native-watch")]
+    {
+        None
+    }
+    #[cfg(not(feature = "native-watch"))]
+    {}
+}
+
+#[cfg(feature = "native-watch")]
 fn start_watching_engine(
     engine: &mut SmkEngineState,
     callback: SmkWatchNotificationCallback,
     context: *mut c_void,
 ) -> Result<(), String> {
     let plan = engine.engine.watch_plan();
-    let watcher = if let Some(callback) = callback {
-        let context = context as usize;
-        NativeWatcher::start_with_notifier(
-            &plan,
-            Some(Arc::new(move || {
-                callback(context as *mut c_void);
-            })),
-        )
-    } else {
-        NativeWatcher::start(&plan)
-    }
-    .map_err(|error| error.to_string())?;
+    let context = context as usize;
+    let watcher = native_watcher_for_plan(&plan, callback, context)?;
     engine.watcher = Some(watcher);
     engine.watch_plan = Some(plan);
+    engine.watch_callback = callback;
+    engine.watch_context = context;
     engine.watch_reconcile_pending = true;
     Ok(())
 }
@@ -3708,6 +4044,8 @@ fn stop_watching_engine(engine: &mut SmkEngineState) {
     engine.watcher = None;
     engine.watch_plan = None;
     engine.watch_reconcile_pending = false;
+    engine.watch_callback = None;
+    engine.watch_context = 0;
 }
 
 #[cfg(not(feature = "native-watch"))]
@@ -3730,7 +4068,8 @@ fn poll_watcher_scan(
             batch = Some(next_batch);
         }
     }
-    if engine.watch_reconcile_pending {
+    let plan_reconciliation = engine.watch_reconcile_pending;
+    if plan_reconciliation {
         let reconcile_paths = engine
             .watch_plan
             .as_ref()
@@ -3754,6 +4093,7 @@ fn poll_watcher_scan(
     let Some(mut batch) = batch else {
         return Ok(None);
     };
+    let is_reconciliation = plan_reconciliation || batch.overflowed;
     batch.paths.sort();
     batch.paths.dedup();
 
@@ -3784,6 +4124,24 @@ fn poll_watcher_scan(
     if dirty_only {
         filter_dirty_scan_result(&mut scan_result, &affected_root_ids);
     }
+    let result_root_ids = scan_result
+        .roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<BTreeSet<_>>();
+    let watched_root_ids = engine
+        .watch_plan
+        .as_ref()
+        .map(|plan| {
+            plan.logical_roots
+                .iter()
+                .filter(|root| root.active && root.physical_index.is_some())
+                .map(|root| root.root_id.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    scan_result.watch_reconciliation = is_reconciliation;
+    scan_result.watch_covers_all_roots = watched_root_ids.is_subset(&result_root_ids);
     scan_result.watch_change_batch = Some(change_batch);
     Ok(Some(SmkScanResult::from_scan_result(scan_result, None)))
 }
@@ -3857,7 +4215,9 @@ impl SmkScanResult {
                     Vec::with_capacity(snapshot.candidate_cache.registered_roots.len())
                 }),
             roots: Vec::with_capacity(scan_result.roots.len()),
+            root_revisions: Vec::with_capacity(scan_result.roots.len()),
             file_lists: Vec::with_capacity(scan_result.file_list_snapshots.len()),
+            file_list_details: Vec::with_capacity(scan_result.file_list_snapshots.len()),
             file_list_directory_state_ranges: Vec::with_capacity(
                 scan_result.file_list_snapshots.len(),
             ),
@@ -3898,6 +4258,11 @@ impl SmkScanResult {
             operation_info: SmkOperationInfo::default(),
             file_issues: Vec::with_capacity(scan_result.file_issues.len()),
             watch_info: SmkWatchChangeInfo::default(),
+            watch_delivery_info: SmkWatchDeliveryInfo {
+                is_watch_update: bool_byte(scan_result.watch_change_batch.is_some()),
+                is_reconciliation: bool_byte(scan_result.watch_reconciliation),
+                covers_all_watched_roots: bool_byte(scan_result.watch_covers_all_roots),
+            },
             watch_events: Vec::new(),
             ignored_watch_paths: Vec::new(),
             watch_rename_candidates: Vec::new(),
@@ -3967,7 +4332,9 @@ impl SmkScanResult {
             catalog_info: SmkCatalogInfo::default(),
             registered_root_signatures: Vec::new(),
             roots: Vec::new(),
+            root_revisions: Vec::new(),
             file_lists: Vec::new(),
+            file_list_details: Vec::new(),
             file_list_directory_state_ranges: Vec::new(),
             file_entries: Vec::new(),
             directory_states: Vec::new(),
@@ -3985,6 +4352,7 @@ impl SmkScanResult {
             operation_info: SmkOperationInfo::default(),
             file_issues: Vec::new(),
             watch_info: SmkWatchChangeInfo::default(),
+            watch_delivery_info: SmkWatchDeliveryInfo::default(),
             watch_events: Vec::new(),
             ignored_watch_paths: Vec::new(),
             watch_rename_candidates: Vec::new(),
@@ -3997,6 +4365,7 @@ impl SmkScanResult {
     }
 
     fn push_root(&mut self, root: &RootSnapshot) {
+        let root_index = self.roots.len();
         let (has_last_loaded_at, last_loaded_at) = optional_u64(root.last_loaded_at);
         let (has_last_event_at, last_event_at) = optional_u64(root.last_event_at);
         let ffi_root = SmkRootSnapshot {
@@ -4014,6 +4383,12 @@ impl SmkScanResult {
                 .push_string(root.error.as_ref().map(|error| error.message.as_str())),
         };
         self.roots.push(ffi_root);
+        let workspace_epoch = self.push_string(Some(&root.state_revision.workspace_epoch));
+        self.root_revisions.push(SmkRootSnapshotRevision {
+            root_index,
+            workspace_epoch,
+            sequence: root.state_revision.sequence,
+        });
     }
 
     fn push_catalog_info(&mut self, snapshot: &ScriptMetaCatalogSnapshot) {
@@ -4085,11 +4460,19 @@ impl SmkScanResult {
             .get(snapshot.root.root_id.as_ref())
             .copied()
             .unwrap_or(usize::MAX);
+        let file_list_index = self.file_lists.len();
         self.file_lists.push(SmkFileListSnapshot {
             root_index,
             first_child_index,
             child_count,
             truncated: bool_byte(snapshot.truncated),
+        });
+        let workspace_epoch = self.push_string(Some(&snapshot.content_revision.workspace_epoch));
+        self.file_list_details.push(SmkFileListSnapshotDetails {
+            file_list_index,
+            has_children: bool_byte(snapshot.children.is_some()),
+            workspace_epoch,
+            content_sequence: snapshot.content_revision.sequence,
         });
     }
 
@@ -4805,7 +5188,9 @@ fn total_string_bytes(
                     )
                 })
                 .sum::<usize>();
-            entry_bytes.saturating_add(directory_state_bytes)
+            entry_bytes
+                .saturating_add(directory_state_bytes)
+                .saturating_add(snapshot.content_revision.workspace_epoch.len())
         })
         .sum::<usize>();
     let item_bytes = scan_result.catalog_snapshot.as_ref().map_or(0, |snapshot| {
@@ -4875,6 +5260,7 @@ fn root_string_bytes(root: &RootSnapshot) -> usize {
     root.root_id
         .len()
         .saturating_add(root.path.to_string_lossy().len())
+        .saturating_add(root.state_revision.workspace_epoch.len())
         .saturating_add(root.error.as_ref().map_or(0, |error| {
             error.code.len().saturating_add(error.message.len())
         }))
@@ -5639,7 +6025,7 @@ fn cache_scope_from_u32(value: u32) -> Result<CacheScope, (SmkStatus, String)> {
         0 => Ok(CacheScope::All),
         1 => Ok(CacheScope::Catalog),
         2 => Ok(CacheScope::FileList),
-        3 => Ok(CacheScope::Root),
+        3 => Ok(CacheScope::FileList),
         _ => Err((
             SmkStatus::InvalidArgument,
             format!("unknown cache scope `{value}`"),
@@ -5647,12 +6033,22 @@ fn cache_scope_from_u32(value: u32) -> Result<CacheScope, (SmkStatus, String)> {
     }
 }
 
+fn validate_cache_size_limit_ffi(value: u64) -> Result<u64, (SmkStatus, String)> {
+    if value == 0 || value > MAX_CACHE_FILE_BYTES {
+        return Err((
+            SmkStatus::InvalidArgument,
+            format!("cache size limit must be between 1 and {MAX_CACHE_FILE_BYTES} bytes"),
+        ));
+    }
+    Ok(value)
+}
+
 fn refresh_policy_from_u32(value: u32) -> Result<RefreshPolicy, (SmkStatus, String)> {
     match value {
         0 => Ok(RefreshPolicy::ManualOnly),
         1 => Ok(RefreshPolicy::OnVisible),
         2 => Ok(RefreshPolicy::OnFileEvent),
-        3 => Ok(RefreshPolicy::OnFileEventDeferred),
+        3 => Ok(RefreshPolicy::OnFileEvent),
         4 => Ok(RefreshPolicy::Scheduled),
         _ => Err((
             SmkStatus::InvalidArgument,
@@ -5976,6 +6372,32 @@ fn script_meta_backup_reason_string(reason: ScriptMetaBackupReason) -> &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn legacy_snapshot_struct_layout_is_unchanged() {
+        assert_eq!(std::mem::size_of::<SmkRootSnapshot>(), 120);
+        assert_eq!(std::mem::align_of::<SmkRootSnapshot>(), 8);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, root_id), 0);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, path), 16);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, status), 32);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, is_dirty), 48);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, last_loaded_at), 56);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, last_event_at), 72);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, item_count), 80);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, error_code), 88);
+        assert_eq!(std::mem::offset_of!(SmkRootSnapshot, error_message), 104);
+
+        assert_eq!(std::mem::size_of::<SmkFileListSnapshot>(), 32);
+        assert_eq!(std::mem::align_of::<SmkFileListSnapshot>(), 8);
+        assert_eq!(std::mem::offset_of!(SmkFileListSnapshot, root_index), 0);
+        assert_eq!(
+            std::mem::offset_of!(SmkFileListSnapshot, first_child_index),
+            8
+        );
+        assert_eq!(std::mem::offset_of!(SmkFileListSnapshot, child_count), 16);
+        assert_eq!(std::mem::offset_of!(SmkFileListSnapshot, truncated), 24);
+    }
 
     fn slice_text(slice: SmkUtf8Slice) -> String {
         if slice.len == 0 {

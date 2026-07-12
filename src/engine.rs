@@ -20,8 +20,9 @@ use crate::{
         FileListSnapshot, RefreshPolicy, RefreshRequest, RootPriority, RootPurpose,
         RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest,
         ScanResult, ScriptMetaCatalogSnapshot, ScriptMetaKitConfig, ScriptMetaKitEvent,
-        UpdateCheckProgress, UpdateCheckProgressPhase, UpdateCheckRequest, UpdateCheckResult,
-        UpdateFailure, UpdateStatus, path_based_root_id, unresolved_distribution,
+        SnapshotRevision, UpdateCheckProgress, UpdateCheckProgressPhase, UpdateCheckRequest,
+        UpdateCheckResult, UpdateFailure, UpdateStatus, path_based_root_id,
+        unresolved_distribution,
     },
     core::{
         FileIssue, OperationCancellation, OperationSummary, ScriptMetaItem, ScriptMetaItemRef,
@@ -61,13 +62,35 @@ pub struct ScriptMetaKitEngine {
     update_check_result: Option<Arc<UpdateCheckResult>>,
     dirty_roots: BTreeMap<RootId, DirtyRootState>,
     last_memory_cache_accessed_at: Option<crate::TimestampMillis>,
-    memory_cache_export_allowed: bool,
+    evicted_file_list_roots: BTreeSet<RootId>,
+    evicted_catalog_roots: BTreeSet<RootId>,
+    persisted_file_list_revisions: BTreeMap<RootId, SnapshotRevision>,
+    catalog_persistence_is_current: bool,
+    pending_file_list_persistence: BTreeMap<RootId, Arc<FileListSnapshot>>,
+    cache_unavailable_revisions: BTreeMap<RootId, SnapshotRevision>,
+    pending_catalog_persistence: Option<Arc<ScriptMetaCatalogSnapshot>>,
+    pending_update_check_persistence: Option<Arc<UpdateCheckResult>>,
+    invalidate_persistent_file_list_on_next_export: bool,
+    invalidate_persistent_catalog_on_next_export: bool,
     http_validation_cache: HttpValidationCache,
     cancellation: OperationCancellation,
+    workspace_epoch: String,
+    next_revision_sequence: u64,
 }
 
 impl Clone for ScriptMetaKitEngine {
     fn clone(&self) -> Self {
+        let mut cloned = self.clone_preserving_identity();
+        cloned.cancellation = OperationCancellation::new();
+        cloned.workspace_epoch = Uuid::new_v4().to_string();
+        cloned.next_revision_sequence = 1;
+        cloned.reissue_all_revisions();
+        cloned
+    }
+}
+
+impl ScriptMetaKitEngine {
+    fn clone_preserving_identity(&self) -> Self {
         Self {
             config: self.config.clone(),
             roots: self.roots.clone(),
@@ -81,10 +104,29 @@ impl Clone for ScriptMetaKitEngine {
             update_check_result: self.update_check_result.clone(),
             dirty_roots: self.dirty_roots.clone(),
             last_memory_cache_accessed_at: self.last_memory_cache_accessed_at,
-            memory_cache_export_allowed: self.memory_cache_export_allowed,
+            evicted_file_list_roots: self.evicted_file_list_roots.clone(),
+            evicted_catalog_roots: self.evicted_catalog_roots.clone(),
+            persisted_file_list_revisions: self.persisted_file_list_revisions.clone(),
+            catalog_persistence_is_current: self.catalog_persistence_is_current,
+            pending_file_list_persistence: self.pending_file_list_persistence.clone(),
+            cache_unavailable_revisions: self.cache_unavailable_revisions.clone(),
+            pending_catalog_persistence: self.pending_catalog_persistence.clone(),
+            pending_update_check_persistence: self.pending_update_check_persistence.clone(),
+            invalidate_persistent_file_list_on_next_export: self
+                .invalidate_persistent_file_list_on_next_export,
+            invalidate_persistent_catalog_on_next_export: self
+                .invalidate_persistent_catalog_on_next_export,
             http_validation_cache: self.http_validation_cache.clone(),
-            cancellation: OperationCancellation::new(),
+            cancellation: self.cancellation.clone(),
+            workspace_epoch: self.workspace_epoch.clone(),
+            next_revision_sequence: self.next_revision_sequence,
         }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn clone_for_reconfiguration(&self) -> Self {
+        self.clone_preserving_identity()
     }
 }
 
@@ -133,10 +175,124 @@ impl ScriptMetaKitEngine {
             update_check_result: None,
             dirty_roots: BTreeMap::new(),
             last_memory_cache_accessed_at: None,
-            memory_cache_export_allowed: true,
+            evicted_file_list_roots: BTreeSet::new(),
+            evicted_catalog_roots: BTreeSet::new(),
+            persisted_file_list_revisions: BTreeMap::new(),
+            catalog_persistence_is_current: false,
+            pending_file_list_persistence: BTreeMap::new(),
+            cache_unavailable_revisions: BTreeMap::new(),
+            pending_catalog_persistence: None,
+            pending_update_check_persistence: None,
+            invalidate_persistent_file_list_on_next_export: false,
+            invalidate_persistent_catalog_on_next_export: false,
             http_validation_cache: HttpValidationCache::default(),
             cancellation: OperationCancellation::new(),
+            workspace_epoch: Uuid::new_v4().to_string(),
+            next_revision_sequence: 1,
         })
+    }
+
+    fn issue_revision(&mut self) -> SnapshotRevision {
+        if self.next_revision_sequence == u64::MAX {
+            self.workspace_epoch = Uuid::new_v4().to_string();
+            self.next_revision_sequence = 1;
+        }
+        let revision = SnapshotRevision {
+            workspace_epoch: self.workspace_epoch.clone(),
+            sequence: self.next_revision_sequence,
+        };
+        self.next_revision_sequence += 1;
+        revision
+    }
+
+    fn reissue_all_revisions(&mut self) {
+        let mut root_revisions = BTreeMap::<RootId, SnapshotRevision>::new();
+        let mut root_ids = self.root_snapshots.keys().cloned().collect::<BTreeSet<_>>();
+        root_ids.extend(
+            self.catalog_snapshot
+                .iter()
+                .flat_map(|snapshot| snapshot.roots.iter().map(|root| root.root_id.clone())),
+        );
+        root_ids.extend(
+            self.pending_catalog_persistence
+                .iter()
+                .flat_map(|snapshot| snapshot.roots.iter().map(|root| root.root_id.clone())),
+        );
+        for root_id in root_ids {
+            root_revisions.insert(root_id, self.issue_revision());
+        }
+        for (root_id, root) in &mut self.root_snapshots {
+            if let Some(revision) = root_revisions.get(root_id) {
+                root.state_revision.clone_from(revision);
+            }
+        }
+
+        let mut content_revisions = BTreeMap::<RootId, SnapshotRevision>::new();
+        let persisted_content_root_ids = self
+            .file_list_snapshots
+            .iter()
+            .chain(self.pending_file_list_persistence.iter())
+            .filter(|(root_id, snapshot)| {
+                self.persisted_file_list_revisions
+                    .get(*root_id)
+                    .is_some_and(|revision| revision == &snapshot.content_revision)
+            })
+            .map(|(root_id, _)| root_id.clone())
+            .collect::<BTreeSet<_>>();
+        let content_root_ids = self
+            .file_list_snapshots
+            .iter()
+            .chain(self.pending_file_list_persistence.iter())
+            .filter(|(_, snapshot)| snapshot.children.is_some())
+            .map(|(root_id, _)| root_id.clone())
+            .collect::<BTreeSet<_>>();
+        for root_id in content_root_ids {
+            content_revisions.insert(root_id, self.issue_revision());
+        }
+        for root_id in persisted_content_root_ids {
+            if let Some(revision) = content_revisions.get(&root_id) {
+                self.persisted_file_list_revisions
+                    .insert(root_id, revision.clone());
+            }
+        }
+        for snapshots in [
+            &mut self.file_list_snapshots,
+            &mut self.pending_file_list_persistence,
+        ] {
+            for (root_id, snapshot) in snapshots {
+                let snapshot = Arc::make_mut(snapshot);
+                snapshot.content_revision = snapshot
+                    .children
+                    .as_ref()
+                    .and_then(|_| content_revisions.get(root_id).cloned())
+                    .unwrap_or_default();
+                if let Some(revision) = root_revisions.get(root_id) {
+                    snapshot.root.state_revision.clone_from(revision);
+                }
+            }
+        }
+        let unavailable_root_ids = self
+            .cache_unavailable_revisions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for root_id in unavailable_root_ids {
+            let revision = self.issue_revision();
+            self.cache_unavailable_revisions.insert(root_id, revision);
+        }
+        for catalog in [
+            &mut self.catalog_snapshot,
+            &mut self.pending_catalog_persistence,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for root in &mut Arc::make_mut(catalog).roots {
+                if let Some(revision) = root_revisions.get(&root.root_id) {
+                    root.state_revision.clone_from(revision);
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -153,8 +309,9 @@ impl ScriptMetaKitEngine {
         &mut self,
         roots: Vec<RootRegistration>,
     ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
+        let events = self.apply_roots(roots)?;
         self.root_groups.clear();
-        self.apply_roots(roots)
+        Ok(events)
     }
 
     pub fn replace_root_group(
@@ -164,12 +321,16 @@ impl ScriptMetaKitEngine {
     ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
         self.expire_idle_memory_cache();
         let group_id = group_id.into();
+        let mut candidate_groups = self.root_groups.clone();
         if roots.is_empty() {
-            self.root_groups.remove(&group_id);
+            candidate_groups.remove(&group_id);
         } else {
-            self.root_groups.insert(group_id, root_map(roots)?);
+            candidate_groups.insert(group_id, root_map(roots)?);
         }
-        self.apply_grouped_roots()
+        let merged_roots = merged_roots_from_groups(&candidate_groups)?;
+        let events = self.apply_roots(merged_roots)?;
+        self.root_groups = candidate_groups;
+        Ok(events)
     }
 
     pub fn insert_roots_into_group(
@@ -178,44 +339,35 @@ impl ScriptMetaKitEngine {
         roots: Vec<RootRegistration>,
     ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
         self.expire_idle_memory_cache();
-        let group = self.root_groups.entry(group_id.into()).or_default();
+        let mut candidate_groups = self.root_groups.clone();
+        let group = candidate_groups.entry(group_id.into()).or_default();
         for root in roots {
             group.insert(root.root_id.clone(), root);
         }
-        self.apply_grouped_roots()
-    }
-
-    fn apply_grouped_roots(&mut self) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
-        let mut merged_roots_by_id: BTreeMap<RootId, RootRegistration> = BTreeMap::new();
-        for group_roots in self.root_groups.values() {
-            for root in group_roots.values() {
-                merged_roots_by_id
-                    .entry(root.root_id.clone())
-                    .and_modify(|existing| {
-                        *existing = merged_root_registration(existing, root);
-                    })
-                    .or_insert_with(|| root.clone());
-            }
-        }
-        self.apply_roots(merged_roots_by_id.into_values().collect())
+        let merged_roots = merged_roots_from_groups(&candidate_groups)?;
+        let events = self.apply_roots(merged_roots)?;
+        self.root_groups = candidate_groups;
+        Ok(events)
     }
 
     fn apply_roots(
         &mut self,
-        roots: Vec<RootRegistration>,
+        mut roots: Vec<RootRegistration>,
     ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
         self.expire_idle_memory_cache();
+        for root in &mut roots {
+            if root.refresh_policy == RefreshPolicy::OnFileEventDeferred {
+                root.refresh_policy = RefreshPolicy::OnFileEvent;
+            }
+        }
         let previous_roots_by_id: BTreeMap<_, _> = self
             .roots
             .iter()
-            .map(|root| (root.root_id.as_ref(), root))
+            .map(|root| (root.root_id.clone(), root.clone()))
             .collect();
-        let previous_root_ids: BTreeSet<_> = self
-            .roots
-            .iter()
-            .map(|root| root.root_id.as_ref())
-            .collect();
-        let next_root_ids: BTreeSet<_> = roots.iter().map(|root| root.root_id.as_ref()).collect();
+        let previous_root_ids: BTreeSet<_> =
+            self.roots.iter().map(|root| root.root_id.clone()).collect();
+        let next_root_ids: BTreeSet<_> = roots.iter().map(|root| root.root_id.clone()).collect();
         if next_root_ids.len() != roots.len() {
             return Err(ScriptMetaKitError::InvalidConfig(
                 "root_id values must be unique".to_string(),
@@ -223,54 +375,159 @@ impl ScriptMetaKitEngine {
         }
         let mut events = Vec::new();
         for removed_id in previous_root_ids.difference(&next_root_ids) {
-            self.root_snapshots.remove(*removed_id);
-            self.file_list_snapshots.remove(*removed_id);
-            self.dirty_roots.remove(*removed_id);
+            self.root_snapshots.remove(removed_id);
+            self.file_list_snapshots.remove(removed_id);
+            self.dirty_roots.remove(removed_id);
+            self.evicted_file_list_roots.remove(removed_id);
+            self.evicted_catalog_roots.remove(removed_id);
+            self.persisted_file_list_revisions.remove(removed_id);
+            self.pending_file_list_persistence.remove(removed_id);
+            self.cache_unavailable_revisions.remove(removed_id);
             events.push(ScriptMetaKitEvent::RootRemoved {
-                root_id: (*removed_id).into(),
+                root_id: removed_id.clone(),
             });
         }
 
-        let mut invalidate_catalog = previous_root_ids
+        let mut invalidated_catalog_root_ids = previous_root_ids
             .difference(&next_root_ids)
-            .next()
-            .is_some();
+            .filter(|root_id| {
+                previous_roots_by_id
+                    .get(*root_id)
+                    .is_some_and(|root| root.purpose.includes_metadata())
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
         for root in &roots {
-            if !previous_root_ids.contains(root.root_id.as_ref()) {
+            if !previous_root_ids.contains(&root.root_id) {
                 events.push(ScriptMetaKitEvent::RootRegistered {
                     root_id: root.root_id.clone(),
                 });
             }
-            let changed = previous_roots_by_id
-                .get(root.root_id.as_ref())
-                .is_some_and(|previous| {
-                    previous.path != root.path
-                        || previous.purpose != root.purpose
-                        || previous.cache_policy != root.cache_policy
-                        || previous.refresh_policy != root.refresh_policy
-                });
-            if changed {
+            let previous = previous_roots_by_id.get(&root.root_id);
+            let cache_availability_changed =
+                previous.is_some_and(|previous| previous.cache_policy != root.cache_policy);
+            if cache_availability_changed {
+                self.cache_unavailable_revisions.remove(&root.root_id);
+            }
+            let file_list_content_changed = previous.is_some_and(|previous| {
+                previous.purpose.includes_file_list() != root.purpose.includes_file_list()
+                    || ((previous.purpose.includes_file_list()
+                        || root.purpose.includes_file_list())
+                        && normalize_path(&previous.path) != normalize_path(&root.path))
+            });
+            let metadata_content_changed = previous.is_some_and(|previous| {
+                previous.purpose.includes_metadata() != root.purpose.includes_metadata()
+                    || ((previous.purpose.includes_metadata() || root.purpose.includes_metadata())
+                        && normalize_path(&previous.path) != normalize_path(&root.path))
+            });
+            if file_list_content_changed {
                 self.file_list_snapshots.remove(&root.root_id);
                 self.dirty_roots.remove(&root.root_id);
-                self.root_snapshots.insert(
-                    root.root_id.clone(),
-                    RootSnapshot::new(root.root_id.clone(), root.path.clone()),
-                );
-                invalidate_catalog = true;
+                self.evicted_file_list_roots.remove(&root.root_id);
+                self.persisted_file_list_revisions.remove(&root.root_id);
+                self.pending_file_list_persistence.remove(&root.root_id);
+                self.cache_unavailable_revisions.remove(&root.root_id);
+            }
+            if metadata_content_changed {
+                self.evicted_catalog_roots.remove(&root.root_id);
+                invalidated_catalog_root_ids.insert(root.root_id.clone());
+            }
+            if file_list_content_changed || metadata_content_changed {
+                let mut snapshot = RootSnapshot::new(root.root_id.clone(), root.path.clone());
+                snapshot.state_revision = self.issue_revision();
+                self.root_snapshots.insert(root.root_id.clone(), snapshot);
             } else {
-                self.root_snapshots
-                    .entry(root.root_id.clone())
-                    .or_insert_with(|| RootSnapshot::new(root.root_id.clone(), root.path.clone()));
+                if !self.root_snapshots.contains_key(&root.root_id) {
+                    let mut snapshot = RootSnapshot::new(root.root_id.clone(), root.path.clone());
+                    snapshot.state_revision = self.issue_revision();
+                    self.root_snapshots.insert(root.root_id.clone(), snapshot);
+                } else if cache_availability_changed {
+                    let revision = self.issue_revision();
+                    if let Some(snapshot) = self.root_snapshots.get_mut(&root.root_id) {
+                        snapshot.state_revision = revision;
+                    }
+                }
             }
         }
 
-        self.roots = roots;
-        self.rebuild_known_path_index();
-        if invalidate_catalog {
-            self.catalog_snapshot = None;
-            self.update_check_result = None;
+        if !self.catalog_persistence_is_current
+            && self.pending_catalog_persistence.is_none()
+            && let Some(snapshot) = self.catalog_snapshot.as_ref()
+        {
+            self.pending_catalog_persistence = Some(Arc::clone(snapshot));
+            self.pending_update_check_persistence = self.update_check_result.clone();
         }
+        self.roots = roots;
+        self.reproject_caches_after_root_change(&invalidated_catalog_root_ids);
+        self.rebuild_known_path_index();
         Ok(events)
+    }
+
+    fn reproject_caches_after_root_change(
+        &mut self,
+        invalidated_catalog_root_ids: &BTreeSet<RootId>,
+    ) {
+        let roots_without_memory_file_list = self
+            .roots
+            .iter()
+            .filter(|root| !root_allows_memory_cache(root))
+            .map(|root| root.root_id.clone())
+            .collect::<Vec<_>>();
+        for root_id in roots_without_memory_file_list {
+            if let Some(snapshot) = self.file_list_snapshots.remove(&root_id) {
+                if self
+                    .root_by_id(&root_id)
+                    .is_some_and(root_allows_persistent_file_list_cache)
+                    && self.persisted_file_list_revisions.get(&root_id)
+                        != Some(&snapshot.content_revision)
+                {
+                    self.pending_file_list_persistence
+                        .insert(root_id.clone(), snapshot);
+                }
+                self.ensure_cache_unavailable_revision(&root_id);
+            }
+        }
+
+        if let Some(snapshot) = self.catalog_snapshot.clone() {
+            let affected_root_ids = snapshot
+                .roots
+                .iter()
+                .map(|root| root.root_id.clone())
+                .collect::<Vec<_>>();
+            let projected = self.catalog_snapshot_for_policy_excluding(
+                snapshot.as_ref(),
+                root_allows_memory_cache,
+                invalidated_catalog_root_ids,
+            );
+            self.update_check_result = self
+                .update_check_result
+                .as_ref()
+                .and_then(|result| filter_update_result_to_items(result, &projected.file_items));
+            self.catalog_snapshot = (!projected.candidate_cache.registered_roots.is_empty())
+                .then(|| Arc::new(projected));
+            for root_id in affected_root_ids {
+                self.refresh_cache_unavailable_revision(&root_id);
+            }
+        }
+
+        if let Some(snapshot) = self.pending_catalog_persistence.clone() {
+            let projected = self.catalog_snapshot_for_policy_excluding(
+                snapshot.as_ref(),
+                root_allows_persistent_catalog_cache,
+                invalidated_catalog_root_ids,
+            );
+            self.pending_update_check_persistence = self
+                .pending_update_check_persistence
+                .as_ref()
+                .and_then(|result| filter_update_result_to_items(result, &projected.file_items));
+            self.pending_catalog_persistence =
+                (!projected.candidate_cache.registered_roots.is_empty())
+                    .then(|| Arc::new(projected));
+        }
+
+        if !invalidated_catalog_root_ids.is_empty() {
+            self.catalog_persistence_is_current = false;
+        }
     }
 
     #[must_use]
@@ -365,6 +622,33 @@ impl ScriptMetaKitEngine {
         self.scan_roots_inner(request, None)
     }
 
+    #[must_use]
+    pub fn preflight_root(&mut self, root: RootRegistration) -> ScanResult {
+        let _operation_scope = self.cancellation.begin_scope();
+        let mut root = crate::scanner::preflight_root_registration(
+            &root,
+            &self.config.scanner,
+            &self.config.supported_extensions,
+            Some(&self.cancellation),
+        );
+        root.state_revision = self.issue_revision();
+        let roots = vec![root];
+        let operation = scan_operation_summary(&roots);
+        let file_issues = collect_scan_file_issues(&roots, &[], None);
+        ScanResult {
+            roots,
+            file_list_snapshots: Vec::new(),
+            catalog_snapshot: None,
+            operation,
+            file_issues,
+            update_check_result: None,
+            change_summary: None,
+            watch_change_batch: None,
+            watch_reconciliation: false,
+            watch_covers_all_roots: false,
+        }
+    }
+
     pub fn scan_roots_and_check_updates(
         &mut self,
         request: ScanRequest,
@@ -423,11 +707,17 @@ impl ScriptMetaKitEngine {
             .then(|| self.catalog_snapshot.clone())
             .flatten();
         for root in &mut roots {
-            let has_file_list = !request.mode.includes_file_list()
+            let purpose = self
+                .root_by_id(&root.root_id)
+                .map_or(RootPurpose::FileListAndMetadata, |root| root.purpose);
+            let expects_file_list =
+                request.mode.includes_file_list() && purpose.includes_file_list();
+            let expects_catalog = request.mode.includes_metadata() && purpose.includes_metadata();
+            let has_file_list = !expects_file_list
                 || file_list_snapshots
                     .iter()
                     .any(|snapshot| snapshot.root.root_id == root.root_id);
-            let has_catalog = !request.mode.includes_metadata()
+            let has_catalog = !expects_catalog
                 || catalog_snapshot.as_ref().is_some_and(|snapshot| {
                     snapshot
                         .roots
@@ -439,6 +729,7 @@ impl ScriptMetaKitEngine {
                 root.is_dirty = true;
                 root.item_count = 0;
                 root.error = None;
+                root.state_revision = self.ensure_cache_unavailable_revision(&root.root_id);
             }
         }
         self.touch_memory_cache_if_needed();
@@ -459,6 +750,8 @@ impl ScriptMetaKitEngine {
                 .flatten(),
             change_summary: None,
             watch_change_batch: None,
+            watch_reconciliation: false,
+            watch_covers_all_roots: false,
         }
     }
 
@@ -503,15 +796,41 @@ impl ScriptMetaKitEngine {
                 defer_script_probe_to_metadata,
             ) {
                 let output_change_summary = output.change_summary;
-                let root_snapshot = output.root;
+                let mut root_snapshot = output.root;
                 let root_id = root_snapshot.root_id.clone();
+                let previous_root = self.root_snapshots.get(&root_id).cloned();
+                root_snapshot.state_revision = previous_root
+                    .as_ref()
+                    .filter(|previous| root_state_equal(previous, &root_snapshot))
+                    .map(|previous| previous.state_revision.clone())
+                    .filter(SnapshotRevision::is_available)
+                    .unwrap_or_else(|| self.issue_revision());
                 let previous_snapshot = self.file_list_snapshots.get(&root_id).cloned();
-                let snapshot = FileListSnapshot {
+                let mut snapshot = FileListSnapshot {
                     root: root_snapshot.clone(),
                     children: Some(output.children),
                     directory_states: output.directory_states,
                     truncated: output.truncated,
+                    content_revision: SnapshotRevision::default(),
                 };
+                if root_snapshot.status != RootStatus::Ready {
+                    if let Some(previous) = previous_snapshot
+                        .as_ref()
+                        .filter(|value| value.children.is_some())
+                    {
+                        snapshot.children.clone_from(&previous.children);
+                        snapshot
+                            .directory_states
+                            .clone_from(&previous.directory_states);
+                        snapshot.truncated = previous.truncated;
+                        snapshot
+                            .content_revision
+                            .clone_from(&previous.content_revision);
+                    } else {
+                        snapshot.children = None;
+                        snapshot.content_revision = SnapshotRevision::default();
+                    }
+                }
                 if let Some(summary) = output_change_summary {
                     saw_previous_file_list = true;
                     change_summary.extend(summary);
@@ -525,7 +844,7 @@ impl ScriptMetaKitEngine {
         }
 
         let catalog_snapshot = if request.mode.includes_metadata() {
-            let output = {
+            let mut output = {
                 let previous_cache = self
                     .memory_cache_enabled()
                     .then(|| {
@@ -550,11 +869,19 @@ impl ScriptMetaKitEngine {
                         previous_cache,
                         dirty_directories_by_root: dirty_directories.as_ref(),
                         file_list_snapshots: shared_file_list_snapshots,
+                        visible_root_id: self.visible_root_id.as_ref(),
                     },
                     Some(&self.cancellation),
                 )
             };
-            for root in &output.roots {
+            for root in &mut output.roots {
+                root.state_revision = self
+                    .root_snapshots
+                    .get(&root.root_id)
+                    .filter(|previous| root_state_equal(previous, root))
+                    .map(|previous| previous.state_revision.clone())
+                    .filter(SnapshotRevision::is_available)
+                    .unwrap_or_else(|| self.issue_revision());
                 self.root_snapshots
                     .insert(root.root_id.clone(), root.clone());
             }
@@ -668,14 +995,29 @@ impl ScriptMetaKitEngine {
         let file_list_snapshots = if request.mode.includes_file_list() {
             file_list_snapshots
                 .into_iter()
-                .map(|snapshot| {
+                .map(|mut snapshot| {
                     let root_id = snapshot.root.root_id.clone();
+                    snapshot.content_revision = if snapshot.children.is_none() {
+                        SnapshotRevision::default()
+                    } else {
+                        self.file_list_snapshots
+                            .get(&root_id)
+                            .filter(|previous| file_list_content_equal(previous, &snapshot))
+                            .map(|previous| previous.content_revision.clone())
+                            .filter(SnapshotRevision::is_available)
+                            .unwrap_or_else(|| self.issue_revision())
+                    };
                     let snapshot = Arc::new(snapshot);
                     if self.should_store_file_list_snapshot(&root_id) {
+                        if snapshot.children.is_some() {
+                            self.pending_file_list_persistence.remove(&root_id);
+                        }
                         self.file_list_snapshots
-                            .insert(root_id, Arc::clone(&snapshot));
+                            .insert(root_id.clone(), Arc::clone(&snapshot));
+                        self.refresh_cache_unavailable_revision(&root_id);
                     } else {
                         self.file_list_snapshots.remove(&root_id);
+                        self.ensure_cache_unavailable_revision(&root_id);
                     }
                     snapshot
                 })
@@ -683,6 +1025,22 @@ impl ScriptMetaKitEngine {
         } else {
             Vec::new()
         };
+        if request.mode.includes_file_list() {
+            for snapshot in &file_list_snapshots {
+                if snapshot.root.status == RootStatus::Ready && snapshot.children.is_some() {
+                    self.evicted_file_list_roots.remove(&snapshot.root.root_id);
+                }
+            }
+        }
+        if request.mode.includes_metadata()
+            && let Some(snapshot) = catalog_snapshot.as_ref()
+        {
+            for root in &snapshot.roots {
+                if root.status == RootStatus::Ready {
+                    self.evicted_catalog_roots.remove(&root.root_id);
+                }
+            }
+        }
         self.rebuild_known_path_index();
         self.enforce_memory_node_limit();
         for root_id in &root_ids {
@@ -717,6 +1075,8 @@ impl ScriptMetaKitEngine {
                 .flatten(),
             change_summary: saw_previous_file_list.then_some(change_summary),
             watch_change_batch: None,
+            watch_reconciliation: false,
+            watch_covers_all_roots: false,
         })
     }
 
@@ -781,6 +1141,7 @@ impl ScriptMetaKitEngine {
                         .map(|path| normalize_path(path)),
                 );
             }
+            let revision = self.issue_revision();
             if let Some(snapshot) = self.root_snapshots.get_mut(&change.root_id) {
                 snapshot.is_dirty = true;
                 snapshot.last_event_at = Some(now);
@@ -789,6 +1150,7 @@ impl ScriptMetaKitEngine {
                 } else {
                     RootStatus::Dirty
                 };
+                snapshot.state_revision = revision;
             }
             root_events.push(ScriptMetaKitEvent::RootMarkedDirty {
                 root_id: change.root_id.clone(),
@@ -846,6 +1208,8 @@ impl ScriptMetaKitEngine {
                     .flatten(),
                 change_summary: None,
                 watch_change_batch: None,
+                watch_reconciliation: false,
+                watch_covers_all_roots: false,
             });
         }
 
@@ -880,6 +1244,8 @@ impl ScriptMetaKitEngine {
                 .flatten(),
             change_summary: partial_result.change_summary,
             watch_change_batch: None,
+            watch_reconciliation: false,
+            watch_covers_all_roots: false,
         })
     }
 
@@ -1226,6 +1592,7 @@ impl ScriptMetaKitEngine {
                 self.update_check_result = Some(Arc::new(merged));
             }
         }
+        self.catalog_persistence_is_current = false;
     }
 
     pub fn load_cache(
@@ -1242,8 +1609,9 @@ impl ScriptMetaKitEngine {
                 "memory cache is disabled; persistent cache cannot be loaded".to_string(),
             ));
         }
-        let payload = payload.migrate()?;
+        let mut payload = payload.migrate()?;
         payload.validate_for_config(&self.config)?;
+        payload.scope = canonical_cache_scope(payload.scope);
         match payload.scope {
             CacheScope::All => {
                 let all_data = decode_all_cache_data(payload.data)?;
@@ -1281,17 +1649,54 @@ impl ScriptMetaKitEngine {
                 "persistent cache is disabled".to_string(),
             ));
         }
-        if !self.memory_cache_export_allowed {
-            return Err(ScriptMetaKitError::Cache(
-                "memory cache was partially evicted; refusing to overwrite persistent cache"
-                    .to_string(),
-            ));
+        self.export_cache_merged(scope, None)
+    }
+
+    pub fn export_cache_merged(
+        &self,
+        scope: CacheScope,
+        existing: Option<CachePayload>,
+    ) -> ScriptMetaKitResult<CachePayload> {
+        let scope = canonical_cache_scope(scope);
+        let existing = existing
+            .map(CachePayload::migrate)
+            .transpose()?
+            .map(|mut payload| {
+                payload.validate_for_config(&self.config)?;
+                payload.scope = canonical_cache_scope(payload.scope);
+                if payload.scope != scope {
+                    return Err(ScriptMetaKitError::Cache(
+                        "existing cache scope does not match requested scope".to_string(),
+                    ));
+                }
+                Ok(payload)
+            })
+            .transpose()?;
+        if existing.is_none() {
+            self.ensure_standalone_cache_export_is_complete(scope)?;
         }
         match scope {
             CacheScope::All => {
+                let existing = existing
+                    .map(|payload| decode_all_cache_data(payload.data))
+                    .transpose()?;
+                let file_list_snapshots = self.merged_persistent_file_list_cache_snapshots(
+                    if self.invalidate_persistent_file_list_on_next_export {
+                        None
+                    } else {
+                        existing.as_ref().map(|data| &data.file_list_snapshots)
+                    },
+                );
+                let catalog = self.merged_catalog_cache_data(
+                    if self.invalidate_persistent_catalog_on_next_export {
+                        None
+                    } else {
+                        existing.and_then(|data| data.catalog)
+                    },
+                )?;
                 let data = serde_json::to_value(AllCacheDataRef {
-                    catalog: self.catalog_cache_data()?,
-                    file_list_snapshots: &self.persistent_file_list_cache_snapshots(),
+                    catalog,
+                    file_list_snapshots: &file_list_snapshots,
                 })
                 .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
                 Ok(CachePayload::new_for_config(
@@ -1301,7 +1706,13 @@ impl ScriptMetaKitEngine {
                 ))
             }
             CacheScope::Catalog => {
-                let data = self.catalog_cache_data()?;
+                let data = self.merged_catalog_cache_data(
+                    if self.invalidate_persistent_catalog_on_next_export {
+                        None
+                    } else {
+                        existing.map(|payload| payload.data)
+                    },
+                )?;
                 Ok(CachePayload::new_for_config(
                     CacheScope::Catalog,
                     data,
@@ -1309,7 +1720,21 @@ impl ScriptMetaKitEngine {
                 ))
             }
             CacheScope::FileList | CacheScope::Root => {
-                let snapshots = self.persistent_file_list_cache_snapshots();
+                let existing_snapshots = existing
+                    .map(|payload| {
+                        serde_json::from_value::<BTreeMap<RootId, Arc<FileListSnapshot>>>(
+                            payload.data,
+                        )
+                        .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))
+                    })
+                    .transpose()?;
+                let snapshots = self.merged_persistent_file_list_cache_snapshots(
+                    if self.invalidate_persistent_file_list_on_next_export {
+                        None
+                    } else {
+                        existing_snapshots.as_ref()
+                    },
+                );
                 let data = serde_json::to_value(&snapshots)
                     .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
                 Ok(CachePayload::new_for_config(scope, data, &self.config))
@@ -1317,25 +1742,181 @@ impl ScriptMetaKitEngine {
         }
     }
 
+    fn ensure_standalone_cache_export_is_complete(
+        &self,
+        scope: CacheScope,
+    ) -> ScriptMetaKitResult<()> {
+        if matches!(
+            scope,
+            CacheScope::All | CacheScope::FileList | CacheScope::Root
+        ) {
+            let available = self
+                .persistent_file_list_cache_snapshots()
+                .into_keys()
+                .collect::<BTreeSet<_>>();
+            let missing = self.evicted_file_list_roots.iter().any(|root_id| {
+                self.root_by_id(root_id)
+                    .is_some_and(root_allows_persistent_file_list_cache)
+                    && !available.contains(root_id)
+            });
+            if missing {
+                return Err(ScriptMetaKitError::Cache(
+                    "file-list memory is incomplete and no durable cache was supplied for merge"
+                        .to_string(),
+                ));
+            }
+        }
+        if matches!(scope, CacheScope::All | CacheScope::Catalog) {
+            let mut available = self
+                .catalog_snapshot
+                .iter()
+                .flat_map(|snapshot| snapshot.roots.iter().map(|root| root.root_id.clone()))
+                .collect::<BTreeSet<_>>();
+            available.extend(
+                self.pending_catalog_persistence
+                    .iter()
+                    .flat_map(|snapshot| snapshot.roots.iter().map(|root| root.root_id.clone())),
+            );
+            let missing = self.evicted_catalog_roots.iter().any(|root_id| {
+                self.root_by_id(root_id)
+                    .is_some_and(root_allows_persistent_catalog_cache)
+                    && !available.contains(root_id)
+            });
+            if missing {
+                return Err(ScriptMetaKitError::Cache(
+                    "catalog memory is incomplete and no durable cache was supplied for merge"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_cache_persisted(&mut self, scope: CacheScope) {
+        match scope {
+            CacheScope::All => {
+                self.mark_file_list_cache_persisted();
+                self.pending_file_list_persistence.clear();
+                self.pending_catalog_persistence = None;
+                self.pending_update_check_persistence = None;
+                self.catalog_persistence_is_current = true;
+                self.invalidate_persistent_file_list_on_next_export = false;
+                self.invalidate_persistent_catalog_on_next_export = false;
+            }
+            CacheScope::Catalog => {
+                self.pending_catalog_persistence = None;
+                self.pending_update_check_persistence = None;
+                self.catalog_persistence_is_current = true;
+                self.invalidate_persistent_catalog_on_next_export = false;
+            }
+            CacheScope::FileList | CacheScope::Root => {
+                self.mark_file_list_cache_persisted();
+                self.pending_file_list_persistence.clear();
+                self.invalidate_persistent_file_list_on_next_export = false;
+            }
+        }
+    }
+
+    fn mark_file_list_cache_persisted(&mut self) {
+        let revisions = self
+            .persistent_file_list_cache_snapshots()
+            .into_iter()
+            .filter_map(|(root_id, snapshot)| {
+                snapshot
+                    .content_revision
+                    .is_available()
+                    .then_some((root_id, snapshot.content_revision.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let allowed_root_ids = self
+            .roots
+            .iter()
+            .filter(|root| root_allows_persistent_file_list_cache(root))
+            .map(|root| root.root_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.persisted_file_list_revisions
+            .retain(|root_id, _| allowed_root_ids.contains(root_id));
+        self.persisted_file_list_revisions.extend(revisions);
+    }
+
+    fn merged_persistent_file_list_cache_snapshots(
+        &self,
+        existing: Option<&BTreeMap<RootId, Arc<FileListSnapshot>>>,
+    ) -> BTreeMap<RootId, Arc<FileListSnapshot>> {
+        let mut snapshots = existing.cloned().unwrap_or_default();
+        snapshots.retain(|root_id, snapshot| {
+            self.root_by_id(root_id).is_some_and(|root| {
+                root_allows_persistent_file_list_cache(root)
+                    && normalize_path(&snapshot.root.path) == normalize_path(&root.path)
+            })
+        });
+        snapshots.extend(self.persistent_file_list_cache_snapshots());
+        snapshots
+    }
+
     fn load_catalog_cache_data(&mut self, data: CatalogCacheData) -> ScriptMetaKitResult<()> {
+        if !data.catalog_snapshot.candidate_cache.is_current_schema() {
+            return Err(ScriptMetaKitError::Cache(format!(
+                "unsupported candidate cache schema version {}",
+                data.catalog_snapshot.candidate_cache.schema_version
+            )));
+        }
+        let previous_catalog_snapshot = self.catalog_snapshot.clone();
+        let has_unpersisted_catalog_data = self.pending_catalog_persistence.is_some()
+            || (self.catalog_snapshot.is_some() && !self.catalog_persistence_is_current);
+        let incoming = serde_json::to_value(&data)
+            .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
+        let merged = self.merged_catalog_cache_data(Some(incoming))?;
         let CatalogCacheData {
             mut catalog_snapshot,
             update_check_result,
-        } = data;
-        validate_catalog_cache_roots(
-            &catalog_snapshot.candidate_cache,
-            &self.roots,
-            root_allows_persistent_catalog_cache,
-        )?;
+        } = decode_catalog_cache_data(merged)?;
         let file_items = file_items_from_cache(&catalog_snapshot.candidate_cache);
         catalog_snapshot.all_items = deduplicated_items(&file_items);
         catalog_snapshot.file_items = file_items;
-        let catalog_snapshot =
+        let mut catalog_snapshot =
             self.catalog_snapshot_for_policy(&catalog_snapshot, root_allows_memory_cache);
+        let unchanged_root_ids = catalog_snapshot
+            .roots
+            .iter()
+            .filter(|root| {
+                previous_catalog_snapshot.as_ref().is_some_and(|previous| {
+                    catalog_root_content_equal(previous, &catalog_snapshot, &root.root_id)
+                })
+            })
+            .map(|root| root.root_id.clone())
+            .collect::<BTreeSet<_>>();
+        for root in &mut catalog_snapshot.roots {
+            let root_id = root.root_id.clone();
+            let mut current_root = self
+                .root_snapshots
+                .get(&root_id)
+                .cloned()
+                .unwrap_or_else(|| RootSnapshot::new(root_id.clone(), root.path.clone()));
+            if !unchanged_root_ids.contains(&root_id) {
+                current_root.state_revision = self.issue_revision();
+            }
+            self.root_snapshots.insert(root_id, current_root.clone());
+            *root = current_root;
+        }
         self.update_check_result = update_check_result
             .as_ref()
             .and_then(|result| filter_update_result_to_items(result, &catalog_snapshot.file_items));
         self.catalog_snapshot = Some(Arc::new(catalog_snapshot));
+        self.catalog_persistence_is_current = !has_unpersisted_catalog_data;
+        let loaded_root_ids = self
+            .catalog_snapshot
+            .iter()
+            .flat_map(|snapshot| snapshot.roots.iter().map(|root| root.root_id.clone()))
+            .collect::<Vec<_>>();
+        if let Some(snapshot) = self.catalog_snapshot.as_ref() {
+            for root in &snapshot.roots {
+                self.evicted_catalog_roots.remove(&root.root_id);
+            }
+        }
+        for root_id in loaded_root_ids {
+            self.refresh_cache_unavailable_revision(&root_id);
+        }
         self.enforce_memory_node_limit();
         self.rebuild_known_path_index();
         self.touch_memory_cache_if_needed();
@@ -1356,9 +1937,33 @@ impl ScriptMetaKitEngine {
                 continue;
             }
             if self.should_store_file_list_snapshot(&root_id) {
-                self.root_snapshots
-                    .insert(root_id.clone(), snapshot.root.clone());
-                self.file_list_snapshots.insert(root_id, snapshot);
+                if self.pending_file_list_persistence.contains_key(&root_id)
+                    || self.file_list_snapshots.contains_key(&root_id)
+                {
+                    continue;
+                }
+                let mut snapshot = snapshot.as_ref().clone();
+                let mut current_root = self
+                    .root_snapshots
+                    .get(&root_id)
+                    .cloned()
+                    .unwrap_or_else(|| RootSnapshot::new(root_id.clone(), root.path.clone()));
+                current_root.state_revision = self.issue_revision();
+                snapshot.root = current_root.clone();
+                snapshot.content_revision = if snapshot.children.is_some() {
+                    self.issue_revision()
+                } else {
+                    SnapshotRevision::default()
+                };
+                let snapshot = Arc::new(snapshot);
+                self.root_snapshots.insert(root_id.clone(), current_root);
+                self.evicted_file_list_roots.remove(&root_id);
+                if snapshot.content_revision.is_available() {
+                    self.persisted_file_list_revisions
+                        .insert(root_id.clone(), snapshot.content_revision.clone());
+                }
+                self.file_list_snapshots.insert(root_id.clone(), snapshot);
+                self.refresh_cache_unavailable_revision(&root_id);
             }
         }
         self.rebuild_known_path_index();
@@ -1367,65 +1972,132 @@ impl ScriptMetaKitEngine {
         Ok(())
     }
 
-    fn catalog_cache_data(&self) -> ScriptMetaKitResult<serde_json::Value> {
-        let data = if let Some(snapshot) = self.catalog_snapshot.as_ref() {
-            let snapshot = self.catalog_snapshot_for_policy(
-                snapshot.as_ref(),
-                root_allows_persistent_catalog_cache,
-            );
-            let update_check_result = self
-                .update_check_result
-                .as_ref()
-                .and_then(|result| filter_update_result_to_items(result, &snapshot.file_items));
-            serde_json::to_value(CatalogCacheDataRef {
-                catalog_snapshot: &snapshot,
-                update_check_result: update_check_result.as_deref(),
-            })
-        } else {
-            let persistent_roots = self
-                .roots
-                .iter()
-                .filter(|root| root_allows_persistent_catalog_cache(root))
-                .collect::<Vec<_>>();
-            let snapshot = ScriptMetaCatalogSnapshot {
-                source_revision: Uuid::new_v4(),
-                roots: self
-                    .root_snapshots
-                    .values()
-                    .filter(|snapshot| {
-                        persistent_roots
-                            .iter()
-                            .any(|root| root.root_id == snapshot.root_id)
+    fn merged_catalog_cache_data(
+        &self,
+        existing: Option<serde_json::Value>,
+    ) -> ScriptMetaKitResult<serde_json::Value> {
+        let existing = existing.map(decode_catalog_cache_data).transpose()?;
+        let allowed_roots = self
+            .roots
+            .iter()
+            .filter(|root| root_allows_persistent_catalog_cache(root))
+            .collect::<Vec<_>>();
+        let allowed_by_id = allowed_roots
+            .iter()
+            .map(|root| (root.root_id.clone(), *root))
+            .collect::<BTreeMap<_, _>>();
+        let mut roots_by_id = BTreeMap::<RootId, RootSnapshot>::new();
+        let mut records_by_root = BTreeMap::<RootId, Vec<CandidateRecord>>::new();
+        let mut source_revision = Uuid::new_v4();
+        let mut built_at = 0;
+        let mut merged_update_result: Option<UpdateCheckResult> = None;
+
+        let mut merge_source =
+            |snapshot: &ScriptMetaCatalogSnapshot, update_result: Option<&UpdateCheckResult>| {
+                source_revision = snapshot.source_revision;
+                built_at = built_at.max(snapshot.candidate_cache.built_at);
+                let source_root_ids = snapshot
+                    .roots
+                    .iter()
+                    .filter_map(|root| {
+                        allowed_by_id.get(&root.root_id).and_then(|registration| {
+                            (normalize_path(&root.path) == normalize_path(&registration.path))
+                                .then_some(root.root_id.clone())
+                        })
                     })
-                    .cloned()
-                    .collect(),
-                all_items: Vec::new(),
-                file_items: Vec::new(),
-                candidate_cache: CandidateCache {
-                    schema_version: CandidateCache::CURRENT_SCHEMA_VERSION,
-                    built_at: now_timestamp_millis(),
-                    registered_roots: registered_root_signatures(&persistent_roots),
-                    records: Vec::new(),
-                },
+                    .collect::<BTreeSet<_>>();
+                for root in &snapshot.roots {
+                    if source_root_ids.contains(&root.root_id) {
+                        roots_by_id.insert(root.root_id.clone(), root.clone());
+                        records_by_root.remove(&root.root_id);
+                    }
+                }
+                for record in &snapshot.candidate_cache.records {
+                    if source_root_ids.contains(&record.root_id) {
+                        records_by_root
+                            .entry(record.root_id.clone())
+                            .or_default()
+                            .push(record.clone());
+                    }
+                }
+                if let Some(update_result) = update_result {
+                    merge_update_check_result(&mut merged_update_result, update_result);
+                }
             };
-            serde_json::to_value(CatalogCacheDataRef {
-                catalog_snapshot: &snapshot,
-                update_check_result: None,
-            })
+
+        if let Some(existing) = existing.as_ref() {
+            merge_source(
+                &existing.catalog_snapshot,
+                existing.update_check_result.as_ref(),
+            );
         }
-        .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
-        Ok(data)
+        if let Some(current) = self.catalog_snapshot.as_ref() {
+            merge_source(current, self.update_check_result.as_deref());
+        }
+        if let Some(pending) = self.pending_catalog_persistence.as_ref() {
+            merge_source(pending, self.pending_update_check_persistence.as_deref());
+        }
+
+        let roots = allowed_roots
+            .iter()
+            .filter_map(|root| roots_by_id.remove(&root.root_id))
+            .collect::<Vec<_>>();
+        let mut records = records_by_root.into_values().flatten().collect::<Vec<_>>();
+        records.sort_by(|lhs, rhs| lhs.identity_path.cmp(&rhs.identity_path));
+        let candidate_cache = CandidateCache {
+            schema_version: CandidateCache::CURRENT_SCHEMA_VERSION,
+            built_at: if built_at == 0 {
+                now_timestamp_millis()
+            } else {
+                built_at
+            },
+            registered_roots: registered_root_signatures(&allowed_roots),
+            records,
+        };
+        let file_items = file_items_from_cache(&candidate_cache);
+        let all_items = deduplicated_items(&file_items);
+        let catalog_snapshot = ScriptMetaCatalogSnapshot {
+            source_revision,
+            roots,
+            all_items,
+            file_items,
+            candidate_cache,
+        };
+        let update_check_result = merged_update_result
+            .as_ref()
+            .and_then(|result| filter_update_result_to_items(result, &catalog_snapshot.file_items));
+        serde_json::to_value(CatalogCacheDataRef {
+            catalog_snapshot: &catalog_snapshot,
+            update_check_result: update_check_result.as_deref(),
+        })
+        .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))
     }
 
     fn persistent_file_list_cache_snapshots(&self) -> BTreeMap<RootId, Arc<FileListSnapshot>> {
-        self.file_list_snapshots
+        let mut snapshots = self
+            .file_list_snapshots
             .iter()
-            .filter(|(root_id, _)| {
-                self.root_by_id(root_id)
-                    .is_some_and(root_allows_persistent_file_list_cache)
+            .filter(|(root_id, snapshot)| {
+                snapshot.children.is_some()
+                    && self.root_by_id(root_id).is_some_and(|root| {
+                        root_allows_persistent_file_list_cache(root)
+                            && normalize_path(&snapshot.root.path) == normalize_path(&root.path)
+                    })
             })
             .map(|(root_id, snapshot)| (root_id.clone(), Arc::clone(snapshot)))
-            .collect::<BTreeMap<_, _>>()
+            .collect::<BTreeMap<_, _>>();
+        snapshots.extend(
+            self.pending_file_list_persistence
+                .iter()
+                .filter(|(root_id, snapshot)| {
+                    snapshot.children.is_some()
+                        && self
+                            .root_by_id(root_id)
+                            .is_some_and(root_allows_persistent_file_list_cache)
+                })
+                .map(|(root_id, snapshot)| (root_id.clone(), Arc::clone(snapshot))),
+        );
+        snapshots
     }
 
     pub fn invalidate_cache(
@@ -1433,17 +2105,62 @@ impl ScriptMetaKitEngine {
         scope: CacheScope,
         reason: CacheInvalidationReason,
     ) -> Vec<ScriptMetaKitEvent> {
+        let affected_root_ids = match scope {
+            CacheScope::All => {
+                self.file_list_snapshots
+                    .keys()
+                    .cloned()
+                    .chain(self.catalog_snapshot.iter().flat_map(|snapshot| {
+                        snapshot.roots.iter().map(|root| root.root_id.clone())
+                    }))
+                    .collect::<BTreeSet<_>>()
+            }
+            CacheScope::Catalog => self
+                .catalog_snapshot
+                .iter()
+                .flat_map(|snapshot| snapshot.roots.iter().map(|root| root.root_id.clone()))
+                .collect(),
+            CacheScope::FileList | CacheScope::Root => {
+                self.file_list_snapshots.keys().cloned().collect()
+            }
+        };
+        for root_id in affected_root_ids {
+            let revision = self.issue_revision();
+            if let Some(root) = self.root_snapshots.get_mut(&root_id) {
+                root.state_revision = revision;
+            }
+        }
         match scope {
             CacheScope::All => {
                 self.catalog_snapshot = None;
                 self.update_check_result = None;
                 self.file_list_snapshots.clear();
+                self.pending_file_list_persistence.clear();
+                self.pending_catalog_persistence = None;
+                self.pending_update_check_persistence = None;
+                self.evicted_file_list_roots.clear();
+                self.evicted_catalog_roots.clear();
+                self.persisted_file_list_revisions.clear();
+                self.catalog_persistence_is_current = false;
+                self.invalidate_persistent_file_list_on_next_export = true;
+                self.invalidate_persistent_catalog_on_next_export = true;
             }
             CacheScope::Catalog => {
                 self.catalog_snapshot = None;
                 self.update_check_result = None;
+                self.pending_catalog_persistence = None;
+                self.pending_update_check_persistence = None;
+                self.evicted_catalog_roots.clear();
+                self.catalog_persistence_is_current = false;
+                self.invalidate_persistent_catalog_on_next_export = true;
             }
-            CacheScope::FileList | CacheScope::Root => self.file_list_snapshots.clear(),
+            CacheScope::FileList | CacheScope::Root => {
+                self.file_list_snapshots.clear();
+                self.pending_file_list_persistence.clear();
+                self.evicted_file_list_roots.clear();
+                self.persisted_file_list_revisions.clear();
+                self.invalidate_persistent_file_list_on_next_export = true;
+            }
         }
         self.rebuild_known_path_index();
         vec![ScriptMetaKitEvent::CacheInvalidated { scope, reason }]
@@ -1539,6 +2256,8 @@ impl ScriptMetaKitEngine {
             });
         }
 
+        jobs.sort_by_key(|job| root_scan_priority(&job.root, self.visible_root_id.as_ref()));
+
         if parallelism <= 1 {
             for job in jobs {
                 let index = job.index;
@@ -1618,6 +2337,35 @@ impl ScriptMetaKitEngine {
         self.roots.iter().find(|root| root.root_id == *root_id)
     }
 
+    fn ensure_cache_unavailable_revision(&mut self, root_id: &RootId) -> SnapshotRevision {
+        if let Some(revision) = self.cache_unavailable_revisions.get(root_id) {
+            return revision.clone();
+        }
+        let revision = self.issue_revision();
+        self.cache_unavailable_revisions
+            .insert(root_id.clone(), revision.clone());
+        revision
+    }
+
+    fn refresh_cache_unavailable_revision(&mut self, root_id: &RootId) {
+        let Some(root) = self.root_by_id(root_id) else {
+            self.cache_unavailable_revisions.remove(root_id);
+            return;
+        };
+        let file_list_is_resident =
+            !root.purpose.includes_file_list() || self.file_list_snapshots.contains_key(root_id);
+        let catalog_is_resident = !root.purpose.includes_metadata()
+            || self
+                .catalog_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.roots.iter().any(|root| root.root_id == *root_id));
+        if file_list_is_resident && catalog_is_resident {
+            self.cache_unavailable_revisions.remove(root_id);
+        } else {
+            self.ensure_cache_unavailable_revision(root_id);
+        }
+    }
+
     fn snapshots_for_roots(&self, root_ids: &[RootId]) -> Vec<RootSnapshot> {
         root_ids
             .iter()
@@ -1687,10 +2435,28 @@ impl ScriptMetaKitEngine {
         snapshot: &Arc<ScriptMetaCatalogSnapshot>,
         update_check_result: Option<Arc<UpdateCheckResult>>,
     ) {
+        let affected_root_ids = snapshot
+            .roots
+            .iter()
+            .map(|root| root.root_id.clone())
+            .collect::<Vec<_>>();
+        let persistent_snapshot = self
+            .catalog_snapshot_for_policy(snapshot.as_ref(), root_allows_persistent_catalog_cache);
+        if let Some((pending_snapshot, pending_update_result)) = self
+            .merged_pending_catalog_persistence(persistent_snapshot, update_check_result.as_deref())
+        {
+            self.pending_update_check_persistence = pending_update_result;
+            self.pending_catalog_persistence = Some(pending_snapshot);
+            self.catalog_persistence_is_current = false;
+        }
+
         if !self.memory_cache_enabled() {
             self.catalog_snapshot = None;
             self.update_check_result = None;
             self.last_memory_cache_accessed_at = None;
+            for root_id in affected_root_ids {
+                self.refresh_cache_unavailable_revision(&root_id);
+            }
             return;
         }
 
@@ -1707,8 +2473,92 @@ impl ScriptMetaKitEngine {
                 .and_then(|result| filter_update_result_to_items(result, &snapshot.file_items));
             self.catalog_snapshot = Some(Arc::new(snapshot));
         }
+        for root_id in affected_root_ids {
+            self.refresh_cache_unavailable_revision(&root_id);
+        }
         self.enforce_memory_node_limit();
         self.touch_memory_cache_if_needed();
+    }
+
+    fn merged_pending_catalog_persistence(
+        &self,
+        refreshed: ScriptMetaCatalogSnapshot,
+        refreshed_update_result: Option<&UpdateCheckResult>,
+    ) -> Option<(
+        Arc<ScriptMetaCatalogSnapshot>,
+        Option<Arc<UpdateCheckResult>>,
+    )> {
+        let refreshed_root_ids = refreshed
+            .roots
+            .iter()
+            .filter(|root| matches!(root.status, RootStatus::Ready | RootStatus::Missing))
+            .map(|root| root.root_id.clone())
+            .collect::<BTreeSet<_>>();
+        if refreshed_root_ids.is_empty() {
+            return None;
+        }
+
+        let refreshed_roots = refreshed
+            .roots
+            .iter()
+            .filter(|root| refreshed_root_ids.contains(&root.root_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut refreshed_candidate_cache = refreshed.candidate_cache.clone();
+        refreshed_candidate_cache
+            .records
+            .retain(|record| refreshed_root_ids.contains(&record.root_id));
+        let (roots, candidate_cache) =
+            if let Some(previous) = self.pending_catalog_persistence.as_ref() {
+                (
+                    merged_catalog_roots(previous, refreshed_roots, &refreshed_root_ids),
+                    merged_candidate_cache(
+                        previous,
+                        refreshed_candidate_cache,
+                        &refreshed_root_ids,
+                        &self.roots,
+                        root_allows_persistent_catalog_cache,
+                    ),
+                )
+            } else {
+                (refreshed_roots, refreshed_candidate_cache)
+            };
+        let file_items = file_items_from_cache(&candidate_cache);
+        let snapshot = Arc::new(ScriptMetaCatalogSnapshot {
+            source_revision: refreshed.source_revision,
+            roots,
+            all_items: deduplicated_items(&file_items),
+            file_items,
+            candidate_cache,
+        });
+
+        let unaffected_previous_items = self
+            .pending_catalog_persistence
+            .iter()
+            .flat_map(|previous| previous.file_items.iter())
+            .filter(|item| !refreshed_root_ids.contains(&item.root_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut merged_update_result = self
+            .pending_update_check_persistence
+            .as_ref()
+            .and_then(|result| filter_update_result_to_items(result, &unaffected_previous_items))
+            .map(|result| result.as_ref().clone());
+        let refreshed_items = snapshot
+            .file_items
+            .iter()
+            .filter(|item| refreshed_root_ids.contains(&item.root_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(result) = refreshed_update_result
+            .and_then(|result| filter_update_result_to_items(result, &refreshed_items))
+        {
+            merge_update_check_result(&mut merged_update_result, &result);
+        }
+        let merged_update_result = merged_update_result
+            .as_ref()
+            .and_then(|result| filter_update_result_to_items(result, &snapshot.file_items));
+        Some((snapshot, merged_update_result))
     }
 
     fn catalog_snapshot_matches_policy(
@@ -1738,10 +2588,20 @@ impl ScriptMetaKitEngine {
         snapshot: &ScriptMetaCatalogSnapshot,
         allows_root: impl Fn(&RootRegistration) -> bool,
     ) -> ScriptMetaCatalogSnapshot {
+        self.catalog_snapshot_for_policy_excluding(snapshot, allows_root, &BTreeSet::new())
+    }
+
+    fn catalog_snapshot_for_policy_excluding(
+        &self,
+        snapshot: &ScriptMetaCatalogSnapshot,
+        allows_root: impl Fn(&RootRegistration) -> bool,
+        excluded_root_ids: &BTreeSet<RootId>,
+    ) -> ScriptMetaCatalogSnapshot {
         let allowed_root_ids: BTreeSet<_> = self
             .roots
             .iter()
             .filter(|root| allows_root(root))
+            .filter(|root| !excluded_root_ids.contains(&root.root_id))
             .map(|root| root.root_id.as_ref())
             .collect();
         let allowed_roots: Vec<_> = self.roots.iter().filter(|root| allows_root(root)).collect();
@@ -1765,7 +2625,12 @@ impl ScriptMetaKitEngine {
             roots: snapshot
                 .roots
                 .iter()
-                .filter(|root| allowed_root_ids.contains(root.root_id.as_ref()))
+                .filter(|root| {
+                    allowed_root_ids.contains(root.root_id.as_ref())
+                        && self.root_by_id(&root.root_id).is_some_and(|registration| {
+                            normalize_path(&registration.path) == normalize_path(&root.path)
+                        })
+                })
                 .cloned()
                 .collect(),
             all_items,
@@ -1803,7 +2668,6 @@ impl ScriptMetaKitEngine {
                 break;
             };
             self.evict_memory_cache_root(&root_id);
-            self.memory_cache_export_allowed = false;
         }
     }
 
@@ -1829,8 +2693,36 @@ impl ScriptMetaKitEngine {
     }
 
     fn evict_memory_cache_root(&mut self, root_id: &RootId) {
-        self.file_list_snapshots.remove(root_id);
-        if let Some(previous) = self.catalog_snapshot.as_ref() {
+        if let Some(snapshot) = self.file_list_snapshots.remove(root_id) {
+            self.ensure_cache_unavailable_revision(root_id);
+            if self
+                .root_by_id(root_id)
+                .is_some_and(root_allows_persistent_file_list_cache)
+                && self.persisted_file_list_revisions.get(root_id)
+                    != Some(&snapshot.content_revision)
+            {
+                self.pending_file_list_persistence
+                    .insert(root_id.clone(), snapshot);
+            }
+            self.evicted_file_list_roots.insert(root_id.clone());
+        }
+        if let Some(previous) = self.catalog_snapshot.clone() {
+            if previous.roots.iter().any(|root| root.root_id == *root_id)
+                || previous
+                    .candidate_cache
+                    .records
+                    .iter()
+                    .any(|record| record.root_id == *root_id)
+            {
+                self.ensure_cache_unavailable_revision(root_id);
+                self.evicted_catalog_roots.insert(root_id.clone());
+                if !self.catalog_persistence_is_current
+                    && self.pending_catalog_persistence.is_none()
+                {
+                    self.pending_catalog_persistence = Some(Arc::clone(&previous));
+                    self.pending_update_check_persistence = self.update_check_result.clone();
+                }
+            }
             let mut candidate_cache = previous.candidate_cache.clone();
             candidate_cache
                 .records
@@ -1887,6 +2779,56 @@ impl ScriptMetaKitEngine {
         self.rebuild_known_path_index();
     }
 
+    fn mark_resident_memory_cache_evicted(&mut self) {
+        let resident_root_ids = self
+            .file_list_snapshots
+            .keys()
+            .cloned()
+            .chain(
+                self.catalog_snapshot
+                    .iter()
+                    .flat_map(|snapshot| snapshot.roots.iter().map(|root| root.root_id.clone())),
+            )
+            .collect::<BTreeSet<_>>();
+        for root_id in resident_root_ids {
+            let revision = self.issue_revision();
+            if let Some(root) = self.root_snapshots.get_mut(&root_id) {
+                root.state_revision = revision;
+            }
+        }
+        for (root_id, snapshot) in &self.file_list_snapshots {
+            if self
+                .root_by_id(root_id)
+                .is_some_and(root_allows_persistent_file_list_cache)
+                && self.persisted_file_list_revisions.get(root_id)
+                    != Some(&snapshot.content_revision)
+            {
+                self.pending_file_list_persistence
+                    .insert(root_id.clone(), Arc::clone(snapshot));
+            }
+        }
+        if !self.catalog_persistence_is_current
+            && self.pending_catalog_persistence.is_none()
+            && let Some(snapshot) = self.catalog_snapshot.as_ref()
+        {
+            self.pending_catalog_persistence = Some(Arc::clone(snapshot));
+            self.pending_update_check_persistence = self.update_check_result.clone();
+        }
+        self.evicted_file_list_roots
+            .extend(self.file_list_snapshots.keys().cloned());
+        if let Some(snapshot) = self.catalog_snapshot.as_ref() {
+            self.evicted_catalog_roots
+                .extend(snapshot.roots.iter().map(|root| root.root_id.clone()));
+            self.evicted_catalog_roots.extend(
+                snapshot
+                    .candidate_cache
+                    .records
+                    .iter()
+                    .map(|record| record.root_id.clone()),
+            );
+        }
+    }
+
     fn expire_idle_memory_cache(&mut self) {
         if !self.memory_cache_enabled() {
             self.clear_memory_cache();
@@ -1894,8 +2836,8 @@ impl ScriptMetaKitEngine {
         }
         let idle_lifetime = self.config.cache.idle_lifetime_millis;
         if idle_lifetime == 0 {
+            self.mark_resident_memory_cache_evicted();
             self.clear_memory_cache();
-            self.memory_cache_export_allowed = false;
             return;
         }
         let Some(last_accessed_at) = self.last_memory_cache_accessed_at else {
@@ -1903,8 +2845,8 @@ impl ScriptMetaKitEngine {
         };
         let now = now_timestamp_millis();
         if now.saturating_sub(last_accessed_at) >= idle_lifetime {
+            self.mark_resident_memory_cache_evicted();
             self.clear_memory_cache();
-            self.memory_cache_export_allowed = false;
         }
     }
 
@@ -1978,6 +2920,45 @@ impl ScriptMetaKitEngine {
     }
 }
 
+fn root_state_equal(lhs: &RootSnapshot, rhs: &RootSnapshot) -> bool {
+    lhs.root_id == rhs.root_id
+        && lhs.path == rhs.path
+        && lhs.status == rhs.status
+        && lhs.is_dirty == rhs.is_dirty
+        && lhs.last_loaded_at == rhs.last_loaded_at
+        && lhs.last_event_at == rhs.last_event_at
+        && lhs.item_count == rhs.item_count
+        && lhs.error == rhs.error
+}
+
+fn catalog_root_content_equal(
+    lhs: &ScriptMetaCatalogSnapshot,
+    rhs: &ScriptMetaCatalogSnapshot,
+    root_id: &RootId,
+) -> bool {
+    let lhs_root = lhs.roots.iter().find(|root| root.root_id == *root_id);
+    let rhs_root = rhs.roots.iter().find(|root| root.root_id == *root_id);
+    if !lhs_root
+        .zip(rhs_root)
+        .is_some_and(|(lhs, rhs)| root_state_equal(lhs, rhs))
+    {
+        return false;
+    }
+    lhs.candidate_cache
+        .records
+        .iter()
+        .filter(|record| record.root_id == *root_id)
+        .eq(rhs
+            .candidate_cache
+            .records
+            .iter()
+            .filter(|record| record.root_id == *root_id))
+}
+
+fn file_list_content_equal(lhs: &FileListSnapshot, rhs: &FileListSnapshot) -> bool {
+    lhs.children == rhs.children && lhs.truncated == rhs.truncated
+}
+
 fn root_map(
     roots: Vec<RootRegistration>,
 ) -> ScriptMetaKitResult<BTreeMap<RootId, RootRegistration>> {
@@ -1992,11 +2973,35 @@ fn root_map(
     Ok(roots_by_id)
 }
 
+fn merged_roots_from_groups(
+    root_groups: &BTreeMap<String, BTreeMap<RootId, RootRegistration>>,
+) -> ScriptMetaKitResult<Vec<RootRegistration>> {
+    let mut merged_roots_by_id: BTreeMap<RootId, RootRegistration> = BTreeMap::new();
+    for group_roots in root_groups.values() {
+        for root in group_roots.values() {
+            if let Some(existing) = merged_roots_by_id.get_mut(&root.root_id) {
+                *existing = merged_root_registration(existing, root)?;
+            } else {
+                merged_roots_by_id.insert(root.root_id.clone(), root.clone());
+            }
+        }
+    }
+    Ok(merged_roots_by_id.into_values().collect())
+}
+
 fn merged_root_registration(
     existing: &RootRegistration,
     next: &RootRegistration,
-) -> RootRegistration {
-    RootRegistration {
+) -> ScriptMetaKitResult<RootRegistration> {
+    if normalize_path(&existing.path) != normalize_path(&next.path) {
+        return Err(ScriptMetaKitError::InvalidConfig(format!(
+            "root_id `{}` is registered with conflicting paths `{}` and `{}`",
+            existing.root_id,
+            existing.path.display(),
+            next.path.display()
+        )));
+    }
+    Ok(RootRegistration {
         root_id: next.root_id.clone(),
         path: merged_root_path(existing, next),
         display_name: merged_display_name(existing, next),
@@ -2005,7 +3010,7 @@ fn merged_root_registration(
         cache_policy: merged_cache_policy(existing.cache_policy, next.cache_policy),
         refresh_policy: merged_refresh_policy(existing.refresh_policy, next.refresh_policy),
         priority: merged_root_priority(existing.priority, next.priority),
-    }
+    })
 }
 
 fn merged_root_path(existing: &RootRegistration, next: &RootRegistration) -> PathBuf {
@@ -2071,10 +3076,13 @@ fn merged_cache_policy(lhs: CachePolicy, rhs: CachePolicy) -> CachePolicy {
 }
 
 fn merged_refresh_policy(lhs: RefreshPolicy, rhs: RefreshPolicy) -> RefreshPolicy {
-    if lhs == RefreshPolicy::OnFileEventDeferred || rhs == RefreshPolicy::OnFileEventDeferred {
-        return RefreshPolicy::OnFileEventDeferred;
-    }
-    if lhs == RefreshPolicy::OnFileEvent || rhs == RefreshPolicy::OnFileEvent {
+    if matches!(
+        lhs,
+        RefreshPolicy::OnFileEvent | RefreshPolicy::OnFileEventDeferred
+    ) || matches!(
+        rhs,
+        RefreshPolicy::OnFileEvent | RefreshPolicy::OnFileEventDeferred
+    ) {
         return RefreshPolicy::OnFileEvent;
     }
     if lhs == RefreshPolicy::OnVisible || rhs == RefreshPolicy::OnVisible {
@@ -2094,6 +3102,21 @@ fn merged_root_priority(lhs: RootPriority, rhs: RootPriority) -> RootPriority {
         return RootPriority::VisibleWhenSelected;
     }
     RootPriority::Background
+}
+
+fn root_scan_priority(root: &RootRegistration, visible_root_id: Option<&RootId>) -> u8 {
+    match root.priority {
+        RootPriority::UserInitiated => 0,
+        RootPriority::VisibleWhenSelected if visible_root_id == Some(&root.root_id) => 1,
+        RootPriority::VisibleWhenSelected | RootPriority::Background => 2,
+    }
+}
+
+const fn canonical_cache_scope(scope: CacheScope) -> CacheScope {
+    match scope {
+        CacheScope::Root => CacheScope::FileList,
+        scope => scope,
+    }
 }
 
 fn root_allows_memory_cache(root: &RootRegistration) -> bool {
@@ -2163,30 +3186,6 @@ fn root_allows_persistent_file_list_cache(root: &RootRegistration) -> bool {
     matches!(root.cache_policy, CachePolicy::MemoryAndPersistent)
 }
 
-fn validate_catalog_cache_roots(
-    cache: &CandidateCache,
-    roots: &[RootRegistration],
-    allows_root: impl Fn(&RootRegistration) -> bool,
-) -> ScriptMetaKitResult<()> {
-    if !cache.is_current_schema() {
-        return Err(ScriptMetaKitError::Cache(format!(
-            "unsupported candidate cache schema version {}",
-            cache.schema_version
-        )));
-    }
-    let allowed_roots = roots
-        .iter()
-        .filter(|root| allows_root(root))
-        .collect::<Vec<_>>();
-    let expected = registered_root_signatures(&allowed_roots);
-    if cache.registered_roots != expected {
-        return Err(ScriptMetaKitError::Cache(
-            "cache root signature does not match registered roots".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn should_mark_dirty_for_file_event(
     root: &RootRegistration,
     visible_root_id: Option<&RootId>,
@@ -2239,6 +3238,27 @@ fn filter_update_result_to_items(
         || !result.failures_by_item_id.is_empty()
         || !result.errors_by_item_id.is_empty())
     .then(|| Arc::new(result))
+}
+
+fn merge_update_check_result(target: &mut Option<UpdateCheckResult>, source: &UpdateCheckResult) {
+    let Some(target) = target.as_mut() else {
+        *target = Some(source.clone());
+        return;
+    };
+    target.checked_at = target.checked_at.max(source.checked_at);
+    target.operation = source.operation.clone();
+    target
+        .resolutions_by_item_id
+        .extend(source.resolutions_by_item_id.clone());
+    target
+        .failures_by_item_id
+        .extend(source.failures_by_item_id.clone());
+    target
+        .errors_by_item_id
+        .extend(source.errors_by_item_id.clone());
+    target
+        .statuses_by_item_id
+        .extend(source.statuses_by_item_id.clone());
 }
 
 fn scan_file_list_job(
@@ -2438,7 +3458,7 @@ fn root_status_issue_code(status: RootStatus) -> &'static str {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogCacheData {
     catalog_snapshot: ScriptMetaCatalogSnapshot,
     #[serde(default)]
@@ -2940,21 +3960,22 @@ fn apply_metadata_capabilities_to_entries(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, path::PathBuf, sync::Arc};
+    use std::{collections::BTreeMap, path::Path, path::PathBuf, sync::Arc};
 
     use url::Url;
 
     use super::{
-        apply_metadata_capabilities_to_file_list_snapshots, decode_all_cache_data,
-        merged_root_purpose, update_retry_delay, update_work_groups,
+        UpdateCheckCacheMode, apply_metadata_capabilities_to_file_list_snapshots,
+        decode_all_cache_data, file_list_content_equal, merged_root_purpose, root_scan_priority,
+        update_retry_delay, update_work_groups,
     };
     use crate::{
         RootId,
         catalog::{
-            CachePolicy, FileListSnapshot, RefreshPolicy, RootPriority, RootPurpose,
-            RootRegistration, RootSnapshot,
+            CachePolicy, DirectoryState, FileListSnapshot, RefreshPolicy, RootPriority,
+            RootPurpose, RootRegistration, RootSnapshot, UpdateCheckResult,
         },
-        core::{ScriptMetaEditState, ScriptMetaItem},
+        core::{OperationSummary, ScriptMetaEditState, ScriptMetaItem},
         scanner::{CandidateRecord, FileSystemEntry, PathKind, PathResolutionStatus},
         watcher::WatchPolicy,
     };
@@ -2995,7 +4016,7 @@ mod tests {
         assert_eq!(merged.display_name.as_deref(), Some("Files"));
         assert_eq!(merged.watch_policy, WatchPolicy::AllRegistered);
         assert_eq!(merged.cache_policy, CachePolicy::MemoryAndPersistent);
-        assert_eq!(merged.refresh_policy, RefreshPolicy::OnFileEventDeferred);
+        assert_eq!(merged.refresh_policy, RefreshPolicy::OnFileEvent);
         assert_eq!(merged.priority, RootPriority::UserInitiated);
 
         engine
@@ -3003,6 +4024,57 @@ mod tests {
             .expect("remove file list roots");
 
         assert_eq!(engine.roots(), &[metadata_root]);
+    }
+
+    #[test]
+    fn failed_set_roots_preserves_existing_root_groups() {
+        let mut engine = super::ScriptMetaKitEngine::new(Default::default()).expect("engine");
+        let first = RootRegistration::file_list_and_metadata("first", "/tmp/first");
+        let second = RootRegistration::file_list_and_metadata("second", "/tmp/second");
+        engine
+            .replace_root_group("existing", vec![first.clone()])
+            .expect("existing group");
+
+        assert!(engine.set_roots(vec![second.clone(), second]).is_err());
+        engine
+            .replace_root_group(
+                "additional",
+                vec![RootRegistration::file_list_and_metadata(
+                    "third",
+                    "/tmp/third",
+                )],
+            )
+            .expect("additional group");
+
+        assert!(engine.roots().contains(&first));
+        assert_eq!(engine.roots().len(), 2);
+    }
+
+    #[test]
+    fn conflicting_paths_for_the_same_grouped_root_id_are_rejected_atomically() {
+        let mut engine = super::ScriptMetaKitEngine::new(Default::default()).expect("engine");
+        let first = RootRegistration::file_list_and_metadata("shared", "/tmp/first");
+        let second = RootRegistration::file_list_and_metadata("shared", "/tmp/second");
+        engine
+            .replace_root_group("first", vec![first.clone()])
+            .expect("first group");
+
+        let error = engine
+            .replace_root_group("second", vec![second])
+            .expect_err("conflicting path");
+
+        assert!(error.to_string().contains("conflicting paths"));
+        assert_eq!(engine.roots(), &[first]);
+        engine
+            .replace_root_group(
+                "third",
+                vec![RootRegistration::file_list_and_metadata(
+                    "additional",
+                    "/tmp/additional",
+                )],
+            )
+            .expect("valid group after rejection");
+        assert_eq!(engine.roots().len(), 2);
     }
 
     #[test]
@@ -3015,6 +4087,74 @@ mod tests {
             merged_root_purpose(RootPurpose::UpdateCheck, RootPurpose::FileList),
             RootPurpose::FileListAndMetadata
         );
+    }
+
+    #[test]
+    fn root_scan_priority_prefers_user_work_then_the_selected_visible_root() {
+        let root = |root_id: &str, priority| RootRegistration {
+            root_id: RootId::from(root_id),
+            path: PathBuf::from(format!("/tmp/{root_id}")),
+            display_name: None,
+            purpose: RootPurpose::FileList,
+            watch_policy: WatchPolicy::Disabled,
+            cache_policy: CachePolicy::MemoryOnly,
+            refresh_policy: RefreshPolicy::ManualOnly,
+            priority,
+        };
+        let user = root("user", RootPriority::UserInitiated);
+        let visible = root("visible", RootPriority::VisibleWhenSelected);
+        let background = root("background", RootPriority::Background);
+        let visible_id = RootId::from("visible");
+
+        assert!(
+            root_scan_priority(&user, Some(&visible_id))
+                < root_scan_priority(&visible, Some(&visible_id))
+        );
+        assert!(
+            root_scan_priority(&visible, Some(&visible_id))
+                < root_scan_priority(&background, Some(&visible_id))
+        );
+        assert_eq!(
+            root_scan_priority(&visible, None),
+            root_scan_priority(&background, None)
+        );
+    }
+
+    #[test]
+    fn storing_update_results_marks_catalog_persistence_dirty() {
+        let mut engine = super::ScriptMetaKitEngine::new(Default::default()).expect("engine");
+        engine.catalog_persistence_is_current = true;
+        engine.store_update_check_result(
+            &[],
+            Arc::new(UpdateCheckResult {
+                checked_at: 1,
+                operation: OperationSummary::default(),
+                resolutions_by_item_id: BTreeMap::new(),
+                failures_by_item_id: BTreeMap::new(),
+                errors_by_item_id: BTreeMap::new(),
+                statuses_by_item_id: BTreeMap::new(),
+            }),
+            UpdateCheckCacheMode::Replace,
+        );
+
+        assert!(!engine.catalog_persistence_is_current);
+    }
+
+    #[test]
+    fn eviction_does_not_retain_an_update_result_without_a_catalog() {
+        let mut engine = super::ScriptMetaKitEngine::new(Default::default()).expect("engine");
+        engine.update_check_result = Some(Arc::new(UpdateCheckResult {
+            checked_at: 1,
+            operation: OperationSummary::default(),
+            resolutions_by_item_id: BTreeMap::new(),
+            failures_by_item_id: BTreeMap::new(),
+            errors_by_item_id: BTreeMap::new(),
+            statuses_by_item_id: BTreeMap::new(),
+        }));
+        engine.mark_resident_memory_cache_evicted();
+
+        assert!(engine.pending_catalog_persistence.is_none());
+        assert!(engine.pending_update_check_persistence.is_none());
     }
 
     #[test]
@@ -3108,6 +4248,7 @@ mod tests {
             children: Some(vec![file_entry(&file_path)]),
             directory_states: Default::default(),
             truncated: false,
+            content_revision: Default::default(),
         }];
 
         apply_metadata_capabilities_to_file_list_snapshots(&mut snapshots, &[record]);
@@ -3138,6 +4279,39 @@ mod tests {
 
         assert!(cache.catalog.is_none());
         assert!(cache.file_list_snapshots.is_empty());
+    }
+
+    #[test]
+    fn content_projection_ignores_directory_states_but_includes_tree_and_truncation() {
+        let root = RootSnapshot::new(RootId::from("root"), PathBuf::from("/tmp/root"));
+        let path = PathBuf::from("/tmp/root/Tool.jsx");
+        let baseline = FileListSnapshot {
+            root,
+            children: Some(vec![file_entry(&path)]),
+            directory_states: Default::default(),
+            truncated: false,
+            content_revision: Default::default(),
+        };
+        let mut directory_state_only = baseline.clone();
+        directory_state_only.directory_states.insert(
+            "/tmp/root".to_string(),
+            DirectoryState {
+                modification_time_millis: Some(1),
+                child_count: 1,
+                child_fingerprint: 42,
+                identity: None,
+            },
+        );
+        assert!(file_list_content_equal(&baseline, &directory_state_only));
+
+        let mut changed_tree = baseline.clone();
+        changed_tree.children.as_mut().expect("children")[0].display_path =
+            PathBuf::from("/tmp/root/Renamed.jsx");
+        assert!(!file_list_content_equal(&baseline, &changed_tree));
+
+        let mut changed_truncation = baseline.clone();
+        changed_truncation.truncated = true;
+        assert!(!file_list_content_equal(&baseline, &changed_truncation));
     }
 
     fn file_entry(path: &Path) -> FileSystemEntry {

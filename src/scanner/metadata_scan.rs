@@ -18,7 +18,8 @@ use uuid::Uuid;
 use crate::{
     RootId, TimestampMillis,
     catalog::{
-        FileIdentity, FileListSnapshot, RootError, RootRegistration, RootSnapshot, RootStatus,
+        FileIdentity, FileListSnapshot, RootError, RootPriority, RootRegistration, RootSnapshot,
+        RootStatus,
     },
     core::{
         OperationCancellation, ParserOptions, ScriptMetaEditState, ScriptMetaItem,
@@ -41,7 +42,7 @@ use super::path_resolution::{
 };
 use super::{
     file_list::{FileSystemEntry, file_identity, system_time_millis},
-    root_preflight::{root_content_preflight_issue, root_location_issue},
+    root_preflight::{RootContentPreflightTracker, root_location_issue},
 };
 use crate::formats::compiled_osa::CompiledOsaErrorKind;
 
@@ -129,6 +130,7 @@ pub(crate) struct MetadataScanSources<'a> {
     pub previous_cache: Option<&'a CandidateCache>,
     pub dirty_directories_by_root: Option<&'a BTreeMap<RootId, Vec<PathBuf>>>,
     pub file_list_snapshots: Option<&'a [FileListSnapshot]>,
+    pub visible_root_id: Option<&'a RootId>,
 }
 
 pub fn scan_metadata_roots<'a, I>(
@@ -189,6 +191,7 @@ where
             previous_cache,
             dirty_directories_by_root,
             file_list_snapshots: None,
+            visible_root_id: None,
         },
         cancellation,
     )
@@ -215,15 +218,9 @@ where
     let mut records = Vec::new();
     let mut root_snapshots = Vec::new();
 
-    for mut output in scan_metadata_root_outputs(
-        &roots,
-        rules,
-        sources.previous_cache,
-        &reusable_records,
-        sources.dirty_directories_by_root,
-        sources.file_list_snapshots,
-        cancellation,
-    ) {
+    for mut output in
+        scan_metadata_root_outputs(&roots, rules, &reusable_records, sources, cancellation)
+    {
         if !matches!(output.root.status, RootStatus::Ready | RootStatus::Missing)
             && let Some(previous_cache) = sources
                 .previous_cache
@@ -276,34 +273,41 @@ struct MetadataRootScanOutput {
 fn scan_metadata_root_outputs<'a>(
     roots: &[&'a RootRegistration],
     rules: MetadataScanRules<'a>,
-    previous_cache: Option<&CandidateCache>,
     reusable_records: &BTreeMap<&'a Path, &'a CandidateRecord>,
-    dirty_directories_by_root: Option<&BTreeMap<RootId, Vec<PathBuf>>>,
-    file_list_snapshots: Option<&[FileListSnapshot]>,
+    sources: MetadataScanSources<'_>,
     cancellation: Option<&OperationCancellation>,
 ) -> Vec<MetadataRootScanOutput> {
     if roots.is_empty() {
         return Vec::new();
     }
 
+    let mut job_indices = (0..roots.len()).collect::<Vec<_>>();
+    job_indices.sort_by_key(|index| metadata_root_priority(roots[*index], sources.visible_root_id));
     let parallelism = metadata_scan_parallelism(roots.len());
     if parallelism <= 1 {
-        return roots
+        let mut outputs = job_indices
             .iter()
-            .map(|root| {
-                let dirty_directories =
-                    dirty_directories_by_root.and_then(|dirty| dirty.get(&root.root_id));
-                scan_metadata_root_job(
-                    root,
-                    rules,
-                    previous_cache,
-                    reusable_records,
-                    dirty_directories.map(Vec::as_slice),
-                    file_list_snapshots,
-                    cancellation,
+            .map(|index| {
+                let root = roots[*index];
+                let dirty_directories = sources
+                    .dirty_directories_by_root
+                    .and_then(|dirty| dirty.get(&root.root_id));
+                (
+                    *index,
+                    scan_metadata_root_job(
+                        root,
+                        rules,
+                        sources.previous_cache,
+                        reusable_records,
+                        dirty_directories.map(Vec::as_slice),
+                        sources.file_list_snapshots,
+                        cancellation,
+                    ),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        outputs.sort_by_key(|(index, _)| *index);
+        return outputs.into_iter().map(|(_, output)| output).collect();
     }
 
     let next_root_index = AtomicUsize::new(0);
@@ -311,22 +315,25 @@ fn scan_metadata_root_outputs<'a>(
     thread::scope(|scope| {
         for _ in 0..parallelism {
             let next_root_index = &next_root_index;
+            let job_indices = &job_indices;
             let sender = sender.clone();
             scope.spawn(move || {
                 loop {
-                    let index = next_root_index.fetch_add(1, Ordering::Relaxed);
-                    let Some(root) = roots.get(index) else {
+                    let job_index = next_root_index.fetch_add(1, Ordering::Relaxed);
+                    let Some(index) = job_indices.get(job_index).copied() else {
                         break;
                     };
-                    let dirty_directories =
-                        dirty_directories_by_root.and_then(|dirty| dirty.get(&root.root_id));
+                    let root = roots[index];
+                    let dirty_directories = sources
+                        .dirty_directories_by_root
+                        .and_then(|dirty| dirty.get(&root.root_id));
                     let output = scan_metadata_root_job(
                         root,
                         rules,
-                        previous_cache,
+                        sources.previous_cache,
                         reusable_records,
                         dirty_directories.map(Vec::as_slice),
-                        file_list_snapshots,
+                        sources.file_list_snapshots,
                         cancellation,
                     );
                     let _ = sender.send((index, output));
@@ -339,6 +346,14 @@ fn scan_metadata_root_outputs<'a>(
         outputs.sort_by_key(|(index, _)| *index);
         outputs.into_iter().map(|(_, output)| output).collect()
     })
+}
+
+fn metadata_root_priority(root: &RootRegistration, visible_root_id: Option<&RootId>) -> u8 {
+    match root.priority {
+        RootPriority::UserInitiated => 0,
+        RootPriority::VisibleWhenSelected if visible_root_id == Some(&root.root_id) => 1,
+        RootPriority::VisibleWhenSelected | RootPriority::Background => 2,
+    }
 }
 
 fn scan_metadata_root_job<'a>(
@@ -416,18 +431,17 @@ fn scan_metadata_root_from_file_list<'a>(
     let normalized_dirty_directories = dirty_directories
         .map(|directories| normalize_dirty_directories(directories, &normalized_root_path))
         .filter(|directories| !directories.is_empty());
-    let dirty_refresh_context = normalized_dirty_directories
-        .as_deref()
-        .filter(|directories| {
-            !directories
-                .iter()
-                .any(|directory| directory == &normalized_root_path)
-        })
-        .and_then(|directories| {
-            previous_cache
-                .filter(|cache| cache.is_current_schema())
-                .map(|cache| (cache, directories))
-        });
+    let dirty_refresh_context = previous_cache
+        .filter(|cache| cache.is_current_schema())
+        .zip(
+            normalized_dirty_directories
+                .as_deref()
+                .filter(|directories| {
+                    !directories
+                        .iter()
+                        .any(|directory| directory == &normalized_root_path)
+                }),
+        );
     let mut state = MetadataWalkState {
         root,
         root_path: Arc::new(root.path.clone()),
@@ -448,6 +462,8 @@ fn scan_metadata_root_from_file_list<'a>(
         cancelled: false,
         root_error: None,
         cancellation,
+        preflight_tracker: None,
+        preflight_issue: None,
     };
     let mut records = Vec::new();
     collect_metadata_from_file_list_entries(
@@ -653,6 +669,8 @@ fn scan_metadata_root<'a>(
         cancelled: false,
         root_error: None,
         cancellation,
+        preflight_tracker: Some(RootContentPreflightTracker::new(options, extensions)),
+        preflight_issue: None,
     };
 
     let root_resolution = resolve_scannable_path(
@@ -667,6 +685,15 @@ fn scan_metadata_root<'a>(
             code: "symlink_following_disabled".to_string(),
             message: "root is a symlink and symlink following is disabled".to_string(),
         });
+        return MetadataRootScanOutput {
+            root: snapshot,
+            records,
+        };
+    }
+    if let Some((status, root_error)) = root_location_issue(&root_resolution.resolved_path, options)
+    {
+        snapshot.status = status;
+        snapshot.error = Some(root_error);
         return MetadataRootScanOutput {
             root: snapshot,
             records,
@@ -707,6 +734,7 @@ fn scan_metadata_root<'a>(
             .any(|directory| directory == &normalized_root_path)
         && let Some(previous_cache) = previous_cache.filter(|cache| cache.is_current_schema())
     {
+        state.preflight_tracker = None;
         scan_dirty_directories(
             dirty_directories,
             &normalized_root_path,
@@ -715,16 +743,6 @@ fn scan_metadata_root<'a>(
         );
         Some((previous_cache, dirty_directories))
     } else {
-        if let Some((status, root_error)) =
-            root_content_preflight_issue(&root_resolution.resolved_path, options, extensions)
-        {
-            snapshot.status = status;
-            snapshot.error = Some(root_error);
-            return MetadataRootScanOutput {
-                root: snapshot,
-                records,
-            };
-        }
         scan_directory(
             &root.path,
             &root_resolution.resolved_path,
@@ -734,7 +752,10 @@ fn scan_metadata_root<'a>(
         );
         None
     };
-    if let Some(error) = state.root_error {
+    if let Some((status, error)) = state.preflight_issue {
+        snapshot.status = status;
+        snapshot.error = Some(error);
+    } else if let Some(error) = state.root_error {
         snapshot.status = RootStatus::Unreadable;
         snapshot.error = Some(error);
     } else {
@@ -888,6 +909,8 @@ struct MetadataWalkState<'a> {
     cancelled: bool,
     root_error: Option<RootError>,
     cancellation: Option<&'a OperationCancellation>,
+    preflight_tracker: Option<RootContentPreflightTracker<'a>>,
+    preflight_issue: Option<(RootStatus, RootError)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -959,6 +982,14 @@ fn scan_directory(
 
         let source_path = entry.path();
         let display_path = display_directory.join(entry.file_name());
+        if let Some(issue) = state
+            .preflight_tracker
+            .as_mut()
+            .and_then(|tracker| tracker.observe_entry(&entry, &display_path))
+        {
+            state.preflight_issue = Some(issue);
+            return;
+        }
         if should_skip_path(&display_path, state.options) {
             continue;
         }
@@ -1384,6 +1415,9 @@ fn compiled_osa_resolution_status(kind: CompiledOsaErrorKind) -> PathResolutionS
 }
 
 fn should_stop(depth: usize, state: &mut MetadataWalkState<'_>) -> bool {
+    if state.preflight_issue.is_some() {
+        return true;
+    }
     if state
         .cancellation
         .is_some_and(OperationCancellation::is_cancelled)
@@ -1425,10 +1459,14 @@ fn should_skip_path(path: &Path, options: &ScannerOptions) -> bool {
 }
 
 fn is_package_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some("app" | "bundle" | "framework" | "plugin" | "appex")
-    )
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "app" | "bundle" | "framework" | "plugin" | "appex"
+            )
+        })
 }
 
 fn missing_root_error() -> RootError {
@@ -1578,6 +1616,33 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn metadata_priority_prefers_user_work_then_the_selected_visible_root() {
+        let root = |root_id: &str, priority| RootRegistration {
+            root_id: RootId::from(root_id),
+            path: PathBuf::from(format!("/tmp/{root_id}")),
+            display_name: None,
+            purpose: crate::RootPurpose::MetadataCatalog,
+            watch_policy: crate::WatchPolicy::Disabled,
+            cache_policy: crate::CachePolicy::MemoryOnly,
+            refresh_policy: crate::RefreshPolicy::ManualOnly,
+            priority,
+        };
+        let user = root("user", RootPriority::UserInitiated);
+        let visible = root("visible", RootPriority::VisibleWhenSelected);
+        let background = root("background", RootPriority::Background);
+        let visible_id = RootId::from("visible");
+
+        assert!(
+            metadata_root_priority(&user, Some(&visible_id))
+                < metadata_root_priority(&visible, Some(&visible_id))
+        );
+        assert!(
+            metadata_root_priority(&visible, Some(&visible_id))
+                < metadata_root_priority(&background, Some(&visible_id))
+        );
+    }
+
+    #[test]
     fn shared_file_list_traversal_matches_independent_metadata_scan() {
         let directory = tempfile::tempdir().expect("tempdir");
         let nested = directory.path().join("Nested");
@@ -1610,6 +1675,7 @@ mod tests {
             children: Some(file_list.children),
             directory_states: file_list.directory_states,
             truncated: file_list.truncated,
+            content_revision: Default::default(),
         };
         let shared = scan_metadata_roots_scoped_with_file_lists_controlled(
             [&root],
@@ -1620,6 +1686,7 @@ mod tests {
                 previous_cache: None,
                 dirty_directories_by_root: None,
                 file_list_snapshots: Some(std::slice::from_ref(&file_list_snapshot)),
+                visible_root_id: None,
             },
             None,
         );
@@ -1673,6 +1740,7 @@ mod tests {
             children: Some(initial_file_list.children),
             directory_states: initial_file_list.directory_states,
             truncated: initial_file_list.truncated,
+            content_revision: Default::default(),
         };
 
         fs::write(
@@ -1694,6 +1762,7 @@ mod tests {
             children: Some(refreshed_file_list.children),
             directory_states: refreshed_file_list.directory_states,
             truncated: refreshed_file_list.truncated,
+            content_revision: Default::default(),
         };
         let dirty_by_root = BTreeMap::from([(root.root_id.clone(), dirty_directories)]);
 
@@ -1715,6 +1784,7 @@ mod tests {
                 previous_cache: Some(&initial_metadata.candidate_cache),
                 dirty_directories_by_root: Some(&dirty_by_root),
                 file_list_snapshots: Some(std::slice::from_ref(&refreshed_file_list)),
+                visible_root_id: None,
             },
             None,
         );
@@ -1746,5 +1816,11 @@ mod tests {
         assert_eq!(output.roots[0].status, RootStatus::Overflowed);
         assert_eq!(output.roots[0].item_count, 0);
         assert!(output.candidate_cache.records.is_empty());
+    }
+
+    #[test]
+    fn package_detection_is_case_insensitive() {
+        assert!(is_package_path(Path::new("Example.APP")));
+        assert!(is_package_path(Path::new("Example.Framework")));
     }
 }

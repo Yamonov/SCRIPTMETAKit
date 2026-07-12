@@ -27,3 +27,4 @@ pub use path_resolution::{
     PathKind, PathResolutionStatus, ScannablePathResolution, resolve_registered_path,
 };
 pub use root_preflight::can_read_directory_contents;
+pub(crate) use root_preflight::preflight_root_registration;
