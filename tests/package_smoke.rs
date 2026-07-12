@@ -680,6 +680,92 @@ fn persistent_restore_does_not_overwrite_newer_pending_snapshot_after_eviction()
 }
 
 #[test]
+fn newer_resident_file_list_replaces_an_older_pending_snapshot() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_path = temp.path().join("Root");
+    std::fs::create_dir_all(&root_path).expect("root");
+    std::fs::write(root_path.join("First.jsx"), "alert('first');").expect("first");
+    std::fs::write(root_path.join("Second.jsx"), "alert('second');").expect("second");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "PendingResidentOrder");
+    config.cache.max_memory_nodes = 1;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration::file_list_and_metadata("root", &root_path),
+        ])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("evicted scan");
+
+    engine.config_mut().cache.max_memory_nodes = 100;
+    std::fs::write(root_path.join("New.jsx"), "alert('new');").expect("new");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("resident refresh");
+
+    let exported = engine
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("latest export");
+    let snapshots: std::collections::BTreeMap<
+        scriptmetakit::RootId,
+        std::sync::Arc<scriptmetakit::FileListSnapshot>,
+    > = serde_json::from_value(exported.data).expect("file-list snapshots");
+    assert!(
+        snapshots["root"]
+            .children
+            .as_ref()
+            .expect("children")
+            .iter()
+            .any(|entry| entry.display_path.ends_with("New.jsx")),
+        "the latest resident snapshot must replace older pending content"
+    );
+}
+
+#[test]
+fn cache_policy_change_refreshes_an_unavailable_state_revision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = |cache_policy| scriptmetakit::RootRegistration {
+        root_id: "root".into(),
+        path: temp.path().to_path_buf(),
+        display_name: None,
+        purpose: scriptmetakit::RootPurpose::MetadataCatalog,
+        watch_policy: scriptmetakit::WatchPolicy::Disabled,
+        cache_policy,
+        refresh_policy: scriptmetakit::RefreshPolicy::ManualOnly,
+        priority: scriptmetakit::RootPriority::Background,
+    };
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(
+        scriptmetakit::ScriptMetaKitConfig::new("Test", "CachePolicyRevision"),
+    )
+    .expect("engine");
+    engine
+        .set_roots(vec![root(
+            scriptmetakit::CachePolicy::PersistentCatalogOnly,
+        )])
+        .expect("persistent-only root");
+    let first = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+
+    engine
+        .set_roots(vec![root(scriptmetakit::CachePolicy::MemoryAndPersistent)])
+        .expect("memory-and-persistent root");
+    let second = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
+        scriptmetakit::ScanMode::MetadataOnly,
+    ));
+
+    assert_ne!(
+        first.roots[0].state_revision, second.roots[0].state_revision,
+        "a cache policy transition must invalidate a prior load-attempt revision"
+    );
+}
+
+#[test]
 fn idle_expiry_can_restore_and_resume_file_list_export() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("Tool.jsx"), "alert('tool');").expect("tool");

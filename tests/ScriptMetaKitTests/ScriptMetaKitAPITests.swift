@@ -903,6 +903,50 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(current.availableSnapshot?.contentRevision, cachedRevision)
     }
 
+    func testPersistentLoadRecordsEveryRootAdoptedFromTheCacheFile() async throws {
+        let firstURL = try makeTemporaryScriptRoot(scriptID: "com.example.persistent-first")
+        let secondURL = try makeTemporaryScriptRoot(scriptID: "com.example.persistent-second")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitMultiRootCache-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let roots = [
+            ScriptMetaKitRoot(rootID: "persistent-first", url: firstURL),
+            ScriptMetaKitRoot(rootID: "persistent-second", url: secondURL)
+        ]
+        let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let writer = ScriptMetaKitWorkspace(configuration: .init(cacheStore: cacheStore))
+        _ = try await writer.scanRoots(
+            roots,
+            replacingGroup: "test.multi-root-persistent",
+            rootIDs: roots.map(\.rootID),
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        await writer.shutdown()
+
+        let reader = ScriptMetaKitWorkspace(configuration: .init(cacheStore: cacheStore))
+        try await reader.registerRoots(
+            roots,
+            replacingGroup: "test.multi-root-persistent",
+            cacheScope: nil
+        )
+        let first = try await reader.cachedFileListStates(
+            rootIDs: [roots[0].rootID],
+            cacheScope: .fileList
+        )
+        XCTAssertEqual(first[roots[0].rootID]?.source, .persistentCache)
+
+        let second = try await reader.cachedFileListStates(
+            rootIDs: [roots[1].rootID],
+            cacheScope: nil
+        )
+        XCTAssertEqual(second[roots[1].rootID]?.source, .persistentCache)
+    }
+
     func testWorkspaceReportsNonfatalCacheDiagnostics() async throws {
         let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.diagnostic")
         let cacheDirectory = FileManager.default.temporaryDirectory

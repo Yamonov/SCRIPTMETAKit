@@ -404,6 +404,11 @@ impl ScriptMetaKitEngine {
                 });
             }
             let previous = previous_roots_by_id.get(&root.root_id);
+            let cache_availability_changed =
+                previous.is_some_and(|previous| previous.cache_policy != root.cache_policy);
+            if cache_availability_changed {
+                self.cache_unavailable_revisions.remove(&root.root_id);
+            }
             let file_list_content_changed = previous.is_some_and(|previous| {
                 previous.purpose.includes_file_list() != root.purpose.includes_file_list()
                     || ((previous.purpose.includes_file_list()
@@ -436,6 +441,11 @@ impl ScriptMetaKitEngine {
                     let mut snapshot = RootSnapshot::new(root.root_id.clone(), root.path.clone());
                     snapshot.state_revision = self.issue_revision();
                     self.root_snapshots.insert(root.root_id.clone(), snapshot);
+                } else if cache_availability_changed {
+                    let revision = self.issue_revision();
+                    if let Some(snapshot) = self.root_snapshots.get_mut(&root.root_id) {
+                        snapshot.state_revision = revision;
+                    }
                 }
             }
         }
@@ -999,6 +1009,9 @@ impl ScriptMetaKitEngine {
                     };
                     let snapshot = Arc::new(snapshot);
                     if self.should_store_file_list_snapshot(&root_id) {
+                        if snapshot.children.is_some() {
+                            self.pending_file_list_persistence.remove(&root_id);
+                        }
                         self.file_list_snapshots
                             .insert(root_id.clone(), Arc::clone(&snapshot));
                         self.refresh_cache_unavailable_revision(&root_id);

@@ -273,7 +273,7 @@ public actor ScriptMetaKitWorkspace {
 
     private struct PersistentCacheLoadState {
         var signature: PersistentCacheFileSignature
-        var attemptedRootIDs: Set<String>
+        var rootRevisions: [String: ScriptMetaKitRevision]
     }
 
     private let engine = ScriptMetaKitEngine()
@@ -1013,7 +1013,8 @@ public actor ScriptMetaKitWorkspace {
 
     private func loadPersistentCacheIfNeeded(scope: ScriptMetaCacheScope, rootIDs: [String]) async {
         guard let cacheStore = configuration.cacheStore else { return }
-        let cacheStateKey = canonicalCacheScope(scope).rawValue
+        let canonicalScope = canonicalCacheScope(scope)
+        let cacheStateKey = canonicalScope.rawValue
         guard let maximumCacheBytes = cacheStore.validatedMaximumCacheBytes else {
             emitDiagnostic(
                 severity: .warning,
@@ -1024,57 +1025,45 @@ public actor ScriptMetaKitWorkspace {
             return
         }
         let requestedRootIDs = Set(rootIDs)
+        var registeredRootIDs = registeredRootIDsByGroup.values.reduce(into: Set<String>()) {
+            $0.formUnion($1)
+        }
+        registeredRootIDs.formUnion(requestedRootIDs)
+        let probedRootIDs = registeredRootIDs.sorted()
         guard let url = cacheStore.readableCacheFileURL(scope: scope) else { return }
         guard let cacheSignature = persistentCacheFileSignature(for: url) else { return }
-        let residentFileListRevisions: [String: ScriptMetaKitRevision]
-        if scope == .fileList || scope == .all || scope == .root {
-            let resident = try? await engine.cachedRoots(
-                rootIDs: rootIDs,
-                mode: .fileListOnly
-            )
-            residentFileListRevisions = Dictionary(uniqueKeysWithValues:
-                resident?.fileListSnapshots.compactMap { snapshot in
-                    snapshot.children.map { _ in
-                        (snapshot.root.rootID, snapshot.contentRevision)
-                    }
-                } ?? []
-            )
-            if scope != .all
-                && Set(residentFileListRevisions.keys).isSuperset(of: requestedRootIDs)
-            {
-                return
-            }
-        } else {
-            residentFileListRevisions = [:]
+        let probeMode: ScriptMetaScanMode = switch canonicalScope {
+        case .catalog: .metadataOnly
+        case .all: .fileListAndMetadata
+        case .fileList, .root: .fileListOnly
         }
+        let resident = try? await engine.cachedRoots(rootIDs: probedRootIDs, mode: probeMode)
+        let residentFileListRevisions = fileListRevisions(in: resident)
+        if canonicalScope == .fileList,
+           Set(residentFileListRevisions.keys).isSuperset(of: requestedRootIDs) {
+            return
+        }
+        let residentRootRevisions = rootRevisions(in: resident)
         if let loadState = persistentCacheLoadStates[cacheStateKey],
            loadState.signature == cacheSignature,
-           loadState.attemptedRootIDs.isSuperset(of: requestedRootIDs) {
+           requestedRootIDs.allSatisfy({ rootID in
+               guard let revision = residentRootRevisions[rootID] else { return false }
+               return loadState.rootRevisions[rootID] == revision
+           }) {
             return
         }
         do {
             try await engine.loadCache(from: url, maximumBytes: maximumCacheBytes)
-            if persistentCacheLoadStates[cacheStateKey]?.signature == cacheSignature {
-                persistentCacheLoadStates[cacheStateKey]?.attemptedRootIDs.formUnion(requestedRootIDs)
-            } else {
-                persistentCacheLoadStates[cacheStateKey] = PersistentCacheLoadState(
-                    signature: cacheSignature,
-                    attemptedRootIDs: requestedRootIDs
-                )
-            }
-            if scope == .fileList || scope == .all || scope == .root {
-                let loaded = try? await engine.cachedRoots(
-                    rootIDs: rootIDs,
-                    mode: .fileListOnly
-                )
-                let adoptedRootIDs: [String] = loaded?.fileListSnapshots.compactMap { snapshot in
-                    guard snapshot.children != nil,
-                          residentFileListRevisions[snapshot.root.rootID]
-                            != snapshot.contentRevision else {
-                        return nil
-                    }
-                    return snapshot.root.rootID
-                } ?? []
+            let loaded = try? await engine.cachedRoots(rootIDs: probedRootIDs, mode: probeMode)
+            persistentCacheLoadStates[cacheStateKey] = PersistentCacheLoadState(
+                signature: cacheSignature,
+                rootRevisions: rootRevisions(in: loaded)
+            )
+            if canonicalScope == .fileList || canonicalScope == .all {
+                let loadedFileListRevisions = fileListRevisions(in: loaded)
+                let adoptedRootIDs = loadedFileListRevisions.compactMap { rootID, revision in
+                    residentFileListRevisions[rootID] != revision ? rootID : nil
+                }
                 persistentFileListRootIDs.formUnion(adoptedRootIDs)
             }
         } catch {
@@ -1107,16 +1096,7 @@ public actor ScriptMetaKitWorkspace {
                 scope: scope,
                 maximumBytes: maximumCacheBytes
             )
-            let url = cacheStore.writableCacheFileURL(scope: scope)
-            if let signature = persistentCacheFileSignature(for: url) {
-                let registeredRootIDs = registeredRootIDsByGroup.values.reduce(into: Set<String>()) {
-                    $0.formUnion($1)
-                }
-                persistentCacheLoadStates[scope.rawValue] = PersistentCacheLoadState(
-                    signature: signature,
-                    attemptedRootIDs: registeredRootIDs
-                )
-            }
+            persistentCacheLoadStates[scope.rawValue] = nil
         } catch {
             emitDiagnostic(
                 severity: .warning,
@@ -1153,6 +1133,20 @@ public actor ScriptMetaKitWorkspace {
             fileSize: fileSize,
             modificationDate: values.contentModificationDate
         )
+    }
+
+    private func rootRevisions(
+        in result: ScriptMetaScanResult?
+    ) -> [String: ScriptMetaKitRevision] {
+        Dictionary(uniqueKeysWithValues: result?.roots.map { ($0.rootID, $0.stateRevision) } ?? [])
+    }
+
+    private func fileListRevisions(
+        in result: ScriptMetaScanResult?
+    ) -> [String: ScriptMetaKitRevision] {
+        Dictionary(uniqueKeysWithValues: result?.fileListSnapshots.compactMap { snapshot in
+            snapshot.children.map { _ in (snapshot.root.rootID, snapshot.contentRevision) }
+        } ?? [])
     }
 
     private func schedulePersistentCacheSave(scope: ScriptMetaCacheScope) {
