@@ -318,7 +318,7 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
         }
         let result = try await engine.scanRoots(
             rootIDs: rootIDs,
@@ -349,7 +349,7 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         try await mergeRoot(root, groupID: groupID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: [root.rootID])
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: [root.rootID])
         }
         let result = try await engine.scanRoot(
             rootID: root.rootID,
@@ -381,7 +381,7 @@ public actor ScriptMetaKitWorkspace {
         try await mergeRoots(roots, groupID: groupID)
         let rootIDs = roots.map(\.rootID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
         }
         let result = try await engine.scanRoots(
             rootIDs: rootIDs,
@@ -416,7 +416,7 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: resultRootIDs)
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: resultRootIDs)
         }
         let scannedResult = try await engine.scanRoots(
             rootIDs: scanningRootIDs,
@@ -449,7 +449,7 @@ public actor ScriptMetaKitWorkspace {
         try Task.checkCancellation()
         try await configureEngineIfNeeded()
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
         }
         return try await engine.cachedRoots(rootIDs: rootIDs, mode: mode)
     }
@@ -477,7 +477,7 @@ public actor ScriptMetaKitWorkspace {
         guard !rootIDs.isEmpty else { return [:] }
         let registeredResult = try await engine.cachedRoots(rootIDs: rootIDs, mode: .fileListOnly)
         try validateRegisteredRootIDs(rootIDs, in: registeredResult)
-        if let cacheScope { await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs) }
+        if let cacheScope { try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs) }
         let result = cacheScope == nil
             ? registeredResult
             : try await engine.cachedRoots(rootIDs: rootIDs, mode: .fileListOnly)
@@ -501,7 +501,7 @@ public actor ScriptMetaKitWorkspace {
         }
         let registeredResult = try await engine.cachedRoots(rootIDs: [rootID], mode: .fileListOnly)
         try validateRegisteredRootIDs([rootID], in: registeredResult)
-        if let cacheScope { await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: [rootID]) }
+        if let cacheScope { try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: [rootID]) }
         let result = cacheScope == nil
             ? registeredResult
             : try await engine.cachedRoots(rootIDs: [rootID], mode: .fileListOnly)
@@ -568,7 +568,7 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         try await mergeRoot(root, groupID: groupID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: [root.rootID])
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: [root.rootID])
         }
         let result = try await engine.cachedRoots(rootIDs: [root.rootID], mode: .fileListOnly)
         return result.fileListSnapshots.first { $0.root.rootID == root.rootID }
@@ -586,7 +586,7 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: rootIDs)
         }
         let result = try await engine.cachedRoots(rootIDs: rootIDs, mode: .metadataOnly)
         return result.catalogSnapshot
@@ -603,7 +603,7 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: roots.map(\.rootID))
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: roots.map(\.rootID))
         }
     }
 
@@ -653,7 +653,7 @@ public actor ScriptMetaKitWorkspace {
         try await configureEngineIfNeeded()
         try await replaceRoots(roots, groupID: groupID)
         if let cacheScope {
-            await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: roots.map(\.rootID))
+            try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: roots.map(\.rootID))
         }
         try await engine.startWatching(onChange: onChange)
         if drainsInitialChanges {
@@ -896,6 +896,13 @@ public actor ScriptMetaKitWorkspace {
         try await engine.failNextWatcherStartForTesting()
     }
 
+    func cancelNextPersistentCacheLoadForTesting() async throws {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        try await engine.cancelNextCacheLoadForTesting()
+    }
+
     func schedulePersistentCacheSaveForTesting(scope: ScriptMetaCacheScope) {
         schedulePersistentCacheSave(scope: scope)
     }
@@ -1011,7 +1018,10 @@ public actor ScriptMetaKitWorkspace {
         persistentFileListRootIDs.formIntersection(registeredRootIDs)
     }
 
-    private func loadPersistentCacheIfNeeded(scope: ScriptMetaCacheScope, rootIDs: [String]) async {
+    private func loadPersistentCacheIfNeeded(
+        scope: ScriptMetaCacheScope,
+        rootIDs: [String]
+    ) async throws {
         guard let cacheStore = configuration.cacheStore else { return }
         let canonicalScope = canonicalCacheScope(scope)
         let cacheStateKey = canonicalScope.rawValue
@@ -1066,6 +1076,8 @@ public actor ScriptMetaKitWorkspace {
                 }
                 persistentFileListRootIDs.formUnion(adoptedRootIDs)
             }
+        } catch let error as CancellationError {
+            throw error
         } catch {
             emitDiagnostic(
                 severity: .warning,
