@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 1.2.0
+# SCRIPTMETAKit 1.2.1
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -8,9 +8,15 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.2.0`
-- Rust FFI crate: `scriptmetakit_ffi` `1.2.0`
+- Rust crate: `scriptmetakit` `1.2.1`
+- Rust FFI crate: `scriptmetakit_ffi` `1.2.1`
 - Swift package product: `ScriptMetaKit`
+
+## 1.2.1
+
+- Propagates `CancellationError` from persistent cache loads without reporting `cache_load_failed` or deleting the cache file.
+- Keeps the existing warning and cache removal behavior for corrupt or invalid persistent caches.
+- Adds deterministic cancellation, cache-preservation, recovery, and corrupt-cache regression coverage.
 
 ## 1.2.0
 

@@ -340,7 +340,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.2.0")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.2.1")
     }
 
     func testRuntimeAcknowledgementSummaryIsConciseAndLinksToComponents() {
@@ -947,7 +947,68 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(second[roots[1].rootID]?.source, .persistentCache)
     }
 
-    func testWorkspaceReportsNonfatalCacheDiagnostics() async throws {
+    func testCancelledPersistentCacheLoadPropagatesWithoutDiagnosticOrDeletion() async throws {
+        let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.cancelled-cache-load")
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitCancelledCacheLoad-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: cacheDirectory)
+        }
+        let root = ScriptMetaKitRoot(rootID: "cancelled-cache-load", url: rootURL)
+        let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
+        let writer = ScriptMetaKitWorkspace(configuration: .init(cacheStore: cacheStore))
+        _ = try await writer.scanRoots(
+            [root],
+            replacingGroup: "test.cancelled-cache-load",
+            rootIDs: [root.rootID],
+            mode: .fileListOnly,
+            cacheScope: .fileList
+        )
+        await writer.shutdown()
+
+        let cacheURL = try XCTUnwrap(cacheStore.readableCacheFileURL(scope: .fileList))
+        let cacheContents = try Data(contentsOf: cacheURL)
+        let recorder = SynchronousDiagnosticRecorder()
+        let reader = ScriptMetaKitWorkspace(configuration: .init(
+            cacheStore: cacheStore,
+            diagnosticHandler: { recorder.append($0) }
+        ))
+        try await reader.registerRoots(
+            [root],
+            replacingGroup: "test.cancelled-cache-load",
+            cacheScope: nil
+        )
+        try await reader.cancelNextPersistentCacheLoadForTesting()
+
+        do {
+            _ = try await reader.cachedFileListStates(
+                rootIDs: [root.rootID],
+                cacheScope: .fileList
+            )
+            XCTFail("CancellationError must propagate to the caller")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        XCTAssertFalse(recorder.diagnostics.contains { $0.code == "cache_load_failed" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cacheURL.path))
+        XCTAssertEqual(try Data(contentsOf: cacheURL), cacheContents)
+
+        let recovered = try await reader.cachedFileListStates(
+            rootIDs: [root.rootID],
+            cacheScope: .fileList
+        )
+        XCTAssertEqual(recovered[root.rootID]?.source, .persistentCache)
+        XCTAssertEqual(
+            recovered[root.rootID]?.availableSnapshot?.root.rootID,
+            root.rootID
+        )
+    }
+
+    func testWorkspaceReportsNonfatalCacheDiagnosticsAndDeletesCorruptCache() async throws {
         let root = try makeTemporaryScriptRoot(scriptID: "com.example.swiftapi.diagnostic")
         let cacheDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitDiagnostic-\(UUID().uuidString)", isDirectory: true)
@@ -957,30 +1018,22 @@ final class ScriptMetaKitAPITests: XCTestCase {
         }
         try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let cacheStore = ScriptMetaKitPersistentCacheStore(directoryURL: cacheDirectory)
-        try Data("{invalid".utf8).write(to: cacheStore.writableCacheFileURL(scope: .catalog))
-        let recorder = DiagnosticRecorder()
+        let cacheURL = cacheStore.writableCacheFileURL(scope: .catalog)
+        try Data("{invalid".utf8).write(to: cacheURL)
+        let recorder = SynchronousDiagnosticRecorder()
         let workspace = ScriptMetaKitWorkspace(configuration: .init(
             cacheStore: cacheStore,
-            diagnosticHandler: { diagnostic in
-                Task { await recorder.append(diagnostic) }
-            }
+            diagnosticHandler: { recorder.append($0) }
         ))
 
-        _ = try await workspace.scanRoots(
-            [ScriptMetaKitRoot(rootID: "diagnostic", url: root)],
+        _ = try await workspace.cachedCatalogSnapshot(
+            roots: [ScriptMetaKitRoot(rootID: "diagnostic", url: root)],
             replacingGroup: "test.diagnostic",
             rootIDs: ["diagnostic"],
-            mode: .metadataOnly,
             cacheScope: .catalog
         )
-        for _ in 0..<20 {
-            if await recorder.diagnostics.isEmpty == false {
-                break
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        let diagnostics = await recorder.diagnostics
-        XCTAssertTrue(diagnostics.contains { $0.code == "cache_load_failed" })
+        XCTAssertTrue(recorder.diagnostics.contains { $0.code == "cache_load_failed" })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheURL.path))
     }
 
     func testInvalidCacheLimitReportsDiagnosticWithoutDeletingPreviousCache() async throws {
@@ -1970,5 +2023,18 @@ private actor DiagnosticRecorder {
 
     func append(_ diagnostic: ScriptMetaKitDiagnostic) {
         diagnostics.append(diagnostic)
+    }
+}
+
+private final class SynchronousDiagnosticRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [ScriptMetaKitDiagnostic] = []
+
+    var diagnostics: [ScriptMetaKitDiagnostic] {
+        lock.withLock { storage }
+    }
+
+    func append(_ diagnostic: ScriptMetaKitDiagnostic) {
+        lock.withLock { storage.append(diagnostic) }
     }
 }

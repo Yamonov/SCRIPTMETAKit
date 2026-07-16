@@ -186,6 +186,12 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         }
     }
 
+    func cancelNextCacheLoadForTesting() async throws {
+        try await runOperation { engineBox in
+            try engineBox.cancelNextCacheLoadForTesting()
+        }
+    }
+
     public func cancelCurrentOperation() {
         engineBox.cancelCurrentOperation()
     }
@@ -1908,6 +1914,7 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
     private var cancellationEngine: ScriptMetaKitFFIEngine?
     private var watchNotificationSink: ScriptMetaKitWatchNotificationSink?
     private var shouldFailNextWatcherStartForTesting = false
+    private var shouldCancelNextCacheLoadForTesting = false
 
     deinit {
         shutdown()
@@ -2019,6 +2026,7 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         engineToRelease?.stopWatching()
         watchNotificationSink = nil
         shouldFailNextWatcherStartForTesting = false
+        shouldCancelNextCacheLoadForTesting = false
         engine = nil
         lock.unlock()
 
@@ -2098,6 +2106,13 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         defer { lock.unlock() }
         _ = try ensureEngineLocked()
         shouldFailNextWatcherStartForTesting = true
+    }
+
+    func cancelNextCacheLoadForTesting() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        _ = try ensureEngineLocked()
+        shouldCancelNextCacheLoadForTesting = true
     }
 
     public func scanRegisteredRoots(
@@ -2208,6 +2223,10 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
     public func loadCache(from fileURL: URL, maximumBytes: UInt64) throws {
         lock.lock()
         defer { lock.unlock() }
+        if shouldCancelNextCacheLoadForTesting {
+            shouldCancelNextCacheLoadForTesting = false
+            throw CancellationError()
+        }
         try ensureEngineLocked().loadCache(from: fileURL, maximumBytes: maximumBytes)
     }
 
