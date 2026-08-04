@@ -1589,6 +1589,80 @@ final class ScriptMetaKitAPITests: XCTestCase {
         await workspace.stopWatching()
     }
 
+    #if os(macOS)
+    func testWatchUpdatesRoutesMacOSAliasTargetChangeToBothRegisteredRoots() async throws {
+        let aliasRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitAliasOwner-\(UUID().uuidString)", isDirectory: true)
+        let targetRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitAliasTarget-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: aliasRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: targetRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: aliasRoot)
+            try? FileManager.default.removeItem(at: targetRoot)
+        }
+        try "alert('initial');\n".write(
+            to: targetRoot.appendingPathComponent("Initial.jsx"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let aliasURL = aliasRoot.appendingPathComponent("LinkedScripts")
+        try createMacOSAlias(to: targetRoot, at: aliasURL)
+
+        let roots = [
+            ScriptMetaKitRoot(
+                rootID: "alias-owner",
+                url: aliasRoot,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                refreshPolicy: .onFileEvent
+            ),
+            ScriptMetaKitRoot(
+                rootID: "direct-target",
+                url: targetRoot,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                refreshPolicy: .onFileEvent
+            )
+        ]
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let updates = try await workspace.watchUpdates(
+            roots: roots,
+            replacingGroup: "test.alias-watch",
+            dirtyOnly: true
+        )
+        var iterator = updates.makeAsyncIterator()
+        let initialValue = try await iterator.next()
+        let initial = try XCTUnwrap(initialValue)
+        XCTAssertEqual(initial.kind, .reconciliation)
+        XCTAssertEqual(Set(initial.result.roots.map(\.rootID)), Set(["alias-owner", "direct-target"]))
+
+        let addedURL = targetRoot.appendingPathComponent("Added.jsx")
+        try "alert('added');\n".write(to: addedURL, atomically: true, encoding: .utf8)
+        let incrementalValue = try await iterator.next()
+        let incremental = try XCTUnwrap(incrementalValue)
+        await workspace.stopWatching()
+
+        XCTAssertEqual(incremental.kind, .incremental)
+        XCTAssertEqual(
+            Set(incremental.result.roots.map(\.rootID)),
+            Set(["alias-owner", "direct-target"])
+        )
+        let ownerSnapshot = try XCTUnwrap(
+            incremental.result.fileListSnapshots.first { $0.root.rootID == "alias-owner" }
+        )
+        let ownerResolvedPaths = ownerSnapshot.children?
+            .flatMap(\.flattened)
+            .map(\.resolvedPath) ?? []
+        XCTAssertTrue(
+            ownerResolvedPaths.contains {
+                URL(fileURLWithPath: $0).lastPathComponent == addedURL.lastPathComponent
+            },
+            "expected \(addedURL.lastPathComponent) in \(ownerResolvedPaths)"
+        )
+    }
+    #endif
+
     func testWatchUpdateBufferDropProducesDetectableSequenceGap() async throws {
         let rootURL = try makeTemporaryScriptRoot(scriptID: "com.example.watch-gap")
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -1943,6 +2017,17 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
         return root
     }
+
+    #if os(macOS)
+    private func createMacOSAlias(to targetURL: URL, at aliasURL: URL) throws {
+        let bookmarkData = try targetURL.bookmarkData(
+            options: .suitableForBookmarkFile,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        try URL.writeBookmarkData(bookmarkData, to: aliasURL)
+    }
+    #endif
 
     private func compileOSA(source: String, outputURL: URL) throws {
         let osacompileURL = URL(fileURLWithPath: "/usr/bin/osacompile")
