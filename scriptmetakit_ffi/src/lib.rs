@@ -1167,15 +1167,26 @@ pub unsafe extern "C" fn smk_engine_set_resolve_macos_alias(
     engine: *mut SmkEngine,
     enabled: u8,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        engine.engine.config_mut().scanner.resolve_macos_alias = enabled != 0;
+        notification = apply_engine_reconfiguration(&mut engine, |candidate| {
+            candidate.set_resolve_macos_alias(enabled != 0);
+            Ok(())
+        })
+        .map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
         Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1478,6 +1489,7 @@ pub unsafe extern "C" fn smk_engine_scan_folders(
     check_updates: u8,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
@@ -1499,6 +1511,10 @@ pub unsafe extern "C" fn smk_engine_scan_folders(
             ptr::null_mut(),
         ) {
             Ok(result) => {
+                notification = synchronize_running_watch_plan(&mut engine).map_err(|message| {
+                    engine.set_error(&message);
+                    (SmkStatus::EngineError, message)
+                })?;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
@@ -1512,6 +1528,9 @@ pub unsafe extern "C" fn smk_engine_scan_folders(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1535,6 +1554,7 @@ pub unsafe extern "C" fn smk_engine_scan_folders_with_progress(
     progress_context: *mut c_void,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
@@ -1556,6 +1576,10 @@ pub unsafe extern "C" fn smk_engine_scan_folders_with_progress(
             progress_context,
         ) {
             Ok(result) => {
+                notification = synchronize_running_watch_plan(&mut engine).map_err(|message| {
+                    engine.set_error(&message);
+                    (SmkStatus::EngineError, message)
+                })?;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
@@ -1569,6 +1593,9 @@ pub unsafe extern "C" fn smk_engine_scan_folders_with_progress(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1787,6 +1814,7 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots(
     check_updates: u8,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
@@ -1802,6 +1830,10 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots(
             ptr::null_mut(),
         ) {
             Ok(result) => {
+                notification = synchronize_running_watch_plan(&mut engine).map_err(|message| {
+                    engine.set_error(&message);
+                    (SmkStatus::EngineError, message)
+                })?;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
@@ -1815,6 +1847,9 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1836,6 +1871,7 @@ pub unsafe extern "C" fn smk_engine_scan_roots(
     check_updates: u8,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
@@ -1853,6 +1889,10 @@ pub unsafe extern "C" fn smk_engine_scan_roots(
             ptr::null_mut(),
         ) {
             Ok(result) => {
+                notification = synchronize_running_watch_plan(&mut engine).map_err(|message| {
+                    engine.set_error(&message);
+                    (SmkStatus::EngineError, message)
+                })?;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
@@ -1866,6 +1906,9 @@ pub unsafe extern "C" fn smk_engine_scan_roots(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1921,6 +1964,7 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots_with_progress(
     progress_context: *mut c_void,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
@@ -1936,6 +1980,10 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots_with_progress(
             progress_context,
         ) {
             Ok(result) => {
+                notification = synchronize_running_watch_plan(&mut engine).map_err(|message| {
+                    engine.set_error(&message);
+                    (SmkStatus::EngineError, message)
+                })?;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
@@ -1949,6 +1997,9 @@ pub unsafe extern "C" fn smk_engine_scan_registered_roots_with_progress(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -1968,6 +2019,7 @@ pub unsafe extern "C" fn smk_engine_scan_roots_with_progress(
     progress_context: *mut c_void,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_result = out_mut(out_result)?;
@@ -1985,6 +2037,10 @@ pub unsafe extern "C" fn smk_engine_scan_roots_with_progress(
             progress_context,
         ) {
             Ok(result) => {
+                notification = synchronize_running_watch_plan(&mut engine).map_err(|message| {
+                    engine.set_error(&message);
+                    (SmkStatus::EngineError, message)
+                })?;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
@@ -1998,6 +2054,9 @@ pub unsafe extern "C" fn smk_engine_scan_roots_with_progress(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -2319,6 +2378,7 @@ pub unsafe extern "C" fn smk_engine_load_cache_file_with_limit(
     cache_path: SmkUtf8Slice,
     max_bytes: u64,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
@@ -2336,11 +2396,18 @@ pub unsafe extern "C" fn smk_engine_load_cache_file_with_limit(
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })?;
+        notification = synchronize_running_watch_plan(&mut engine).map_err(|message| {
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
         Ok(())
     });
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -2535,7 +2602,10 @@ pub unsafe extern "C" fn smk_engine_watcher_requires_restart(
         {
             let current_plan = engine.engine.watch_plan();
             *out_requires_restart = bool_byte(
-                engine.watcher.is_some() && engine.watch_plan.as_ref() != Some(&current_plan),
+                engine.watcher.is_some()
+                    && engine.watch_plan.as_ref().is_none_or(|running_plan| {
+                        !native_watch_configuration_equal(running_plan, &current_plan)
+                    }),
             );
         }
         #[cfg(not(feature = "native-watch"))]
@@ -2563,6 +2633,7 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan(
     out_changed: *mut u8,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_changed = out_mut(out_changed)?;
@@ -2572,12 +2643,16 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan(
         engine.clear_error();
 
         match poll_watcher_scan(&mut engine, false) {
-            Ok(Some(result)) => {
+            Ok((Some(result), pending_notification)) => {
+                notification = pending_notification;
                 *out_changed = 1;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok((None, pending_notification)) => {
+                notification = pending_notification;
+                Ok(())
+            }
             Err(message) => {
                 engine.set_error(&message);
                 Err((SmkStatus::EngineError, message))
@@ -2587,6 +2662,9 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -2603,6 +2681,7 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan_dirty_only(
     out_changed: *mut u8,
     out_result: *mut *mut SmkScanResult,
 ) -> SmkStatus {
+    let mut notification = empty_pending_watch_notification();
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         let out_changed = out_mut(out_changed)?;
@@ -2612,12 +2691,16 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan_dirty_only(
         engine.clear_error();
 
         match poll_watcher_scan(&mut engine, true) {
-            Ok(Some(result)) => {
+            Ok((Some(result), pending_notification)) => {
+                notification = pending_notification;
                 *out_changed = 1;
                 *out_result = Box::into_raw(Box::new(result));
                 Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok((None, pending_notification)) => {
+                notification = pending_notification;
+                Ok(())
+            }
             Err(message) => {
                 engine.set_error(&message);
                 Err((SmkStatus::EngineError, message))
@@ -2627,6 +2710,9 @@ pub unsafe extern "C" fn smk_engine_poll_watcher_scan_dirty_only(
 
     if status == SmkStatus::Panic {
         set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok {
+        emit_pending_watch_notification(notification);
     }
     status
 }
@@ -3925,11 +4011,7 @@ fn scan_selected_roots(
     Ok(SmkScanResult::from_scan_result(scan_result, update_result))
 }
 
-#[cfg(feature = "native-watch")]
 type PendingWatchNotification = Option<(extern "C" fn(context: *mut c_void), usize)>;
-
-#[cfg(not(feature = "native-watch"))]
-type PendingWatchNotification = ();
 
 #[cfg(feature = "native-watch")]
 fn native_watcher_for_plan(
@@ -3954,6 +4036,21 @@ fn native_watcher_for_plan(
 }
 
 #[cfg(feature = "native-watch")]
+fn native_watch_configuration_equal(lhs: &WatchPlan, rhs: &WatchPlan) -> bool {
+    lhs.physical_roots
+        .iter()
+        .map(|root| &root.path)
+        .eq(rhs.physical_roots.iter().map(|root| &root.path))
+        && lhs.debounce_delay_millis == rhs.debounce_delay_millis
+        && lhs.max_delivery_delay_millis == rhs.max_delivery_delay_millis
+        && lhs.native_event_latency_millis == rhs.native_event_latency_millis
+        && lhs.max_pending_paths == rhs.max_pending_paths
+        && lhs.supported_extensions == rhs.supported_extensions
+        && lhs.skip_hidden_paths == rhs.skip_hidden_paths
+        && lhs.skip_package_paths == rhs.skip_package_paths
+}
+
+#[cfg(feature = "native-watch")]
 fn apply_engine_reconfiguration(
     state: &mut SmkEngineState,
     mutate: impl FnOnce(&mut ScriptMetaKitEngine) -> Result<(), String>,
@@ -3961,26 +4058,63 @@ fn apply_engine_reconfiguration(
     let mut candidate = state.engine.clone_for_reconfiguration();
     mutate(&mut candidate)?;
     let candidate_plan = candidate.watch_plan();
-    let replacement =
-        if state.watcher.is_some() && state.watch_plan.as_ref() != Some(&candidate_plan) {
-            Some(native_watcher_for_plan(
-                &candidate_plan,
-                state.watch_callback,
-                state.watch_context,
-            )?)
-        } else {
-            None
-        };
+    let replacement = if state.watcher.is_some()
+        && state.watch_plan.as_ref().is_none_or(|current_plan| {
+            !native_watch_configuration_equal(current_plan, &candidate_plan)
+        }) {
+        Some(native_watcher_for_plan(
+            &candidate_plan,
+            state.watch_callback,
+            state.watch_context,
+        )?)
+    } else {
+        None
+    };
 
     state.engine = candidate;
+    if state.watcher.is_some() {
+        state.watch_plan = Some(candidate_plan.clone());
+    }
     if let Some(replacement) = replacement {
         state.watcher = Some(replacement);
-        state.watch_plan = Some(candidate_plan);
         state.watch_reconcile_pending = true;
         return Ok(state
             .watch_callback
             .map(|callback| (callback, state.watch_context)));
     }
+    Ok(None)
+}
+
+#[cfg(feature = "native-watch")]
+fn synchronize_running_watch_plan(
+    state: &mut SmkEngineState,
+) -> Result<PendingWatchNotification, String> {
+    if state.watcher.is_none() {
+        return Ok(None);
+    }
+    let candidate_plan = state.engine.watch_plan();
+    let requires_replacement = state.watch_plan.as_ref().is_none_or(|current_plan| {
+        !native_watch_configuration_equal(current_plan, &candidate_plan)
+    });
+    if !requires_replacement {
+        state.watch_plan = Some(candidate_plan);
+        return Ok(None);
+    }
+
+    let replacement =
+        native_watcher_for_plan(&candidate_plan, state.watch_callback, state.watch_context)?;
+    state.watcher = Some(replacement);
+    state.watch_plan = Some(candidate_plan);
+    state.watch_reconcile_pending = true;
+    Ok(state
+        .watch_callback
+        .map(|callback| (callback, state.watch_context)))
+}
+
+#[cfg(not(feature = "native-watch"))]
+fn synchronize_running_watch_plan(
+    _state: &mut SmkEngineState,
+) -> Result<PendingWatchNotification, String> {
     Ok(None)
 }
 
@@ -3992,7 +4126,7 @@ fn apply_engine_reconfiguration(
     let mut candidate = state.engine.clone_for_reconfiguration();
     mutate(&mut candidate)?;
     state.engine = candidate;
-    Ok(())
+    Ok(None)
 }
 
 fn emit_pending_watch_notification(notification: PendingWatchNotification) {
@@ -4001,16 +4135,11 @@ fn emit_pending_watch_notification(notification: PendingWatchNotification) {
         callback(context as *mut c_void);
     }
     #[cfg(not(feature = "native-watch"))]
-    let () = notification;
+    let _ = notification;
 }
 
 fn empty_pending_watch_notification() -> PendingWatchNotification {
-    #[cfg(feature = "native-watch")]
-    {
-        None
-    }
-    #[cfg(not(feature = "native-watch"))]
-    {}
+    None
 }
 
 #[cfg(feature = "native-watch")]
@@ -4055,7 +4184,7 @@ fn stop_watching_engine(_engine: &mut SmkEngineState) {}
 fn poll_watcher_scan(
     engine: &mut SmkEngineState,
     dirty_only: bool,
-) -> Result<Option<SmkScanResult>, String> {
+) -> Result<(Option<SmkScanResult>, PendingWatchNotification), String> {
     let Some(watcher) = engine.watcher.as_ref() else {
         return Err("watcher is not running".to_string());
     };
@@ -4091,7 +4220,7 @@ fn poll_watcher_scan(
         }
     }
     let Some(mut batch) = batch else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let is_reconciliation = plan_reconciliation || batch.overflowed;
     batch.paths.sort();
@@ -4107,7 +4236,7 @@ fn poll_watcher_scan(
             _ => None,
         });
     let Some(change_batch) = change_batch else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let affected_root_ids = change_batch
         .affected_roots
@@ -4121,6 +4250,7 @@ fn poll_watcher_scan(
         })
         .map_err(|error| error.to_string())?;
     engine.watch_reconcile_pending = false;
+    let notification = synchronize_running_watch_plan(engine)?;
     if dirty_only {
         filter_dirty_scan_result(&mut scan_result, &affected_root_ids);
     }
@@ -4143,7 +4273,10 @@ fn poll_watcher_scan(
     scan_result.watch_reconciliation = is_reconciliation;
     scan_result.watch_covers_all_roots = watched_root_ids.is_subset(&result_root_ids);
     scan_result.watch_change_batch = Some(change_batch);
-    Ok(Some(SmkScanResult::from_scan_result(scan_result, None)))
+    Ok((
+        Some(SmkScanResult::from_scan_result(scan_result, None)),
+        notification,
+    ))
 }
 
 #[cfg(feature = "native-watch")]
@@ -4185,7 +4318,7 @@ fn filter_dirty_scan_result(scan_result: &mut ScanResult, affected_root_ids: &BT
 fn poll_watcher_scan(
     _engine: &mut SmkEngineState,
     _dirty_only: bool,
-) -> Result<Option<SmkScanResult>, String> {
+) -> Result<(Option<SmkScanResult>, PendingWatchNotification), String> {
     Err("native-watch feature is not enabled".to_string())
 }
 

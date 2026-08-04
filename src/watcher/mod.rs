@@ -14,4 +14,7 @@ pub use plan::{
 };
 pub use policy::{MonitorRootStrategy, OverflowPolicy, WatchPolicy};
 
-pub(crate) use plan::{ChangeRoutingOptions, normalize_path, route_change_batch};
+pub(crate) use plan::{
+    ChangeRoutingOptions, build_watch_plan_with_resolved_targets, normalize_path,
+    route_change_batch,
+};

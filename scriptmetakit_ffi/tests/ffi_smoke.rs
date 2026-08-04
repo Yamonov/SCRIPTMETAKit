@@ -1878,6 +1878,154 @@ fn notifies_when_native_watcher_receives_change() {
     }
 }
 
+#[cfg(all(feature = "native-watch", target_os = "macos"))]
+#[test]
+fn dynamically_watches_unregistered_macos_alias_target_through_ffi() {
+    extern "C" fn watch_callback(context: *mut c_void) {
+        if context.is_null() {
+            return;
+        }
+        let counter = unsafe { &*(context as *const AtomicUsize) };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let alias_root = tempfile::tempdir().expect("alias root tempdir");
+    let target_root = tempfile::tempdir().expect("target root tempdir");
+    std::fs::write(target_root.path().join("Initial.jsx"), "alert('initial');")
+        .expect("initial script");
+    let alias_path = alias_root.path().join("LinkedScripts");
+    create_macos_alias(target_root.path(), &alias_path, true);
+
+    let alias_root_path = alias_root.path().to_string_lossy().into_owned();
+    let root = SmkRootRegistration {
+        root_id: utf8_slice("alias-owner"),
+        path: utf8_slice(&alias_root_path),
+        display_name: utf8_slice("Alias owner"),
+        purpose: 0,
+        watch_policy: 2,
+        cache_policy: 3,
+        refresh_policy: 2,
+        priority: 1,
+    };
+    let mut engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_set_roots(engine, &root, 1) },
+        SmkStatus::Ok
+    );
+    let notification_count = AtomicUsize::new(0);
+    assert_eq!(
+        unsafe {
+            smk_engine_start_watching_with_callback(
+                engine,
+                Some(watch_callback),
+                &notification_count as *const AtomicUsize as *mut c_void,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+
+    for reconciliation_index in 0..2 {
+        let mut changed = 0_u8;
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            unsafe { smk_engine_poll_watcher_scan_dirty_only(engine, &mut changed, &mut result) },
+            SmkStatus::Ok
+        );
+        assert_eq!(
+            changed, 1,
+            "watch-plan reconciliation must be immediately pollable"
+        );
+        assert!(!result.is_null());
+        unsafe { smk_scan_result_free(result) };
+        if reconciliation_index == 0 {
+            assert!(
+                notification_count.load(Ordering::SeqCst) >= 2,
+                "installing the discovered target must notify callback-driven clients"
+            );
+        }
+    }
+
+    let mut requires_restart = 1_u8;
+    assert_eq!(
+        unsafe { smk_engine_watcher_requires_restart(engine, &mut requires_restart) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        requires_restart, 0,
+        "the discovered alias target must already be installed in the live watcher"
+    );
+
+    notification_count.store(0, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(250));
+    let added_path = target_root.path().join("Added.jsx");
+    std::fs::write(&added_path, "alert('added');").expect("added script");
+    let expected_path = added_path.canonicalize().expect("added path");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while notification_count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        notification_count.load(Ordering::SeqCst) > 0,
+        "the dynamically installed watcher did not notify the client"
+    );
+    let mut observed = false;
+    while Instant::now() < deadline {
+        let mut changed = 0_u8;
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            unsafe { smk_engine_poll_watcher_scan_dirty_only(engine, &mut changed, &mut result) },
+            SmkStatus::Ok
+        );
+        if changed == 0 {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        assert!(!result.is_null());
+        let mut entries = SmkFileEntrySlice::default();
+        assert_eq!(
+            unsafe { smk_scan_result_file_entries(result, &mut entries) },
+            SmkStatus::Ok
+        );
+        let entries = unsafe { slice::from_raw_parts(entries.ptr, entries.len) };
+        observed = entries
+            .iter()
+            .any(|entry| utf8(entry.resolved_path) == expected_path.to_string_lossy());
+        if observed {
+            let mut roots = SmkRootSnapshotSlice::default();
+            assert_eq!(
+                unsafe { smk_scan_result_roots(result, &mut roots) },
+                SmkStatus::Ok
+            );
+            let roots = unsafe { slice::from_raw_parts(roots.ptr, roots.len) };
+            assert_eq!(
+                roots
+                    .iter()
+                    .map(|root| utf8(root.root_id))
+                    .collect::<Vec<_>>(),
+                vec!["alias-owner"]
+            );
+        }
+        unsafe { smk_scan_result_free(result) };
+        if observed {
+            break;
+        }
+    }
+    assert!(
+        observed,
+        "a change inside an unregistered alias target was not delivered to its owner root"
+    );
+
+    unsafe {
+        smk_engine_stop_watching(engine);
+        smk_engine_free(engine);
+    }
+}
+
 #[test]
 fn stores_last_error_on_invalid_argument() {
     let mut engine: *mut SmkEngine = ptr::null_mut();
@@ -2180,6 +2328,28 @@ fn utf8_slice(value: &str) -> SmkUtf8Slice {
         ptr: value.as_ptr(),
         len: value.len(),
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "native-watch"))]
+fn create_macos_alias(target: &std::path::Path, alias_path: &std::path::Path, is_directory: bool) {
+    use objc2_foundation::{NSURL, NSURLBookmarkCreationOptions};
+
+    let target_url = if is_directory {
+        NSURL::from_directory_path(target)
+    } else {
+        NSURL::from_file_path(target)
+    }
+    .expect("target NSURL");
+    let alias_url = NSURL::from_file_path(alias_path).expect("alias NSURL");
+    let bookmark_data = target_url
+        .bookmarkDataWithOptions_includingResourceValuesForKeys_relativeToURL_error(
+            NSURLBookmarkCreationOptions::SuitableForBookmarkFile,
+            None,
+            None,
+        )
+        .expect("bookmark data");
+    NSURL::writeBookmarkData_toURL_options_error(&bookmark_data, &alias_url, 0)
+        .expect("write alias");
 }
 
 extern "C" fn collect_progress_phase(progress: *const SmkUpdateProgress, context: *mut c_void) {
