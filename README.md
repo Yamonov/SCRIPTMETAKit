@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 1.2.1
+# SCRIPTMETAKit 1.2.2
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -8,9 +8,17 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.2.1`
-- Rust FFI crate: `scriptmetakit_ffi` `1.2.1`
+- Rust crate: `scriptmetakit` `1.2.2`
+- Rust FFI crate: `scriptmetakit_ffi` `1.2.2`
 - Swift package product: `ScriptMetaKit`
+
+## 1.2.2
+
+- Watches the resolved physical targets of macOS alias folders, including targets that are not registered as separate roots.
+- Reuses an existing physical watcher when an alias target is already registered, while routing additions, modifications, and removals to both the direct root and every alias-owning root.
+- Reconfigures a live native watcher when aliases are added, removed, or retargeted, and restores alias-target topology from persistent file-list cache data before watching starts.
+- Preserves alias-target monitoring for empty folders and after file-list memory eviction, without exposing hidden empty folders in the file-list result.
+- Adds deterministic Rust and C FFI coverage for two-root routing, cache restoration, retargeting, watcher callbacks, and dynamically discovered targets.
 
 ## 1.2.1
 

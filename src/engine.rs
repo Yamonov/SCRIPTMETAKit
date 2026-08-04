@@ -34,8 +34,9 @@ use crate::{
         retry_after_hint_millis,
     },
     scanner::{
-        CandidateCache, CandidateRecord, FileSystemEntry, MetadataScanSources, deduplicated_items,
-        file_items_from_cache, registered_root_signatures,
+        CandidateCache, CandidateRecord, FileSystemEntry, MetadataScanSources, PathKind,
+        PathResolutionStatus, deduplicated_items, file_items_from_cache,
+        registered_root_signatures, resolve_registered_path,
         scan_file_list_root_transactional_controlled,
         scan_file_list_root_with_dirty_directories_controlled,
         scan_metadata_roots_scoped_with_file_lists_controlled,
@@ -43,8 +44,8 @@ use crate::{
     },
     storage::CachePayload,
     watcher::{
-        ChangeRoutingOptions, RawChangeBatch, WatchPlan, WatchPolicy, build_watch_plan,
-        normalize_path, route_change_batch,
+        ChangeRoutingOptions, RawChangeBatch, WatchPlan, WatchPolicy,
+        build_watch_plan_with_resolved_targets, normalize_path, route_change_batch,
     },
 };
 
@@ -58,6 +59,8 @@ pub struct ScriptMetaKitEngine {
     file_list_snapshots: BTreeMap<RootId, Arc<FileListSnapshot>>,
     known_directory_paths: BTreeSet<PathBuf>,
     known_file_paths: BTreeSet<PathBuf>,
+    resolved_watch_targets: BTreeMap<RootId, BTreeSet<PathBuf>>,
+    resolved_watch_sources: BTreeMap<RootId, BTreeSet<PathBuf>>,
     catalog_snapshot: Option<Arc<ScriptMetaCatalogSnapshot>>,
     update_check_result: Option<Arc<UpdateCheckResult>>,
     dirty_roots: BTreeMap<RootId, DirtyRootState>,
@@ -100,6 +103,8 @@ impl ScriptMetaKitEngine {
             file_list_snapshots: self.file_list_snapshots.clone(),
             known_directory_paths: self.known_directory_paths.clone(),
             known_file_paths: self.known_file_paths.clone(),
+            resolved_watch_targets: self.resolved_watch_targets.clone(),
+            resolved_watch_sources: self.resolved_watch_sources.clone(),
             catalog_snapshot: self.catalog_snapshot.clone(),
             update_check_result: self.update_check_result.clone(),
             dirty_roots: self.dirty_roots.clone(),
@@ -171,6 +176,8 @@ impl ScriptMetaKitEngine {
             file_list_snapshots: BTreeMap::new(),
             known_directory_paths: BTreeSet::new(),
             known_file_paths: BTreeSet::new(),
+            resolved_watch_targets: BTreeMap::new(),
+            resolved_watch_sources: BTreeMap::new(),
             catalog_snapshot: None,
             update_check_result: None,
             dirty_roots: BTreeMap::new(),
@@ -305,6 +312,16 @@ impl ScriptMetaKitEngine {
         &mut self.config
     }
 
+    pub fn set_resolve_macos_alias(&mut self, enabled: bool) {
+        if self.config.scanner.resolve_macos_alias == enabled {
+            return;
+        }
+        self.config.scanner.resolve_macos_alias = enabled;
+        self.resolved_watch_targets.clear();
+        self.resolved_watch_sources.clear();
+        self.rebuild_known_path_index();
+    }
+
     pub fn set_roots(
         &mut self,
         roots: Vec<RootRegistration>,
@@ -383,6 +400,8 @@ impl ScriptMetaKitEngine {
             self.persisted_file_list_revisions.remove(removed_id);
             self.pending_file_list_persistence.remove(removed_id);
             self.cache_unavailable_revisions.remove(removed_id);
+            self.resolved_watch_targets.remove(removed_id);
+            self.resolved_watch_sources.remove(removed_id);
             events.push(ScriptMetaKitEvent::RootRemoved {
                 root_id: removed_id.clone(),
             });
@@ -427,6 +446,8 @@ impl ScriptMetaKitEngine {
                 self.persisted_file_list_revisions.remove(&root.root_id);
                 self.pending_file_list_persistence.remove(&root.root_id);
                 self.cache_unavailable_revisions.remove(&root.root_id);
+                self.resolved_watch_targets.remove(&root.root_id);
+                self.resolved_watch_sources.remove(&root.root_id);
             }
             if metadata_content_changed {
                 self.evicted_catalog_roots.remove(&root.root_id);
@@ -582,11 +603,12 @@ impl ScriptMetaKitEngine {
         if !self.config.watcher.enabled {
             return self.watch_plan_with_delivery_options(WatchPlan::empty());
         }
-        let plan = build_watch_plan(
+        let plan = build_watch_plan_with_resolved_targets(
             &self.roots,
             self.config.watcher.watch_policy,
             self.config.watcher.monitor_root_strategy,
             self.visible_root_id.as_ref(),
+            &self.resolved_watch_targets,
         );
         self.watch_plan_with_delivery_options(plan)
     }
@@ -1025,6 +1047,7 @@ impl ScriptMetaKitEngine {
         } else {
             Vec::new()
         };
+        self.refresh_resolved_watch_paths(&file_list_snapshots);
         if request.mode.includes_file_list() {
             for snapshot in &file_list_snapshots {
                 if snapshot.root.status == RootStatus::Ready && snapshot.children.is_some() {
@@ -1096,6 +1119,9 @@ impl ScriptMetaKitEngine {
                 skip_package_paths: self.config.scanner.skip_packages,
                 known_directory_paths,
                 known_file_paths,
+                resolved_targets_by_root: &self.resolved_watch_targets,
+                resolved_sources_by_root: &self.resolved_watch_sources,
+                scanner_options: &self.config.scanner,
                 overflow_policy: self.config.watcher.overflow_policy,
                 max_deferred_dirty_directories: self.config.cache.max_deferred_dirty_directories,
             },
@@ -1966,6 +1992,14 @@ impl ScriptMetaKitEngine {
                 self.refresh_cache_unavailable_revision(&root_id);
             }
         }
+        let loaded_snapshots = self
+            .file_list_snapshots
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for snapshot in &loaded_snapshots {
+            self.replace_resolved_watch_paths(snapshot);
+        }
         self.rebuild_known_path_index();
         self.enforce_memory_node_limit();
         self.touch_memory_cache_if_needed();
@@ -2144,6 +2178,8 @@ impl ScriptMetaKitEngine {
                 self.catalog_persistence_is_current = false;
                 self.invalidate_persistent_file_list_on_next_export = true;
                 self.invalidate_persistent_catalog_on_next_export = true;
+                self.resolved_watch_targets.clear();
+                self.resolved_watch_sources.clear();
             }
             CacheScope::Catalog => {
                 self.catalog_snapshot = None;
@@ -2160,6 +2196,8 @@ impl ScriptMetaKitEngine {
                 self.evicted_file_list_roots.clear();
                 self.persisted_file_list_revisions.clear();
                 self.invalidate_persistent_file_list_on_next_export = true;
+                self.resolved_watch_targets.clear();
+                self.resolved_watch_sources.clear();
             }
         }
         self.rebuild_known_path_index();
@@ -2402,9 +2440,87 @@ impl ScriptMetaKitEngine {
             let children = snapshot.children.as_deref().unwrap_or_default();
             collect_directory_paths(children, &mut directories);
             collect_file_paths(children, &mut files);
+            directories.extend(snapshot.directory_states.keys().map(PathBuf::from));
+        }
+        for targets in self.resolved_watch_targets.values() {
+            directories.extend(targets.iter().cloned());
+        }
+        for sources in self.resolved_watch_sources.values() {
+            directories.extend(sources.iter().cloned());
         }
         self.known_directory_paths = directories;
         self.known_file_paths = files;
+    }
+
+    fn refresh_resolved_watch_paths(&mut self, snapshots: &[Arc<FileListSnapshot>]) {
+        for snapshot in snapshots {
+            match snapshot.root.status {
+                RootStatus::Ready => self.replace_resolved_watch_paths(snapshot),
+                RootStatus::Missing => {
+                    self.resolved_watch_targets.remove(&snapshot.root.root_id);
+                    self.resolved_watch_sources.remove(&snapshot.root.root_id);
+                }
+                RootStatus::NotLoaded
+                | RootStatus::Dirty
+                | RootStatus::Loading
+                | RootStatus::Unreadable
+                | RootStatus::TimedOut
+                | RootStatus::Overflowed
+                | RootStatus::Cancelled => {}
+            }
+        }
+    }
+
+    fn replace_resolved_watch_paths(&mut self, snapshot: &FileListSnapshot) {
+        let Some(root) = self.root_by_id(&snapshot.root.root_id) else {
+            return;
+        };
+        let root_resolution = resolve_registered_path(
+            &root.path,
+            &self.config.scanner,
+            Some(&self.config.supported_extensions),
+        );
+        let physical_root = normalize_path(&root_resolution.resolved_path);
+        let mut targets = snapshot
+            .directory_states
+            .keys()
+            .map(PathBuf::from)
+            .map(|path| normalize_path(&path))
+            .filter(|path| !path.starts_with(&physical_root))
+            .collect::<Vec<_>>();
+        targets.sort_by(|lhs, rhs| {
+            lhs.components()
+                .count()
+                .cmp(&rhs.components().count())
+                .then_with(|| lhs.cmp(rhs))
+        });
+        let mut minimal_targets = BTreeSet::new();
+        for target in targets {
+            if !minimal_targets
+                .iter()
+                .any(|parent: &PathBuf| target.starts_with(parent))
+            {
+                minimal_targets.insert(target);
+            }
+        }
+
+        let mut sources = BTreeSet::new();
+        collect_resolved_directory_link_sources(
+            snapshot.children.as_deref().unwrap_or_default(),
+            &mut sources,
+        );
+        if minimal_targets.is_empty() {
+            self.resolved_watch_targets.remove(&snapshot.root.root_id);
+        } else {
+            self.resolved_watch_targets
+                .insert(snapshot.root.root_id.clone(), minimal_targets);
+        }
+        if sources.is_empty() {
+            self.resolved_watch_sources.remove(&snapshot.root.root_id);
+        } else {
+            self.resolved_watch_sources
+                .insert(snapshot.root.root_id.clone(), sources);
+        }
     }
 
     fn known_directory_paths(&self) -> &BTreeSet<PathBuf> {
@@ -3859,6 +3975,21 @@ fn collect_directory_paths(entries: &[FileSystemEntry], output: &mut BTreeSet<Pa
             output.insert(entry.resolved_path.clone());
         }
         collect_directory_paths(&entry.children, output);
+    }
+}
+
+fn collect_resolved_directory_link_sources(
+    entries: &[FileSystemEntry],
+    output: &mut BTreeSet<PathBuf>,
+) {
+    for entry in entries {
+        if entry.is_directory
+            && entry.path_kind != PathKind::Normal
+            && entry.resolution_status == PathResolutionStatus::Resolved
+        {
+            output.insert(entry.display_path.clone());
+        }
+        collect_resolved_directory_link_sources(&entry.children, output);
     }
 }
 

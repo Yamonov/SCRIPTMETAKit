@@ -2843,6 +2843,353 @@ fn scans_macos_alias_directory_with_display_path_preserved() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_alias_target_change_affects_direct_and_alias_roots() {
+    let alias_root = tempfile::tempdir().expect("alias root tempdir");
+    let target_root = tempfile::tempdir().expect("target root tempdir");
+    let initial_script = target_root.path().join("Initial.jsx");
+    std::fs::write(&initial_script, "alert('initial');").expect("initial script");
+    let alias_path = alias_root.path().join("LinkedScripts");
+    create_macos_alias(target_root.path(), &alias_path, true);
+
+    let alias_root_id = scriptmetakit::RootId::from("alias-owner");
+    let target_root_id = scriptmetakit::RootId::from("direct-target");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "AliasWatchRouting");
+    config.watcher.watch_policy = scriptmetakit::WatchPolicy::AllRegistered;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![
+            scriptmetakit::RootRegistration {
+                root_id: alias_root_id.clone(),
+                path: alias_root.path().to_path_buf(),
+                display_name: Some("Alias owner".to_string()),
+                purpose: scriptmetakit::RootPurpose::FileList,
+                watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
+                cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+                refresh_policy: scriptmetakit::RefreshPolicy::OnFileEvent,
+                priority: scriptmetakit::RootPriority::UserInitiated,
+            },
+            scriptmetakit::RootRegistration {
+                root_id: target_root_id.clone(),
+                path: target_root.path().to_path_buf(),
+                display_name: Some("Direct target".to_string()),
+                purpose: scriptmetakit::RootPurpose::FileList,
+                watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
+                cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+                refresh_policy: scriptmetakit::RefreshPolicy::OnFileEvent,
+                priority: scriptmetakit::RootPriority::UserInitiated,
+            },
+        ])
+        .expect("roots");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("initial scan");
+
+    let target_physical_path = target_root.path().canonicalize().expect("target path");
+    let plan = engine.watch_plan();
+    let target_watch_root = plan
+        .physical_roots
+        .iter()
+        .find(|root| root.path == target_physical_path)
+        .expect("target physical watch root");
+    assert_eq!(
+        target_watch_root
+            .covers_root_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([alias_root_id.clone(), target_root_id.clone()])
+    );
+
+    let added_script = target_root.path().join("Added.jsx");
+    std::fs::write(&added_script, "alert('added');").expect("added script");
+    let events = engine
+        .mark_changed_paths(scriptmetakit::RawChangeBatch {
+            paths: vec![added_script.clone()],
+            overflowed: false,
+        })
+        .expect("mark target change");
+    let change_batch = events
+        .into_iter()
+        .find_map(|event| match event {
+            scriptmetakit::ScriptMetaKitEvent::ChangeDetected { batch } => Some(batch),
+            _ => None,
+        })
+        .expect("change event");
+    let affected_root_ids = change_batch
+        .affected_roots
+        .iter()
+        .map(|change| change.root_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        affected_root_ids,
+        std::collections::BTreeSet::from([alias_root_id.clone(), target_root_id])
+    );
+    assert!(
+        change_batch
+            .affected_roots
+            .iter()
+            .find(|change| change.root_id == alias_root_id)
+            .expect("alias owner change")
+            .requires_full_rescan
+    );
+
+    let refreshed = engine
+        .refresh_dirty_roots(scriptmetakit::RefreshRequest {
+            mode: scriptmetakit::ScanMode::FileListOnly,
+        })
+        .expect("refresh changed roots");
+    let alias_snapshot = refreshed
+        .file_list_snapshots
+        .iter()
+        .find(|snapshot| snapshot.root.root_id == alias_root_id)
+        .expect("refreshed alias owner");
+    assert!(contains_file(
+        alias_snapshot.children.as_deref().unwrap_or_default(),
+        &added_script.canonicalize().expect("added script path")
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_empty_alias_target_is_watched_without_direct_registration() {
+    let alias_root = tempfile::tempdir().expect("alias root tempdir");
+    let target_root = tempfile::tempdir().expect("target root tempdir");
+    let alias_path = alias_root.path().join("EmptyLinkedScripts");
+    create_macos_alias(target_root.path(), &alias_path, true);
+
+    let alias_root_id = scriptmetakit::RootId::from("alias-owner");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "EmptyAliasWatch");
+    config.scanner.include_empty_directories = false;
+    config.watcher.watch_policy = scriptmetakit::WatchPolicy::AllRegistered;
+    config.cache.max_memory_nodes = 0;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![scriptmetakit::RootRegistration {
+            root_id: alias_root_id.clone(),
+            path: alias_root.path().to_path_buf(),
+            display_name: Some("Alias owner".to_string()),
+            purpose: scriptmetakit::RootPurpose::FileList,
+            watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
+            cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+            refresh_policy: scriptmetakit::RefreshPolicy::OnFileEvent,
+            priority: scriptmetakit::RootPriority::UserInitiated,
+        }])
+        .expect("root");
+    let initial = engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("initial scan");
+    assert!(
+        initial.file_list_snapshots[0]
+            .children
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .all(|entry| entry.display_path != alias_path),
+        "empty alias directory should stay hidden from the file list"
+    );
+
+    let target_physical_path = target_root.path().canonicalize().expect("target path");
+    assert!(
+        engine.snapshot(&alias_root_id).is_none(),
+        "the test must exercise topology retained outside the evicted file-list cache"
+    );
+    let plan = engine.watch_plan();
+    let target_watch_root = plan
+        .physical_roots
+        .iter()
+        .find(|root| root.path == target_physical_path)
+        .expect("external alias target watch root");
+    assert_eq!(
+        target_watch_root.covers_root_ids,
+        vec![alias_root_id.clone()]
+    );
+
+    let added_script = target_root.path().join("Added.jsx");
+    std::fs::write(&added_script, "alert('added');").expect("added script");
+    let events = engine
+        .mark_changed_paths(scriptmetakit::RawChangeBatch {
+            paths: vec![added_script],
+            overflowed: false,
+        })
+        .expect("mark target change");
+    let affected_root_ids = events
+        .into_iter()
+        .find_map(|event| match event {
+            scriptmetakit::ScriptMetaKitEvent::ChangeDetected { batch } => Some(
+                batch
+                    .affected_roots
+                    .into_iter()
+                    .map(|change| change.root_id)
+                    .collect::<std::collections::BTreeSet<_>>(),
+            ),
+            _ => None,
+        })
+        .expect("change event");
+    assert_eq!(
+        affected_root_ids,
+        std::collections::BTreeSet::from([alias_root_id.clone()])
+    );
+
+    std::fs::remove_file(&alias_path).expect("remove empty alias");
+    let removal_events = engine
+        .mark_changed_paths(scriptmetakit::RawChangeBatch {
+            paths: vec![alias_path],
+            overflowed: false,
+        })
+        .expect("mark alias removal");
+    let removal_batch = removal_events
+        .into_iter()
+        .find_map(|event| match event {
+            scriptmetakit::ScriptMetaKitEvent::ChangeDetected { batch } => Some(batch),
+            _ => None,
+        })
+        .expect("alias removal event");
+    assert!(
+        removal_batch
+            .affected_roots
+            .iter()
+            .any(|change| change.root_id == alias_root_id && change.requires_full_rescan)
+    );
+    engine
+        .refresh_dirty_roots(scriptmetakit::RefreshRequest {
+            mode: scriptmetakit::ScanMode::FileListOnly,
+        })
+        .expect("refresh alias removal");
+    assert!(
+        engine
+            .watch_plan()
+            .physical_roots
+            .iter()
+            .all(|root| root.path != target_physical_path),
+        "removed alias target must leave the physical watch plan"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_alias_retarget_replaces_physical_watch_target() {
+    let alias_root = tempfile::tempdir().expect("alias root tempdir");
+    let first_target = tempfile::tempdir().expect("first target tempdir");
+    let second_target = tempfile::tempdir().expect("second target tempdir");
+    let alias_path = alias_root.path().join("LinkedScripts");
+    create_macos_alias(first_target.path(), &alias_path, true);
+
+    let alias_root_id = scriptmetakit::RootId::from("alias-owner");
+    let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "AliasRetargetWatch");
+    config.scanner.include_empty_directories = false;
+    config.watcher.watch_policy = scriptmetakit::WatchPolicy::AllRegistered;
+    let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
+    engine
+        .set_roots(vec![scriptmetakit::RootRegistration {
+            root_id: alias_root_id.clone(),
+            path: alias_root.path().to_path_buf(),
+            display_name: Some("Alias owner".to_string()),
+            purpose: scriptmetakit::RootPurpose::FileList,
+            watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
+            cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+            refresh_policy: scriptmetakit::RefreshPolicy::OnFileEvent,
+            priority: scriptmetakit::RootPriority::UserInitiated,
+        }])
+        .expect("root");
+    engine
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("initial scan");
+
+    create_macos_alias(second_target.path(), &alias_path, true);
+    let events = engine
+        .mark_changed_paths(scriptmetakit::RawChangeBatch {
+            paths: vec![alias_path],
+            overflowed: false,
+        })
+        .expect("mark alias retarget");
+    let change = events
+        .into_iter()
+        .find_map(|event| match event {
+            scriptmetakit::ScriptMetaKitEvent::ChangeDetected { batch } => batch
+                .affected_roots
+                .into_iter()
+                .find(|change| change.root_id == alias_root_id),
+            _ => None,
+        })
+        .expect("alias owner change");
+    assert!(change.requires_full_rescan);
+    engine
+        .refresh_dirty_roots(scriptmetakit::RefreshRequest {
+            mode: scriptmetakit::ScanMode::FileListOnly,
+        })
+        .expect("refresh retargeted alias");
+
+    let first_physical = first_target.path().canonicalize().expect("first target");
+    let second_physical = second_target.path().canonicalize().expect("second target");
+    let plan_paths = engine
+        .watch_plan()
+        .physical_roots
+        .into_iter()
+        .map(|root| root.path)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!plan_paths.contains(&first_physical));
+    assert!(plan_paths.contains(&second_physical));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_alias_watch_target_is_restored_from_file_list_cache() {
+    let alias_root = tempfile::tempdir().expect("alias root tempdir");
+    let target_root = tempfile::tempdir().expect("target root tempdir");
+    let alias_path = alias_root.path().join("CachedLinkedScripts");
+    create_macos_alias(target_root.path(), &alias_path, true);
+
+    let make_config = || {
+        let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "AliasWatchCache");
+        config.scanner.include_empty_directories = false;
+        config.watcher.watch_policy = scriptmetakit::WatchPolicy::AllRegistered;
+        config
+    };
+    let root = scriptmetakit::RootRegistration {
+        root_id: "alias-owner".into(),
+        path: alias_root.path().to_path_buf(),
+        display_name: Some("Alias owner".to_string()),
+        purpose: scriptmetakit::RootPurpose::FileList,
+        watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
+        cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
+        refresh_policy: scriptmetakit::RefreshPolicy::OnFileEvent,
+        priority: scriptmetakit::RootPriority::UserInitiated,
+    };
+    let mut writer = scriptmetakit::ScriptMetaKitEngine::new(make_config()).expect("writer");
+    writer.set_roots(vec![root.clone()]).expect("writer root");
+    writer
+        .scan_roots(scriptmetakit::ScanRequest::all(
+            scriptmetakit::ScanMode::FileListOnly,
+        ))
+        .expect("writer scan");
+    let cache = writer
+        .export_cache(scriptmetakit::CacheScope::FileList)
+        .expect("file-list cache");
+
+    let mut reader = scriptmetakit::ScriptMetaKitEngine::new(make_config()).expect("reader");
+    reader.set_roots(vec![root]).expect("reader root");
+    reader.load_cache(cache).expect("load file-list cache");
+
+    let target_physical = target_root.path().canonicalize().expect("target path");
+    assert!(
+        reader
+            .watch_plan()
+            .physical_roots
+            .iter()
+            .any(|root| root.path == target_physical),
+        "cached alias topology must be available before native watching starts"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn scans_macos_alias_script_without_alias_extension() {
     let temp = tempfile::tempdir().expect("tempdir");
     let target_script = temp.path().join("Actual.jsx");

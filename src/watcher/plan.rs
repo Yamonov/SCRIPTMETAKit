@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     RootId,
     catalog::RootRegistration,
-    scanner::ExtensionPolicy,
+    scanner::{
+        ExtensionPolicy, PathKind, PathResolutionStatus, ScannerOptions, resolve_registered_path,
+    },
     watcher::{MonitorRootStrategy, OverflowPolicy, WatchPolicy},
 };
 
@@ -164,17 +166,40 @@ pub fn build_watch_plan(
     strategy: MonitorRootStrategy,
     visible_root_id: Option<&RootId>,
 ) -> WatchPlan {
+    build_watch_plan_with_resolved_targets(
+        roots,
+        global_policy,
+        strategy,
+        visible_root_id,
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn build_watch_plan_with_resolved_targets(
+    roots: &[RootRegistration],
+    global_policy: WatchPolicy,
+    strategy: MonitorRootStrategy,
+    visible_root_id: Option<&RootId>,
+    resolved_targets_by_root: &BTreeMap<RootId, BTreeSet<PathBuf>>,
+) -> WatchPlan {
     if matches!(global_policy, WatchPolicy::Disabled | WatchPolicy::Manual) {
         return WatchPlan::empty();
     }
 
     let mut candidates = Vec::with_capacity(roots.len());
-    candidates.extend(
-        roots
-            .iter()
-            .filter(|root| should_watch_root(root, global_policy, visible_root_id))
-            .map(|root| (root.root_id.clone(), normalize_path(&root.path))),
-    );
+    for root in roots
+        .iter()
+        .filter(|root| should_watch_root(root, global_policy, visible_root_id))
+    {
+        candidates.push((root.root_id.clone(), normalize_path(&root.path), true));
+        if let Some(targets) = resolved_targets_by_root.get(&root.root_id) {
+            candidates.extend(
+                targets
+                    .iter()
+                    .map(|target| (root.root_id.clone(), normalize_path(target), false)),
+            );
+        }
+    }
 
     candidates.sort_by(|lhs, rhs| {
         lhs.1
@@ -183,10 +208,11 @@ pub fn build_watch_plan(
             .cmp(&rhs.1.components().count())
             .then_with(|| lhs.1.cmp(&rhs.1))
             .then_with(|| lhs.0.cmp(&rhs.0))
+            .then_with(|| rhs.2.cmp(&lhs.2))
     });
 
     let mut plan = WatchPlan::empty();
-    for (root_id, path) in candidates {
+    for (root_id, path, is_logical_root) in candidates {
         let physical_index = match strategy {
             MonitorRootStrategy::ExactRoots => physical_index_for_exact_path(&mut plan, &path),
             MonitorRootStrategy::DeduplicateNestedRoots
@@ -201,12 +227,14 @@ pub fn build_watch_plan(
             physical_root.covers_root_ids.push(root_id.clone());
         }
 
-        plan.logical_roots.push(LogicalWatchRoot {
-            root_id,
-            path,
-            physical_index: Some(physical_index),
-            active: true,
-        });
+        if is_logical_root {
+            plan.logical_roots.push(LogicalWatchRoot {
+                root_id,
+                path,
+                physical_index: Some(physical_index),
+                active: true,
+            });
+        }
     }
 
     plan
@@ -218,6 +246,9 @@ pub(crate) struct ChangeRoutingOptions<'a> {
     pub skip_package_paths: bool,
     pub known_directory_paths: &'a BTreeSet<PathBuf>,
     pub known_file_paths: &'a BTreeSet<PathBuf>,
+    pub resolved_targets_by_root: &'a BTreeMap<RootId, BTreeSet<PathBuf>>,
+    pub resolved_sources_by_root: &'a BTreeMap<RootId, BTreeSet<PathBuf>>,
+    pub scanner_options: &'a ScannerOptions,
     pub overflow_policy: OverflowPolicy,
     pub max_deferred_dirty_directories: usize,
 }
@@ -243,13 +274,41 @@ pub(crate) fn route_change_batch(
         let root_path = normalize_path(&root.path);
         let mut filtered_paths = Vec::new();
         let mut root_events = Vec::new();
-        for path in normalized_paths
-            .iter()
-            .filter(|path| path_affects_root(path, &root_path))
-        {
+        let resolved_targets = options.resolved_targets_by_root.get(&root.root_id);
+        let resolved_sources = options.resolved_sources_by_root.get(&root.root_id);
+        let mut resolved_target_affected = false;
+        let mut resolved_source_affected = false;
+        for path in &normalized_paths {
+            let affects_registered_root = path_affects_root(path, &root_path);
+            let matching_target = resolved_targets.and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|target| path_affects_root(path, target))
+            });
+            let matches_known_source = resolved_sources.is_some_and(|sources| {
+                sources.iter().any(|source| path_affects_root(path, source))
+            });
+            let matches_new_source = affects_registered_root
+                && !options.extensions.contains_path(path)
+                && path_is_resolved_directory_link(
+                    path,
+                    options.scanner_options,
+                    options.extensions,
+                );
+            let may_be_removed_source = affects_registered_root
+                && resolved_targets.is_some_and(|targets| !targets.is_empty())
+                && !path.try_exists().unwrap_or(false)
+                && !options.extensions.contains_path(path);
+            let matches_source =
+                matches_known_source || matches_new_source || may_be_removed_source;
+            if !affects_registered_root && matching_target.is_none() && !matches_source {
+                continue;
+            }
             matched_paths.insert(path.clone());
             if raw_overflowed {
                 filtered_paths.push(path.clone());
+                resolved_target_affected |= matching_target.is_some();
+                resolved_source_affected |= matches_source;
                 root_events.push(WatchPathEvent {
                     root_id: root.root_id.clone(),
                     path: path.clone(),
@@ -260,20 +319,61 @@ pub(crate) fn route_change_batch(
                 continue;
             }
 
-            match observe_change_path(
+            if matches_source {
+                match observe_change_path_visibility(
+                    path,
+                    &root_path,
+                    options.skip_hidden_paths,
+                    options.skip_package_paths,
+                ) {
+                    Ok(()) => {
+                        filtered_paths.push(path.clone());
+                        resolved_source_affected = true;
+                        root_events.push(watch_path_event(
+                            &root.root_id,
+                            path,
+                            &root_path,
+                            options.known_file_paths,
+                            options.known_directory_paths,
+                        ));
+                    }
+                    Err(reason) => ignored_paths.push(IgnoredWatchPath {
+                        root_id: Some(root.root_id.clone()),
+                        path: path.clone(),
+                        reason,
+                    }),
+                }
+                continue;
+            }
+
+            let observation_root = matching_target.map_or(root_path.as_path(), PathBuf::as_path);
+
+            let observation = observe_change_path(
                 path,
-                &root_path,
+                observation_root,
                 options.extensions,
                 options.skip_hidden_paths,
                 options.skip_package_paths,
                 options.known_directory_paths,
-            ) {
+            );
+            let observation = if matching_target.is_some()
+                && !path.try_exists().unwrap_or(false)
+                && matches!(
+                    observation,
+                    Err(WatchIgnoreReason::UnsupportedExtension | WatchIgnoreReason::NotRelevant)
+                ) {
+                Ok(())
+            } else {
+                observation
+            };
+            match observation {
                 Ok(()) => {
                     filtered_paths.push(path.clone());
+                    resolved_target_affected |= matching_target.is_some();
                     root_events.push(watch_path_event(
                         &root.root_id,
                         path,
-                        &root_path,
+                        observation_root,
                         options.known_file_paths,
                         options.known_directory_paths,
                     ));
@@ -289,6 +389,8 @@ pub(crate) fn route_change_batch(
 
         let affects_root = raw_overflowed
             && options.overflow_policy == OverflowPolicy::MarkAllRootsDirty
+            || resolved_target_affected
+            || resolved_source_affected
             || filtered_paths
                 .iter()
                 .any(|changed_path| path_affects_root(changed_path, &root_path));
@@ -306,6 +408,8 @@ pub(crate) fn route_change_batch(
         dirty_directories.dedup();
 
         let requires_full_rescan = raw_overflowed
+            || resolved_target_affected
+            || resolved_source_affected
             || dirty_directories.len() > options.max_deferred_dirty_directories
             || dirty_directories.iter().any(|path| path == &root_path);
 
@@ -358,13 +462,7 @@ fn observe_change_path(
     skip_package_paths: bool,
     known_directory_paths: &BTreeSet<PathBuf>,
 ) -> Result<(), WatchIgnoreReason> {
-    if skip_hidden_paths && path_has_hidden_component(path, root_path) {
-        return Err(WatchIgnoreReason::HiddenPath);
-    }
-
-    if skip_package_paths && path_has_package_component(path, root_path) {
-        return Err(WatchIgnoreReason::PackagePath);
-    }
+    observe_change_path_visibility(path, root_path, skip_hidden_paths, skip_package_paths)?;
 
     if extensions.contains_path(path)
         || path_is_existing_directory(path)
@@ -378,6 +476,37 @@ fn observe_change_path(
     } else {
         Err(WatchIgnoreReason::NotRelevant)
     }
+}
+
+fn observe_change_path_visibility(
+    path: &Path,
+    root_path: &Path,
+    skip_hidden_paths: bool,
+    skip_package_paths: bool,
+) -> Result<(), WatchIgnoreReason> {
+    if skip_hidden_paths && path_has_hidden_component(path, root_path) {
+        return Err(WatchIgnoreReason::HiddenPath);
+    }
+
+    if skip_package_paths && path_has_package_component(path, root_path) {
+        return Err(WatchIgnoreReason::PackagePath);
+    }
+
+    Ok(())
+}
+
+fn path_is_resolved_directory_link(
+    path: &Path,
+    scanner_options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+) -> bool {
+    let resolved = resolve_registered_path(path, scanner_options, Some(extensions));
+    resolved.path_kind != PathKind::Normal
+        && resolved.resolution_status == PathResolutionStatus::Resolved
+        && resolved
+            .resolved_path
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
 }
 
 fn watch_path_event(

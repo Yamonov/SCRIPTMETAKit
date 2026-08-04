@@ -294,6 +294,14 @@ fn should_keep_event_path(
         return true;
     }
 
+    // Finder aliases for directories normally have no extension. Their
+    // bookmark data can be modified without FSEvents marking the change as a
+    // directory-tree mutation, so keep these paths for the routing layer to
+    // resolve and classify.
+    if path.extension().is_none() {
+        return true;
+    }
+
     if !may_change_directory_tree {
         return false;
     }
@@ -302,7 +310,7 @@ fn should_keep_event_path(
         return true;
     }
 
-    identifies_folder || path_is_existing_directory(path) || path.extension().is_none()
+    identifies_folder || path_is_existing_directory(path)
 }
 
 fn path_has_hidden_component(path: &Path, watch_roots: &[PathBuf]) -> bool {
