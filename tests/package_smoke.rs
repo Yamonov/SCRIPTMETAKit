@@ -799,6 +799,7 @@ fn idle_expiry_can_restore_and_resume_file_list_export() {
         .export_cache_merged(scriptmetakit::CacheScope::FileList, Some(durable.clone()))
         .expect("safe merge after expiry");
     assert_eq!(merged.data.as_object().expect("snapshots").len(), 1);
+    engine.config_mut().cache.idle_lifetime_millis = u64::MAX;
     engine.load_cache(durable).expect("restore");
     let restored = engine.cached_scan_result(scriptmetakit::ScanRequest::all(
         scriptmetakit::ScanMode::FileListOnly,
