@@ -340,7 +340,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.2.2")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.3.0")
     }
 
     func testRuntimeAcknowledgementSummaryIsConciseAndLinksToComponents() {
@@ -1576,6 +1576,8 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertEqual(initial.sequence, 1)
         XCTAssertEqual(initial.kind, .reconciliation)
         XCTAssertTrue(initial.coversAllWatchedRoots)
+        XCTAssertEqual(initial.reconciledRootIDs, ["watch-updates"])
+        XCTAssertTrue(initial.pendingRootIDs.isEmpty)
 
         try "alert('incremental');\n".write(
             to: rootURL.appendingPathComponent("incremental.jsx"),
@@ -1586,10 +1588,158 @@ final class ScriptMetaKitAPITests: XCTestCase {
         let incremental = try XCTUnwrap(incrementalValue)
         XCTAssertEqual(incremental.sequence, 2)
         XCTAssertEqual(incremental.kind, .incremental)
+        XCTAssertEqual(incremental.reconciledRootIDs, ["watch-updates"])
+        XCTAssertTrue(incremental.pendingRootIDs.isEmpty)
+        await workspace.stopWatching()
+    }
+
+    func testProgressiveWatchUpdatesDeliverUserInitiatedRootBeforeCompleteState() async throws {
+        let userRootURL = try makeTemporaryScriptRoot(scriptID: "com.example.progressive-user")
+        let backgroundRootURL = try makeTemporaryScriptRoot(
+            scriptID: "com.example.progressive-background"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: userRootURL)
+            try? FileManager.default.removeItem(at: backgroundRootURL)
+        }
+        let roots = [
+            ScriptMetaKitRoot(
+                rootID: "background",
+                url: backgroundRootURL,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                priority: .background
+            ),
+            ScriptMetaKitRoot(
+                rootID: "user",
+                url: userRootURL,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                priority: .userInitiated
+            )
+        ]
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let updates = try await workspace.watchUpdates(
+            roots: roots,
+            replacingGroup: "test.progressive-watch-updates",
+            dirtyOnly: true,
+            reconciliationDelivery: .progressiveByRootPriority
+        )
+        var iterator = updates.makeAsyncIterator()
+
+        let firstValue = try await iterator.next()
+        let first = try XCTUnwrap(firstValue)
+        XCTAssertEqual(first.kind, .reconciliation)
+        XCTAssertFalse(first.coversAllWatchedRoots)
+        XCTAssertEqual(first.result.roots.map(\.rootID), ["user"])
+        XCTAssertEqual(first.reconciledRootIDs, ["user"])
+        XCTAssertEqual(first.pendingRootIDs, ["background"])
+
+        var observedUpdates: [String] = []
+        var completeValue = try await iterator.next()
+        for _ in 0..<8 where completeValue.map({
+            $0.kind == .reconciliation && $0.coversAllWatchedRoots
+        }) != true {
+            if let completeValue {
+                observedUpdates.append(
+                    "sequence=\(completeValue.sequence) kind=\(completeValue.kind) "
+                        + "covers=\(completeValue.coversAllWatchedRoots) roots=\(completeValue.result.roots.map(\.rootID)) "
+                        + "reconciled=\(completeValue.reconciledRootIDs) pending=\(completeValue.pendingRootIDs)"
+                )
+            }
+            completeValue = try await iterator.next()
+        }
+        let complete = try XCTUnwrap(completeValue)
+        let observedDescription = observedUpdates.joined(separator: " | ")
+        if complete.kind != .reconciliation || complete.coversAllWatchedRoots == false {
+            XCTFail("complete reconciliation was not observed: \(observedDescription)")
+        }
+        XCTAssertEqual(complete.kind, .reconciliation, observedDescription)
+        XCTAssertTrue(complete.coversAllWatchedRoots, observedDescription)
+        XCTAssertEqual(Set(complete.result.roots.map(\.rootID)), Set(["background", "user"]))
+        XCTAssertEqual(
+            complete.reconciledRootIDs,
+            ["background", "user"],
+            observedDescription
+        )
+        XCTAssertTrue(complete.pendingRootIDs.isEmpty, observedDescription)
         await workspace.stopWatching()
     }
 
     #if os(macOS)
+    func testProgressiveWatchUpdatesFinishAfterAliasWatchPlanReplacement() async throws {
+        let aliasRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitProgressiveAlias-\(UUID().uuidString)", isDirectory: true)
+        let targetRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitProgressiveTarget-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: aliasRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: targetRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: aliasRoot)
+            try? FileManager.default.removeItem(at: targetRoot)
+        }
+        let initialScript = targetRoot.appendingPathComponent("Initial.jsx")
+        try "alert('initial');\n".write(to: initialScript, atomically: true, encoding: .utf8)
+        try createMacOSAlias(
+            to: targetRoot,
+            at: aliasRoot.appendingPathComponent("LinkedScripts")
+        )
+        let roots = [
+            ScriptMetaKitRoot(
+                rootID: "alias-owner",
+                url: aliasRoot,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                priority: .userInitiated
+            ),
+            ScriptMetaKitRoot(
+                rootID: "direct-target",
+                url: targetRoot,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                priority: .background
+            )
+        ]
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let updates = try await workspace.watchUpdates(
+            roots: roots,
+            replacingGroup: "test.progressive-alias-watch",
+            dirtyOnly: true,
+            reconciliationDelivery: .progressiveByRootPriority
+        )
+        var iterator = updates.makeAsyncIterator()
+        let firstValue = try await iterator.next()
+        let first = try XCTUnwrap(firstValue)
+        XCTAssertEqual(first.kind, .reconciliation)
+        XCTAssertTrue(first.reconciledRootIDs.contains("alias-owner"))
+
+        var completeValue: ScriptMetaKitWatchUpdate?
+        for _ in 0..<16 {
+            let candidate = try await iterator.next()
+            if candidate?.kind == .reconciliation,
+               candidate?.coversAllWatchedRoots == true {
+                completeValue = candidate
+                break
+            }
+        }
+        let complete = try XCTUnwrap(completeValue)
+        XCTAssertEqual(complete.reconciledRootIDs, ["alias-owner", "direct-target"])
+        XCTAssertTrue(complete.pendingRootIDs.isEmpty)
+        let aliasSnapshot = try XCTUnwrap(
+            complete.result.fileListSnapshots.first { $0.root.rootID == "alias-owner" }
+        )
+        XCTAssertTrue(
+            aliasSnapshot.children?
+                .flatMap(\.flattened)
+                .contains(where: {
+                    URL(fileURLWithPath: $0.resolvedPath).standardizedFileURL
+                        == initialScript.standardizedFileURL
+                })
+                == true
+        )
+        await workspace.stopWatching()
+    }
+
     func testWatchUpdatesRoutesMacOSAliasTargetChangeToBothRegisteredRoots() async throws {
         let aliasRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitAliasOwner-\(UUID().uuidString)", isDirectory: true)

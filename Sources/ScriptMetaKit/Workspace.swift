@@ -103,12 +103,46 @@ public nonisolated enum ScriptMetaKitWatchUpdateKind: String, Codable, Sendable 
     case incremental, reconciliation
 }
 
+public nonisolated enum ScriptMetaKitReconciliationDeliveryPolicy: UInt32, Codable, Sendable {
+    /// Preserves the established behavior: one reconciliation update is delivered
+    /// after every watched root has been reconciled.
+    case complete = 0
+
+    /// Delivers reconciliation in root-priority batches, followed by one complete
+    /// update whose `coversAllWatchedRoots` value is `true`.
+    case progressiveByRootPriority = 1
+}
+
 public nonisolated struct ScriptMetaKitWatchUpdate: Sendable {
     public let streamID: String
     public let sequence: UInt64
     public let kind: ScriptMetaKitWatchUpdateKind
     public let coversAllWatchedRoots: Bool
+    /// Watched roots reconciled in the current reconciliation cycle up to and
+    /// including this update. Consumers must still inspect each root's freshness
+    /// and completeness before allowing mutations or script execution.
+    public let reconciledRootIDs: [String]
+    /// Watched roots not yet reconciled in the current reconciliation cycle.
+    public let pendingRootIDs: [String]
     public let result: ScriptMetaScanResult
+
+    init(
+        streamID: String,
+        sequence: UInt64,
+        kind: ScriptMetaKitWatchUpdateKind,
+        coversAllWatchedRoots: Bool,
+        reconciledRootIDs: [String] = [],
+        pendingRootIDs: [String] = [],
+        result: ScriptMetaScanResult
+    ) {
+        self.streamID = streamID
+        self.sequence = sequence
+        self.kind = kind
+        self.coversAllWatchedRoots = coversAllWatchedRoots
+        self.reconciledRootIDs = reconciledRootIDs
+        self.pendingRootIDs = pendingRootIDs
+        self.result = result
+    }
 }
 
 public nonisolated struct ScriptMetaKitWatchUpdateSequence: AsyncSequence, Sendable {
@@ -633,6 +667,7 @@ public actor ScriptMetaKitWorkspace {
                 cacheScope: cacheScope,
                 drainsInitialChanges: drainsInitialChanges,
                 initialDrainDirtyOnly: initialDrainDirtyOnly,
+                reconciliationDelivery: .complete,
                 onChange: onChange
             )
         } catch {
@@ -647,6 +682,7 @@ public actor ScriptMetaKitWorkspace {
         cacheScope: ScriptMetaCacheScope?,
         drainsInitialChanges: Bool,
         initialDrainDirtyOnly: Bool,
+        reconciliationDelivery: ScriptMetaKitReconciliationDeliveryPolicy,
         onChange: @escaping @Sendable () -> Void
     ) async throws {
         try Task.checkCancellation()
@@ -655,7 +691,10 @@ public actor ScriptMetaKitWorkspace {
         if let cacheScope {
             try await loadPersistentCacheIfNeeded(scope: cacheScope, rootIDs: roots.map(\.rootID))
         }
-        try await engine.startWatching(onChange: onChange)
+        try await engine.startWatching(
+            onChange: onChange,
+            reconciliationDelivery: reconciliationDelivery
+        )
         if drainsInitialChanges {
             try await drainWatchChangesUnlocked(dirtyOnly: initialDrainDirtyOnly)
             if let cacheScope {
@@ -677,15 +716,20 @@ public actor ScriptMetaKitWorkspace {
             roots: roots,
             replacingGroup: groupID,
             cacheScope: cacheScope,
-            dirtyOnly: dirtyOnly
+            dirtyOnly: dirtyOnly,
+            reconciliationDelivery: .complete
         ))
     }
 
+    /// Starts a sequenced watch-update stream. Complete reconciliation delivery
+    /// remains the default; progressive delivery emits root-priority batches and
+    /// ends each cycle with `coversAllWatchedRoots == true`.
     public func watchUpdates(
         roots: [ScriptMetaKitRoot],
         replacingGroup groupID: String,
         cacheScope: ScriptMetaCacheScope? = nil,
-        dirtyOnly: Bool = false
+        dirtyOnly: Bool = false,
+        reconciliationDelivery: ScriptMetaKitReconciliationDeliveryPolicy = .complete
     ) async throws -> ScriptMetaKitWatchUpdateSequence {
         try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
@@ -694,7 +738,8 @@ public actor ScriptMetaKitWorkspace {
             roots: roots,
             replacingGroup: groupID,
             cacheScope: cacheScope,
-            dirtyOnly: dirtyOnly
+            dirtyOnly: dirtyOnly,
+            reconciliationDelivery: reconciliationDelivery
         )
     }
 
@@ -702,7 +747,8 @@ public actor ScriptMetaKitWorkspace {
         roots: [ScriptMetaKitRoot],
         replacingGroup groupID: String,
         cacheScope: ScriptMetaCacheScope?,
-        dirtyOnly: Bool
+        dirtyOnly: Bool,
+        reconciliationDelivery: ScriptMetaKitReconciliationDeliveryPolicy
     ) async throws -> ScriptMetaKitWatchUpdateSequence {
         let watchedRootIDs = Set(roots.map(\.rootID))
         let streamID = UUID().uuidString
@@ -716,6 +762,8 @@ public actor ScriptMetaKitWorkspace {
         )
         let pump = Task { [weak self] in
             var sequence: UInt64 = 0
+            var reconciledRootIDs = Set<String>()
+            var reconciliationIsInProgress = false
             for await _ in notifications {
                 guard let self else { break }
                 do {
@@ -739,11 +787,29 @@ public actor ScriptMetaKitWorkspace {
                     delivery.streamID = streamID
                     delivery.sequence = sequence
                     result.watchDelivery = delivery
+                    let kind: ScriptMetaKitWatchUpdateKind = delivery.isReconciliation
+                        ? .reconciliation
+                        : .incremental
+                    if delivery.isReconciliation {
+                        if reconciliationIsInProgress == false {
+                            reconciledRootIDs.removeAll(keepingCapacity: true)
+                            reconciliationIsInProgress = true
+                        }
+                        if delivery.coversAllWatchedRoots {
+                            reconciledRootIDs = watchedRootIDs
+                            reconciliationIsInProgress = false
+                        } else {
+                            reconciledRootIDs.formUnion(result.roots.map(\.rootID))
+                        }
+                    }
+                    let pendingRootIDs = watchedRootIDs.subtracting(reconciledRootIDs)
                     updateContinuation.yield(ScriptMetaKitWatchUpdate(
                         streamID: streamID,
                         sequence: sequence,
-                        kind: delivery.isReconciliation ? .reconciliation : .incremental,
+                        kind: kind,
                         coversAllWatchedRoots: delivery.coversAllWatchedRoots,
+                        reconciledRootIDs: reconciledRootIDs.sorted(),
+                        pendingRootIDs: pendingRootIDs.sorted(),
                         result: result
                     ))
                 } catch is CancellationError {
@@ -772,6 +838,7 @@ public actor ScriptMetaKitWorkspace {
                 cacheScope: cacheScope,
                 drainsInitialChanges: false,
                 initialDrainDirtyOnly: false,
+                reconciliationDelivery: reconciliationDelivery,
                 onChange: { notificationContinuation.yield() }
             )
         } catch {

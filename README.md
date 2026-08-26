@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 1.2.2
+# SCRIPTMETAKit 1.3.0
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -8,9 +8,14 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.2.2`
-- Rust FFI crate: `scriptmetakit_ffi` `1.2.2`
+- Rust crate: `scriptmetakit` `1.3.0`
+- Rust FFI crate: `scriptmetakit_ffi` `1.3.0`
 - Swift package product: `ScriptMetaKit`
+
+## 1.3.0
+
+- Adds opt-in root-priority reconciliation delivery while preserving the existing complete reconciliation behavior by default.
+- Swift watch updates expose reconciled and pending root identities so consumers can act on current watched roots without waiting for unrelated background roots.
 
 ## 1.2.2
 
@@ -70,6 +75,8 @@ public func preflightRoot(
 `ScriptMetaKitFileListState` separates current root state from last-good content. `freshness` reports filesystem verification, `completeness` reports truncation, and `source` reports memory or persistent provenance. A content revision is reusable only within the same non-empty workspace epoch.
 
 Watch updates start at sequence 1 for each stream ID. A slow consumer can detect a dropped buffered result from a sequence gap, then recover all current registered states with `cachedFileListStates(rootIDs:)`. `watchChanges(...)` remains as a source-compatible adapter over the same native watcher and update pump.
+
+`watchUpdates(...)` keeps complete reconciliation delivery as its default. Consumers with latency-sensitive roots may opt in to `.progressiveByRootPriority`; each update then reports cumulative `reconciledRootIDs` and remaining `pendingRootIDs`, and the cycle finishes with a reconciliation update whose `coversAllWatchedRoots` value is `true`. Reconciliation coverage does not replace each root's `freshness` and `completeness` checks.
 
 Compatibility enum cases remain available but no longer create distinct behavior:
 

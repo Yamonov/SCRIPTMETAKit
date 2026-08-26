@@ -18,6 +18,11 @@ typedef enum SmkStatus {
     SMK_STATUS_CONFLICT = 6,
 } SmkStatus;
 
+typedef enum SmkWatchReconciliationDelivery {
+    SMK_WATCH_RECONCILIATION_DELIVERY_COMPLETE = 0,
+    SMK_WATCH_RECONCILIATION_DELIVERY_PROGRESSIVE_BY_ROOT_PRIORITY = 1,
+} SmkWatchReconciliationDelivery;
+
 typedef struct SmkEngine SmkEngine;
 typedef struct SmkScanResult SmkScanResult;
 typedef struct SmkEditResult SmkEditResult;
@@ -906,6 +911,13 @@ SmkStatus smk_engine_start_watching_with_callback(
     SmkEngine *engine,
     SmkWatchNotificationCallback callback,
     void *context
+);
+/* `reconciliation_delivery` must be one of SmkWatchReconciliationDelivery. */
+SmkStatus smk_engine_start_watching_with_callback_v2(
+    SmkEngine *engine,
+    SmkWatchNotificationCallback callback,
+    void *context,
+    uint32_t reconciliation_delivery
 );
 SmkStatus smk_engine_stop_watching(SmkEngine *engine);
 

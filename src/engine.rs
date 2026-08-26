@@ -556,6 +556,29 @@ impl ScriptMetaKitEngine {
         &self.roots
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn highest_priority_root_batch(&self, pending_root_ids: &BTreeSet<RootId>) -> Vec<RootId> {
+        let highest_priority = self
+            .roots
+            .iter()
+            .filter(|root| pending_root_ids.contains(&root.root_id))
+            .map(|root| root_scan_priority(root, self.visible_root_id.as_ref()))
+            .min();
+        let Some(highest_priority) = highest_priority else {
+            return Vec::new();
+        };
+
+        self.roots
+            .iter()
+            .filter(|root| pending_root_ids.contains(&root.root_id))
+            .filter(|root| {
+                root_scan_priority(root, self.visible_root_id.as_ref()) == highest_priority
+            })
+            .map(|root| root.root_id.clone())
+            .collect()
+    }
+
     pub fn set_root_paths<I, P>(
         &mut self,
         paths: I,
@@ -4248,6 +4271,37 @@ mod tests {
         assert_eq!(
             root_scan_priority(&visible, None),
             root_scan_priority(&background, None)
+        );
+    }
+
+    #[test]
+    fn highest_priority_root_batch_returns_all_pending_roots_in_the_first_tier() {
+        let mut engine = super::ScriptMetaKitEngine::new(Default::default()).expect("engine");
+        let root = |root_id: &str, priority| RootRegistration {
+            root_id: RootId::from(root_id),
+            path: PathBuf::from(format!("/tmp/{root_id}")),
+            display_name: None,
+            purpose: RootPurpose::FileList,
+            watch_policy: WatchPolicy::AllRegistered,
+            cache_policy: CachePolicy::MemoryOnly,
+            refresh_policy: RefreshPolicy::OnFileEvent,
+            priority,
+        };
+        engine
+            .set_roots(vec![
+                root("user-a", RootPriority::UserInitiated),
+                root("background", RootPriority::Background),
+                root("user-b", RootPriority::UserInitiated),
+            ])
+            .expect("roots");
+        let pending = ["user-a", "background", "user-b"]
+            .into_iter()
+            .map(RootId::from)
+            .collect();
+
+        assert_eq!(
+            engine.highest_priority_root_batch(&pending),
+            [RootId::from("user-a"), RootId::from("user-b")]
         );
     }
 

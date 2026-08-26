@@ -248,9 +248,15 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         try await scanRoots(rootIDs: [rootID], mode: mode, checkUpdates: checkUpdates, onProgress: onProgress)
     }
 
-    public func startWatching(onChange: @escaping @Sendable () -> Void) async throws {
+    public func startWatching(
+        onChange: @escaping @Sendable () -> Void,
+        reconciliationDelivery: ScriptMetaKitReconciliationDeliveryPolicy = .complete
+    ) async throws {
         try await runOperation { engineBox in
-            try engineBox.startWatching(onChange: onChange)
+            try engineBox.startWatching(
+                onChange: onChange,
+                reconciliationDelivery: reconciliationDelivery
+            )
         }
     }
 
@@ -1582,6 +1588,14 @@ private nonisolated func smk_engine_start_watching_with_callback(
     _ context: UnsafeMutableRawPointer?
 ) -> Int32
 
+@_silgen_name("smk_engine_start_watching_with_callback_v2")
+private nonisolated func smk_engine_start_watching_with_callback_v2(
+    _ engine: OpaquePointer?,
+    _ callback: SmkWatchNotificationCallback?,
+    _ context: UnsafeMutableRawPointer?,
+    _ reconciliationDelivery: UInt32
+) -> Int32
+
 @_silgen_name("smk_engine_stop_watching")
 private nonisolated func smk_engine_stop_watching(_ engine: OpaquePointer?) -> Int32
 
@@ -2145,13 +2159,19 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         return try ensureEngineLocked().cachedRoots(rootIDs: rootIDs, mode: mode)
     }
 
-    public func startWatching(onChange: @escaping @Sendable () -> Void) throws {
+    public func startWatching(
+        onChange: @escaping @Sendable () -> Void,
+        reconciliationDelivery: ScriptMetaKitReconciliationDeliveryPolicy = .complete
+    ) throws {
         lock.lock()
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
         let sink = ScriptMetaKitWatchNotificationSink(onChange: onChange)
         do {
-            try engine.startWatching(notificationSink: sink)
+            try engine.startWatching(
+                notificationSink: sink,
+                reconciliationDelivery: reconciliationDelivery
+            )
             watchNotificationSink = sink
         } catch {
             throw error
@@ -3159,12 +3179,16 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         return try backupRecord(from: result)
     }
 
-    public func startWatching(notificationSink: ScriptMetaKitWatchNotificationSink?) throws {
+    public func startWatching(
+        notificationSink: ScriptMetaKitWatchNotificationSink?,
+        reconciliationDelivery: ScriptMetaKitReconciliationDeliveryPolicy = .complete
+    ) throws {
         let notificationContext = notificationSink.map { Unmanaged.passUnretained($0).toOpaque() }
-        let status = smk_engine_start_watching_with_callback(
+        let status = smk_engine_start_watching_with_callback_v2(
             handle,
             notificationSink == nil ? nil : watchNotificationCallback,
-            notificationContext
+            notificationContext,
+            reconciliationDelivery.rawValue
         )
         guard status == smkStatusOK else {
             throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
