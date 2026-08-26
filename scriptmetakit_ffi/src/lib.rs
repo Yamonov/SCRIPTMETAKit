@@ -62,6 +62,12 @@ pub enum SmkStatus {
     Conflict = 6,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchReconciliationDelivery {
+    Complete,
+    ProgressiveByRootPriority,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SmkUtf8Slice {
@@ -775,6 +781,12 @@ struct SmkEngineState {
     #[cfg(feature = "native-watch")]
     watch_reconcile_pending: bool,
     #[cfg(feature = "native-watch")]
+    watch_reconciliation_delivery: WatchReconciliationDelivery,
+    #[cfg(feature = "native-watch")]
+    watch_progressive_reconciliation_active: bool,
+    #[cfg(feature = "native-watch")]
+    watch_progressive_pending_root_ids: BTreeSet<RootId>,
+    #[cfg(feature = "native-watch")]
     watcher: Option<NativeWatcher>,
     #[cfg(feature = "native-watch")]
     watch_plan: Option<WatchPlan>,
@@ -919,6 +931,12 @@ pub unsafe extern "C" fn smk_engine_create_default(out_engine: *mut *mut SmkEngi
                 last_error: Vec::new(),
                 #[cfg(feature = "native-watch")]
                 watch_reconcile_pending: false,
+                #[cfg(feature = "native-watch")]
+                watch_reconciliation_delivery: WatchReconciliationDelivery::Complete,
+                #[cfg(feature = "native-watch")]
+                watch_progressive_reconciliation_active: false,
+                #[cfg(feature = "native-watch")]
+                watch_progressive_pending_root_ids: BTreeSet::new(),
                 #[cfg(feature = "native-watch")]
                 watcher: None,
                 #[cfg(feature = "native-watch")]
@@ -2523,7 +2541,13 @@ pub unsafe extern "C" fn smk_engine_start_watching(engine: *mut SmkEngine) -> Sm
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        start_watching_engine(&mut engine, None, ptr::null_mut()).map_err(|message| {
+        start_watching_engine(
+            &mut engine,
+            None,
+            ptr::null_mut(),
+            WatchReconciliationDelivery::Complete,
+        )
+        .map_err(|message| {
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })
@@ -2551,10 +2575,60 @@ pub unsafe extern "C" fn smk_engine_start_watching_with_callback(
     let status = ffi_guard(|| {
         let mut engine = engine_mut(engine)?;
         engine.clear_error();
-        start_watching_engine(&mut engine, callback, context).map_err(|message| {
+        start_watching_engine(
+            &mut engine,
+            callback,
+            context,
+            WatchReconciliationDelivery::Complete,
+        )
+        .map_err(|message| {
             engine.set_error(&message);
             (SmkStatus::EngineError, message)
         })
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    if status == SmkStatus::Ok
+        && let Some(callback) = callback
+    {
+        callback(context);
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// Starts native watching with an explicit reconciliation delivery policy.
+///
+/// Policy `0` preserves complete reconciliation delivery. Policy `1` delivers
+/// reconciliation in root-priority batches and finishes with one result that
+/// covers every watched root.
+///
+/// # Safety
+///
+/// `engine` must be a live engine handle. The engine must already have roots,
+/// normally by calling one of the scan functions first. `callback`, if non-null,
+/// may be called from a background watcher thread after a file event has been
+/// queued. `context` is passed through unchanged and must remain valid until
+/// `smk_engine_stop_watching` or `smk_engine_free` returns.
+pub unsafe extern "C" fn smk_engine_start_watching_with_callback_v2(
+    engine: *mut SmkEngine,
+    callback: SmkWatchNotificationCallback,
+    context: *mut c_void,
+    reconciliation_delivery: u32,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let reconciliation_delivery =
+            watch_reconciliation_delivery_from_u32(reconciliation_delivery)?;
+        let mut engine = engine_mut(engine)?;
+        engine.clear_error();
+        start_watching_engine(&mut engine, callback, context, reconciliation_delivery).map_err(
+            |message| {
+                engine.set_error(&message);
+                (SmkStatus::EngineError, message)
+            },
+        )
     });
 
     if status == SmkStatus::Panic {
@@ -4078,6 +4152,8 @@ fn apply_engine_reconfiguration(
     if let Some(replacement) = replacement {
         state.watcher = Some(replacement);
         state.watch_reconcile_pending = true;
+        state.watch_progressive_reconciliation_active = false;
+        state.watch_progressive_pending_root_ids.clear();
         return Ok(state
             .watch_callback
             .map(|callback| (callback, state.watch_context)));
@@ -4106,6 +4182,8 @@ fn synchronize_running_watch_plan(
     state.watcher = Some(replacement);
     state.watch_plan = Some(candidate_plan);
     state.watch_reconcile_pending = true;
+    state.watch_progressive_reconciliation_active = false;
+    state.watch_progressive_pending_root_ids.clear();
     Ok(state
         .watch_callback
         .map(|callback| (callback, state.watch_context)))
@@ -4147,6 +4225,7 @@ fn start_watching_engine(
     engine: &mut SmkEngineState,
     callback: SmkWatchNotificationCallback,
     context: *mut c_void,
+    reconciliation_delivery: WatchReconciliationDelivery,
 ) -> Result<(), String> {
     let plan = engine.engine.watch_plan();
     let context = context as usize;
@@ -4156,6 +4235,9 @@ fn start_watching_engine(
     engine.watch_callback = callback;
     engine.watch_context = context;
     engine.watch_reconcile_pending = true;
+    engine.watch_reconciliation_delivery = reconciliation_delivery;
+    engine.watch_progressive_reconciliation_active = false;
+    engine.watch_progressive_pending_root_ids.clear();
     Ok(())
 }
 
@@ -4164,6 +4246,7 @@ fn start_watching_engine(
     _engine: &mut SmkEngineState,
     _callback: SmkWatchNotificationCallback,
     _context: *mut c_void,
+    _reconciliation_delivery: WatchReconciliationDelivery,
 ) -> Result<(), String> {
     Err("native-watch feature is not enabled".to_string())
 }
@@ -4173,6 +4256,9 @@ fn stop_watching_engine(engine: &mut SmkEngineState) {
     engine.watcher = None;
     engine.watch_plan = None;
     engine.watch_reconcile_pending = false;
+    engine.watch_reconciliation_delivery = WatchReconciliationDelivery::Complete;
+    engine.watch_progressive_reconciliation_active = false;
+    engine.watch_progressive_pending_root_ids.clear();
     engine.watch_callback = None;
     engine.watch_context = 0;
 }
@@ -4219,25 +4305,58 @@ fn poll_watcher_scan(
             });
         }
     }
-    let Some(mut batch) = batch else {
-        return Ok((None, None));
-    };
-    let is_reconciliation = plan_reconciliation || batch.overflowed;
-    batch.paths.sort();
-    batch.paths.dedup();
+    let batch_overflowed = batch.as_ref().is_some_and(|batch| batch.overflowed);
+    let mut change_batch = None;
+    let mut affected_root_ids = BTreeSet::new();
+    if let Some(mut batch) = batch {
+        batch.paths.sort();
+        batch.paths.dedup();
+        change_batch = engine
+            .engine
+            .mark_changed_paths(batch)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find_map(|event| match event {
+                scriptmetakit::ScriptMetaKitEvent::ChangeDetected { batch } => Some(batch),
+                _ => None,
+            });
+        if let Some(change_batch) = change_batch.as_ref() {
+            affected_root_ids.extend(
+                change_batch
+                    .affected_roots
+                    .iter()
+                    .map(|change| change.root_id.clone()),
+            );
+        }
+    }
+    engine.watch_reconcile_pending = false;
 
-    let change_batch = engine
-        .engine
-        .mark_changed_paths(batch)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find_map(|event| match event {
-            scriptmetakit::ScriptMetaKitEvent::ChangeDetected { batch } => Some(batch),
-            _ => None,
-        });
+    let starts_reconciliation = plan_reconciliation || batch_overflowed;
+    let uses_progressive_delivery = engine.watch_reconciliation_delivery
+        == WatchReconciliationDelivery::ProgressiveByRootPriority;
+    if uses_progressive_delivery
+        && (starts_reconciliation || engine.watch_progressive_reconciliation_active)
+    {
+        engine.watch_progressive_reconciliation_active = true;
+        engine
+            .watch_progressive_pending_root_ids
+            .extend(affected_root_ids);
+        return poll_progressive_watcher_reconciliation(engine, dirty_only, change_batch);
+    }
+
     let Some(change_batch) = change_batch else {
         return Ok((None, None));
     };
+    poll_complete_watcher_batch(engine, dirty_only, change_batch, starts_reconciliation)
+}
+
+#[cfg(feature = "native-watch")]
+fn poll_complete_watcher_batch(
+    engine: &mut SmkEngineState,
+    dirty_only: bool,
+    change_batch: RootChangeBatch,
+    is_reconciliation: bool,
+) -> Result<(Option<SmkScanResult>, PendingWatchNotification), String> {
     let affected_root_ids = change_batch
         .affected_roots
         .iter()
@@ -4249,7 +4368,8 @@ fn poll_watcher_scan(
             mode: ScanMode::FileListAndMetadata,
         })
         .map_err(|error| error.to_string())?;
-    engine.watch_reconcile_pending = false;
+    engine.watch_progressive_reconciliation_active = false;
+    engine.watch_progressive_pending_root_ids.clear();
     let notification = synchronize_running_watch_plan(engine)?;
     if dirty_only {
         filter_dirty_scan_result(&mut scan_result, &affected_root_ids);
@@ -4259,17 +4379,7 @@ fn poll_watcher_scan(
         .iter()
         .map(|root| root.root_id.clone())
         .collect::<BTreeSet<_>>();
-    let watched_root_ids = engine
-        .watch_plan
-        .as_ref()
-        .map(|plan| {
-            plan.logical_roots
-                .iter()
-                .filter(|root| root.active && root.physical_index.is_some())
-                .map(|root| root.root_id.clone())
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+    let watched_root_ids = watched_root_ids(engine);
     scan_result.watch_reconciliation = is_reconciliation;
     scan_result.watch_covers_all_roots = watched_root_ids.is_subset(&result_root_ids);
     scan_result.watch_change_batch = Some(change_batch);
@@ -4277,6 +4387,98 @@ fn poll_watcher_scan(
         Some(SmkScanResult::from_scan_result(scan_result, None)),
         notification,
     ))
+}
+
+#[cfg(feature = "native-watch")]
+fn poll_progressive_watcher_reconciliation(
+    engine: &mut SmkEngineState,
+    dirty_only: bool,
+    change_batch: Option<RootChangeBatch>,
+) -> Result<(Option<SmkScanResult>, PendingWatchNotification), String> {
+    let batch_root_ids = engine
+        .engine
+        .highest_priority_root_batch(&engine.watch_progressive_pending_root_ids);
+    if batch_root_ids.is_empty() {
+        engine.watch_progressive_reconciliation_active = false;
+        engine.watch_progressive_pending_root_ids.clear();
+        return Ok((None, None));
+    }
+
+    let mut scan_result = engine
+        .engine
+        .scan_roots(ScanRequest {
+            root_ids: batch_root_ids.clone(),
+            mode: ScanMode::FileListAndMetadata,
+        })
+        .map_err(|error| error.to_string())?;
+    for root_id in &batch_root_ids {
+        engine.watch_progressive_pending_root_ids.remove(root_id);
+    }
+
+    let mut notification = synchronize_running_watch_plan(engine)?;
+    let watcher_was_replaced = engine.watch_reconcile_pending;
+    if watcher_was_replaced {
+        engine.watch_progressive_reconciliation_active = false;
+        engine.watch_progressive_pending_root_ids.clear();
+    }
+
+    let watched_root_ids = watched_root_ids(engine);
+    let completes_reconciliation =
+        !watcher_was_replaced && engine.watch_progressive_pending_root_ids.is_empty();
+    let filter_root_ids = if completes_reconciliation {
+        let change_summary = scan_result.change_summary.take();
+        scan_result = engine.engine.cached_scan_result(ScanRequest {
+            root_ids: watched_root_ids.iter().cloned().collect(),
+            mode: ScanMode::FileListAndMetadata,
+        });
+        scan_result.change_summary = change_summary;
+        engine.watch_progressive_reconciliation_active = false;
+        watched_root_ids.clone()
+    } else {
+        if !watcher_was_replaced && notification.is_none() {
+            notification = watch_callback_notification(engine);
+        }
+        batch_root_ids.iter().cloned().collect()
+    };
+
+    if dirty_only {
+        filter_dirty_scan_result(&mut scan_result, &filter_root_ids);
+    }
+    let result_root_ids = scan_result
+        .roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<BTreeSet<_>>();
+    scan_result.watch_reconciliation = true;
+    scan_result.watch_covers_all_roots =
+        completes_reconciliation && watched_root_ids.is_subset(&result_root_ids);
+    scan_result.watch_change_batch = change_batch;
+    Ok((
+        Some(SmkScanResult::from_scan_result(scan_result, None)),
+        notification,
+    ))
+}
+
+#[cfg(feature = "native-watch")]
+fn watched_root_ids(engine: &SmkEngineState) -> BTreeSet<RootId> {
+    engine
+        .watch_plan
+        .as_ref()
+        .map(|plan| {
+            plan.logical_roots
+                .iter()
+                .filter(|root| root.active && root.physical_index.is_some())
+                .map(|root| root.root_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "native-watch")]
+fn watch_callback_notification(engine: &SmkEngineState) -> PendingWatchNotification {
+    engine
+        .watch_callback
+        .map(|callback| (callback, engine.watch_context))
 }
 
 #[cfg(feature = "native-watch")]
@@ -4392,7 +4594,9 @@ impl SmkScanResult {
             file_issues: Vec::with_capacity(scan_result.file_issues.len()),
             watch_info: SmkWatchChangeInfo::default(),
             watch_delivery_info: SmkWatchDeliveryInfo {
-                is_watch_update: bool_byte(scan_result.watch_change_batch.is_some()),
+                is_watch_update: bool_byte(
+                    scan_result.watch_change_batch.is_some() || scan_result.watch_reconciliation,
+                ),
                 is_reconciliation: bool_byte(scan_result.watch_reconciliation),
                 covers_all_watched_roots: bool_byte(scan_result.watch_covers_all_roots),
             },
@@ -6136,6 +6340,19 @@ fn watch_policy_from_u32(value: u32) -> Result<WatchPolicy, (SmkStatus, String)>
         _ => Err((
             SmkStatus::InvalidArgument,
             format!("unknown watch policy `{value}`"),
+        )),
+    }
+}
+
+fn watch_reconciliation_delivery_from_u32(
+    value: u32,
+) -> Result<WatchReconciliationDelivery, (SmkStatus, String)> {
+    match value {
+        0 => Ok(WatchReconciliationDelivery::Complete),
+        1 => Ok(WatchReconciliationDelivery::ProgressiveByRootPriority),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown watch reconciliation delivery policy `{value}`"),
         )),
     }
 }

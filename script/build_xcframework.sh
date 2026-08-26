@@ -77,6 +77,7 @@ nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_write_script_metadata_file_if
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_file_list_directory_state_ranges$'
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_set_operational_policy$'
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_start_watching_with_callback$'
+nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_start_watching_with_callback_v2$'
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_root_revisions$'
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_file_list_details$'
 nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_watch_delivery_info$'

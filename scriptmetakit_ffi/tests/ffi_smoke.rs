@@ -14,8 +14,8 @@ use scriptmetakit_ffi::{
     SmkScanChangeInfo, SmkScanResult, SmkScriptItemSlice, SmkScriptMetaBackupGenerationSlice,
     SmkScriptMetaBackupRecord, SmkScriptMetadataDraft, SmkScriptMetadataEditPreviewResult,
     SmkScriptMetadataFileWriteResult, SmkScriptMetadataWriteRequest, SmkStatus, SmkUpdateCheckInfo,
-    SmkUpdateProgress, SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_compare_versions,
-    smk_edit_result_backup_generations, smk_edit_result_backup_record,
+    SmkUpdateProgress, SmkUpdateStatusEntrySlice, SmkUtf8Slice, SmkWatchDeliveryInfo,
+    smk_compare_versions, smk_edit_result_backup_generations, smk_edit_result_backup_record,
     smk_edit_result_file_write_result, smk_edit_result_free,
     smk_edit_result_metadata_edit_preview_result, smk_edit_result_text,
     smk_engine_cancel_current_operation, smk_engine_cancel_current_or_reserved_operation,
@@ -36,15 +36,16 @@ use scriptmetakit_ffi::{
     smk_scan_result_file_lists, smk_scan_result_free, smk_scan_result_items,
     smk_scan_result_operation_info, smk_scan_result_root_revisions, smk_scan_result_roots,
     smk_scan_result_update_info, smk_scan_result_update_resolutions,
-    smk_scan_result_update_statuses, smk_validate_edit_password_sha256_format,
-    smk_validate_version_string,
+    smk_scan_result_update_statuses, smk_scan_result_watch_delivery_info,
+    smk_validate_edit_password_sha256_format, smk_validate_version_string,
 };
 #[cfg(unix)]
 use scriptmetakit_ffi::{SmkPathResolution, smk_resolve_registered_path};
 #[cfg(feature = "native-watch")]
 use scriptmetakit_ffi::{
     smk_engine_poll_watcher_scan, smk_engine_poll_watcher_scan_dirty_only,
-    smk_engine_start_watching, smk_engine_start_watching_with_callback, smk_engine_stop_watching,
+    smk_engine_start_watching, smk_engine_start_watching_with_callback,
+    smk_engine_start_watching_with_callback_v2, smk_engine_stop_watching,
     smk_engine_watcher_requires_restart,
 };
 
@@ -1876,6 +1877,130 @@ fn notifies_when_native_watcher_receives_change() {
         smk_engine_stop_watching(engine);
         smk_engine_free(engine);
     }
+}
+
+#[cfg(feature = "native-watch")]
+#[test]
+fn progressive_reconciliation_delivers_user_initiated_roots_before_complete_state() {
+    let user_root = tempfile::tempdir().expect("user root tempdir");
+    let background_root = tempfile::tempdir().expect("background root tempdir");
+    std::fs::write(user_root.path().join("User.jsx"), "alert('user');").expect("user script");
+    std::fs::write(
+        background_root.path().join("Background.jsx"),
+        "alert('background');",
+    )
+    .expect("background script");
+
+    let user_path = user_root.path().to_string_lossy().into_owned();
+    let background_path = background_root.path().to_string_lossy().into_owned();
+    let roots = [
+        SmkRootRegistration {
+            root_id: utf8_slice("background"),
+            path: utf8_slice(&background_path),
+            display_name: SmkUtf8Slice::default(),
+            purpose: 0,
+            watch_policy: 2,
+            cache_policy: 1,
+            refresh_policy: 2,
+            priority: 2,
+        },
+        SmkRootRegistration {
+            root_id: utf8_slice("user"),
+            path: utf8_slice(&user_path),
+            display_name: SmkUtf8Slice::default(),
+            purpose: 0,
+            watch_policy: 2,
+            cache_policy: 1,
+            refresh_policy: 2,
+            priority: 1,
+        },
+    ];
+    let mut engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_set_roots(engine, roots.as_ptr(), roots.len()) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe { smk_engine_start_watching_with_callback_v2(engine, None, ptr::null_mut(), 1) },
+        SmkStatus::Ok
+    );
+
+    let mut first_changed = 0_u8;
+    let mut first_result = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            smk_engine_poll_watcher_scan_dirty_only(engine, &mut first_changed, &mut first_result)
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(first_changed, 1);
+    let mut first_roots = SmkRootSnapshotSlice::default();
+    assert_eq!(
+        unsafe { smk_scan_result_roots(first_result, &mut first_roots) },
+        SmkStatus::Ok
+    );
+    let first_roots = unsafe { slice::from_raw_parts(first_roots.ptr, first_roots.len) };
+    assert_eq!(first_roots.len(), 1);
+    assert_eq!(utf8(first_roots[0].root_id), "user");
+    let mut first_delivery = SmkWatchDeliveryInfo::default();
+    assert_eq!(
+        unsafe { smk_scan_result_watch_delivery_info(first_result, &mut first_delivery) },
+        SmkStatus::Ok
+    );
+    assert_eq!(first_delivery.is_reconciliation, 1);
+    assert_eq!(first_delivery.covers_all_watched_roots, 0);
+    unsafe { smk_scan_result_free(first_result) };
+
+    let mut final_changed = 0_u8;
+    let mut final_result = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            smk_engine_poll_watcher_scan_dirty_only(engine, &mut final_changed, &mut final_result)
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(final_changed, 1);
+    let mut final_roots = SmkRootSnapshotSlice::default();
+    assert_eq!(
+        unsafe { smk_scan_result_roots(final_result, &mut final_roots) },
+        SmkStatus::Ok
+    );
+    assert_eq!(final_roots.len, 2);
+    let mut final_delivery = SmkWatchDeliveryInfo::default();
+    assert_eq!(
+        unsafe { smk_scan_result_watch_delivery_info(final_result, &mut final_delivery) },
+        SmkStatus::Ok
+    );
+    assert_eq!(final_delivery.is_reconciliation, 1);
+    assert_eq!(final_delivery.is_watch_update, 1);
+    assert_eq!(final_delivery.covers_all_watched_roots, 1);
+
+    unsafe {
+        smk_scan_result_free(final_result);
+        smk_engine_stop_watching(engine);
+        smk_engine_free(engine);
+    }
+}
+
+#[cfg(feature = "native-watch")]
+#[test]
+fn progressive_watcher_rejects_unknown_reconciliation_delivery_policy() {
+    let mut engine = ptr::null_mut();
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    assert_eq!(
+        unsafe {
+            smk_engine_start_watching_with_callback_v2(engine, None, ptr::null_mut(), u32::MAX)
+        },
+        SmkStatus::InvalidArgument
+    );
+    unsafe { smk_engine_free(engine) };
 }
 
 #[cfg(all(feature = "native-watch", target_os = "macos"))]
