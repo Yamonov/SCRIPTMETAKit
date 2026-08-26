@@ -15,7 +15,7 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 ## 1.3.0
 
 - Adds opt-in root-priority reconciliation delivery while preserving the existing complete reconciliation behavior by default.
-- Exposes reconciled and pending root identities so consumers can act on current watched roots without waiting for unrelated background roots.
+- Swift watch updates expose reconciled and pending root identities so consumers can act on current watched roots without waiting for unrelated background roots.
 
 ## 1.2.2
 
