@@ -1667,6 +1667,79 @@ final class ScriptMetaKitAPITests: XCTestCase {
     }
 
     #if os(macOS)
+    func testProgressiveWatchUpdatesFinishAfterAliasWatchPlanReplacement() async throws {
+        let aliasRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitProgressiveAlias-\(UUID().uuidString)", isDirectory: true)
+        let targetRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScriptMetaKitProgressiveTarget-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: aliasRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: targetRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: aliasRoot)
+            try? FileManager.default.removeItem(at: targetRoot)
+        }
+        let initialScript = targetRoot.appendingPathComponent("Initial.jsx")
+        try "alert('initial');\n".write(to: initialScript, atomically: true, encoding: .utf8)
+        try createMacOSAlias(
+            to: targetRoot,
+            at: aliasRoot.appendingPathComponent("LinkedScripts")
+        )
+        let roots = [
+            ScriptMetaKitRoot(
+                rootID: "alias-owner",
+                url: aliasRoot,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                priority: .userInitiated
+            ),
+            ScriptMetaKitRoot(
+                rootID: "direct-target",
+                url: targetRoot,
+                purpose: .fileList,
+                watchPolicy: .allRegistered,
+                priority: .background
+            )
+        ]
+        let workspace = ScriptMetaKitWorkspace(configuration: .init(nativeEventLatencyMillis: 50))
+        let updates = try await workspace.watchUpdates(
+            roots: roots,
+            replacingGroup: "test.progressive-alias-watch",
+            dirtyOnly: true,
+            reconciliationDelivery: .progressiveByRootPriority
+        )
+        var iterator = updates.makeAsyncIterator()
+        let firstValue = try await iterator.next()
+        let first = try XCTUnwrap(firstValue)
+        XCTAssertEqual(first.kind, .reconciliation)
+        XCTAssertTrue(first.reconciledRootIDs.contains("alias-owner"))
+
+        var completeValue: ScriptMetaKitWatchUpdate?
+        for _ in 0..<16 {
+            let candidate = try await iterator.next()
+            if candidate?.kind == .reconciliation,
+               candidate?.coversAllWatchedRoots == true {
+                completeValue = candidate
+                break
+            }
+        }
+        let complete = try XCTUnwrap(completeValue)
+        XCTAssertEqual(complete.reconciledRootIDs, ["alias-owner", "direct-target"])
+        XCTAssertTrue(complete.pendingRootIDs.isEmpty)
+        let aliasSnapshot = try XCTUnwrap(
+            complete.result.fileListSnapshots.first { $0.root.rootID == "alias-owner" }
+        )
+        XCTAssertTrue(
+            aliasSnapshot.children?
+                .flatMap(\.flattened)
+                .contains(where: {
+                    URL(fileURLWithPath: $0.resolvedPath).standardizedFileURL
+                        == initialScript.standardizedFileURL
+                })
+                == true
+        )
+        await workspace.stopWatching()
+    }
+
     func testWatchUpdatesRoutesMacOSAliasTargetChangeToBothRegisteredRoots() async throws {
         let aliasRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitAliasOwner-\(UUID().uuidString)", isDirectory: true)
