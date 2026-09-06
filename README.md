@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 1.3.0
+# SCRIPTMETAKit 1.3.1
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -8,9 +8,18 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.3.0`
-- Rust FFI crate: `scriptmetakit_ffi` `1.3.0`
+- Rust crate: `scriptmetakit` `1.3.1`
+- Rust FFI crate: `scriptmetakit_ffi` `1.3.1`
 - Swift package product: `ScriptMetaKit`
+
+## 1.3.1
+
+- Expands every directory alias or symbolic-link reference within a registered root while stopping actual ancestor cycles.
+- Preserves each reference's display path and ancestor context during partial refreshes, including references to descendants of a changed directory.
+- Updates and removes all affected logical references, instead of stopping after the first physical-path match.
+- Keeps metadata inspection deduplicated by physical directory and preserves the registered display-root path during metadata-only refreshes.
+- Reconciles older cached trees containing false cycle markers or physical child paths under an alias before they become current again.
+- Retains the existing scan limits, C/Swift API, and persistent-cache format.
 
 ## 1.3.0
 
