@@ -5,5 +5,9 @@
   "sourceTreeSHA256": "846e7e8f983b6a901d55bb5c2aff86cc167ec94fd3fb0aa9c746879c6d3e86c3",
   "features": "blocking-http,native-watch",
   "architectures": "x86_64 arm64",
-  "dylibSHA256": "5ce23e4d4b8864b79bda9abfb7dc5229a9861f26061ba0f9f6acefc4ba7f0f9f"
+  "dylibSHA256": "d4b340b83a64cb9bbd8c52ff93657b04b249adea1ba6d2ee9e69dabb32bb9be2",
+  "signingTeamIdentifier": "5NFE273M7M",
+  "notarizationSubmissionID": "a98b9e2a-8ad0-4c0b-8ec6-64bdad9f091a",
+  "notarizationStatus": "Accepted",
+  "notarizedArchiveSHA256": "54896cf45869fe6015d145adfdde5694465e771d007a6900fa976161f573eed2"
 }
