@@ -528,6 +528,15 @@ fn collect_metadata_from_file_list_entries(
         state.scanned_nodes = state.scanned_nodes.saturating_add(1);
 
         if entry.is_directory {
+            // File lists preserve every logical alias. Metadata still visits
+            // each physical directory once, as in the independent scanner.
+            if entry.resolution_status == PathResolutionStatus::Cycle
+                || !state
+                    .visited_directories
+                    .insert(entry.resolved_path.clone())
+            {
+                continue;
+            }
             collect_metadata_from_file_list_entries(
                 &entry.children,
                 depth + 1,
@@ -829,8 +838,12 @@ fn scan_dirty_directories(
         if !metadata.is_dir() {
             continue;
         }
+        let Ok(relative_directory) = dirty_directory.strip_prefix(root_path) else {
+            continue;
+        };
+        let display_directory = state.root.path.join(relative_directory);
         scan_directory(
-            dirty_directory,
+            &display_directory,
             dirty_directory,
             relative_depth(root_path, dirty_directory),
             state,

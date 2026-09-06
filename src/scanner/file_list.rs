@@ -140,7 +140,7 @@ fn scan_file_list_root_controlled_with_probe(
         extensions,
         timeout,
         started,
-        visited_directories: BTreeSet::new(),
+        ancestor_directories: BTreeSet::new(),
         visited_nodes: 0,
         scanned_nodes: 0,
         directory_states: DirectoryStateMap::new(),
@@ -331,7 +331,8 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
     );
     let normalized_root_path = normalize_path(&root_resolution.resolved_path);
     let dirty_directories = normalize_dirty_directories(dirty_directories, &normalized_root_path);
-    if dirty_directories.is_empty()
+    if requires_alias_reconciliation(previous_children, root_path, &normalized_root_path)
+        || dirty_directories.is_empty()
         || dirty_directories
             .iter()
             .any(|directory| directory == &normalized_root_path)
@@ -355,25 +356,27 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
     let mut root_error = None;
     let mut scanned_nodes = 0;
 
-    for dirty_directory in &dirty_directories {
-        if !directory_exists_in_entries(&children, dirty_directory) {
-            return scan_file_list_root_transactional_controlled(
-                root_id,
-                root_path,
-                options,
-                extensions,
-                Some(previous_snapshot),
-                cancellation,
-                true,
-            );
-        }
-
+    if dirty_directories
+        .iter()
+        .any(|directory| !directory_exists_in_entries(&children, directory))
+    {
+        return scan_file_list_root_transactional_controlled(
+            root_id,
+            root_path,
+            options,
+            extensions,
+            Some(previous_snapshot),
+            cancellation,
+            true,
+        );
+    }
+    let contexts = directory_scan_contexts(&children, &dirty_directories, &normalized_root_path);
+    for context in &contexts {
+        let dirty_directory = &context.resolved_path;
         match fs::metadata(dirty_directory) {
             Ok(metadata) if metadata.is_dir() => {
                 let output = scan_file_list_directory(
-                    dirty_directory,
-                    dirty_directory,
-                    relative_depth(&normalized_root_path, dirty_directory),
+                    context,
                     options,
                     extensions,
                     cancellation,
@@ -383,7 +386,7 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
                 if output.completed {
                     replace_directory_children(
                         &mut children,
-                        dirty_directory,
+                        &context.display_path,
                         output.children,
                         output.directory_error,
                     );
@@ -398,11 +401,11 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
                 }
             }
             Ok(_) => {
-                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_entry(&mut children, &context.display_path);
                 remove_directory_states_under(&mut directory_states, dirty_directory);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_entry(&mut children, &context.display_path);
                 remove_directory_states_under(&mut directory_states, dirty_directory);
             }
             Err(error) => {
@@ -477,7 +480,8 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
     );
     let normalized_root_path = normalize_path(&root_resolution.resolved_path);
     let dirty_directories = normalize_dirty_directories(dirty_directories, &normalized_root_path);
-    if dirty_directories.is_empty()
+    if requires_alias_reconciliation(previous_children, root_path, &normalized_root_path)
+        || dirty_directories.is_empty()
         || dirty_directories
             .iter()
             .any(|directory| directory == &normalized_root_path)
@@ -504,13 +508,13 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
     let mut root_error = None;
     let mut scanned_nodes = 0;
 
-    for dirty_directory in &dirty_directories {
+    let contexts = directory_scan_contexts(&children, &dirty_directories, &normalized_root_path);
+    for context in &contexts {
+        let dirty_directory = &context.resolved_path;
         match fs::metadata(dirty_directory) {
             Ok(metadata) if metadata.is_dir() => {
                 let output = scan_file_list_directory(
-                    dirty_directory,
-                    dirty_directory,
-                    relative_depth(&normalized_root_path, dirty_directory),
+                    context,
                     options,
                     extensions,
                     cancellation,
@@ -520,7 +524,7 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
                 if output.completed {
                     replace_directory_children(
                         &mut children,
-                        dirty_directory,
+                        &context.display_path,
                         output.children,
                         output.directory_error,
                     );
@@ -535,11 +539,11 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
                 }
             }
             Ok(_) => {
-                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_entry(&mut children, &context.display_path);
                 remove_directory_states_under(&mut directory_states, dirty_directory);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_entry(&mut children, &context.display_path);
                 remove_directory_states_under(&mut directory_states, dirty_directory);
             }
             Err(error) => {
@@ -615,10 +619,15 @@ struct PartialDirectoryScanOutput {
     completed: bool,
 }
 
-fn scan_file_list_directory(
-    display_directory: &Path,
-    source_directory: &Path,
+struct DirectoryScanContext {
+    display_path: PathBuf,
+    resolved_path: PathBuf,
+    ancestor_directories: BTreeSet<PathBuf>,
     depth: usize,
+}
+
+fn scan_file_list_directory(
+    context: &DirectoryScanContext,
     options: &ScannerOptions,
     extensions: &ExtensionPolicy,
     cancellation: Option<&OperationCancellation>,
@@ -631,7 +640,7 @@ fn scan_file_list_directory(
             .scan_timeout_per_root_millis
             .map(Duration::from_millis),
         started: Instant::now(),
-        visited_directories: BTreeSet::new(),
+        ancestor_directories: context.ancestor_directories.clone(),
         visited_nodes: 0,
         scanned_nodes,
         directory_states: DirectoryStateMap::new(),
@@ -645,12 +654,14 @@ fn scan_file_list_directory(
         preflight_tracker: None,
         preflight_issue: None,
     };
-    let resolved_directory = normalize_path(source_directory);
-    let children = scan_directory(display_directory, source_directory, depth, &mut state);
-    let directory_error = state
-        .directory_read_errors
-        .get(&resolved_directory)
-        .cloned();
+    let resolved_directory = &context.resolved_path;
+    let children = scan_directory(
+        &context.display_path,
+        resolved_directory,
+        context.depth,
+        &mut state,
+    );
+    let directory_error = state.directory_read_errors.get(resolved_directory).cloned();
     PartialDirectoryScanOutput {
         completed: children.is_some(),
         children: children.unwrap_or_default(),
@@ -669,7 +680,7 @@ struct FileListWalkState<'a> {
     extensions: &'a ExtensionPolicy,
     timeout: Option<Duration>,
     started: Instant,
-    visited_directories: BTreeSet<PathBuf>,
+    ancestor_directories: BTreeSet<PathBuf>,
     visited_nodes: usize,
     scanned_nodes: usize,
     directory_states: DirectoryStateMap,
@@ -695,15 +706,38 @@ fn scan_directory(
     }
 
     let resolved_directory = normalize_path(source_directory);
-    if !state.visited_directories.insert(resolved_directory.clone()) {
+    if !state
+        .ancestor_directories
+        .insert(resolved_directory.clone())
+    {
         return Some(Vec::new());
     }
 
+    // Sibling aliases may visit the same directory. Only a directory already
+    // on this branch is a cycle; unwind on every normal/early-return path.
+    let children = scan_directory_contents(
+        display_directory,
+        source_directory,
+        &resolved_directory,
+        depth,
+        state,
+    );
+    state.ancestor_directories.remove(&resolved_directory);
+    children
+}
+
+fn scan_directory_contents(
+    display_directory: &Path,
+    source_directory: &Path,
+    resolved_directory: &Path,
+    depth: usize,
+    state: &mut FileListWalkState<'_>,
+) -> Option<Vec<FileSystemEntry>> {
     let entries = match fs::read_dir(source_directory) {
         Ok(entries) => entries,
         Err(error) => {
             state.directory_read_errors.insert(
-                resolved_directory,
+                resolved_directory.to_path_buf(),
                 (path_error_status(&error), error.to_string()),
             );
             let (_, root_error) = root_io_error(&error, "read_directory_failed");
@@ -788,12 +822,12 @@ fn scan_directory(
 
         if metadata.is_dir() {
             let resolved_directory = normalize_path(&resolved.resolved_path);
-            let is_cycle = state.visited_directories.contains(&resolved_directory);
+            let is_cycle = state.ancestor_directories.contains(&resolved_directory);
             let (resolved, nested_children) = if is_cycle {
                 (
                     resolved.with_status(
                         PathResolutionStatus::Cycle,
-                        Some("resolved path was already visited".to_string()),
+                        Some("resolved path is an ancestor directory".to_string()),
                     ),
                     Vec::new(),
                 )
@@ -1118,6 +1152,103 @@ fn prune_redundant_dirty_directories(directories: Vec<PathBuf>) -> Vec<PathBuf> 
     pruned
 }
 
+fn requires_alias_reconciliation(
+    entries: &[FileSystemEntry],
+    display_root: &Path,
+    resolved_root: &Path,
+) -> bool {
+    fn visit(
+        entries: &[FileSystemEntry],
+        display_parent: &Path,
+        ancestors: &mut BTreeSet<PathBuf>,
+    ) -> bool {
+        for entry in entries {
+            if entry.display_path.parent() != Some(display_parent) {
+                return true;
+            }
+            if !entry.is_directory {
+                continue;
+            }
+            let is_ancestor = ancestors.contains(&entry.resolved_path);
+            if entry.resolution_status == PathResolutionStatus::Cycle {
+                if !is_ancestor || !entry.children.is_empty() {
+                    return true;
+                }
+                continue;
+            }
+            if is_ancestor {
+                return true;
+            }
+            ancestors.insert(entry.resolved_path.clone());
+            let invalid = visit(&entry.children, &entry.display_path, ancestors);
+            ancestors.remove(&entry.resolved_path);
+            if invalid {
+                return true;
+            }
+        }
+        false
+    }
+    // Older cached trees may contain false Cycle markers or physical child
+    // paths under a logical alias. Reconcile those once with the full scanner.
+    visit(
+        entries,
+        display_root,
+        &mut BTreeSet::from([resolved_root.to_path_buf()]),
+    )
+}
+
+fn directory_scan_contexts(
+    entries: &[FileSystemEntry],
+    dirty_directories: &[PathBuf],
+    resolved_root: &Path,
+) -> Vec<DirectoryScanContext> {
+    fn collect(
+        entries: &[FileSystemEntry],
+        dirty_directories: &[PathBuf],
+        ancestors: &mut BTreeSet<PathBuf>,
+        depth: usize,
+        contexts: &mut Vec<DirectoryScanContext>,
+    ) {
+        for entry in entries {
+            if !entry.is_directory || ancestors.contains(&entry.resolved_path) {
+                continue;
+            }
+            if dirty_directories
+                .iter()
+                .any(|dirty| path_is_same_or_child(&entry.resolved_path, dirty))
+            {
+                contexts.push(DirectoryScanContext {
+                    display_path: entry.display_path.clone(),
+                    resolved_path: entry.resolved_path.clone(),
+                    ancestor_directories: ancestors.clone(),
+                    depth,
+                });
+                // This logical subtree is covered, but sibling aliases still
+                // require their own scan with their own display path/ancestors.
+                continue;
+            }
+            ancestors.insert(entry.resolved_path.clone());
+            collect(
+                &entry.children,
+                dirty_directories,
+                ancestors,
+                depth + 1,
+                contexts,
+            );
+            ancestors.remove(&entry.resolved_path);
+        }
+    }
+    let mut contexts = Vec::new();
+    collect(
+        entries,
+        dirty_directories,
+        &mut BTreeSet::from([resolved_root.to_path_buf()]),
+        1,
+        &mut contexts,
+    );
+    contexts
+}
+
 fn directory_exists_in_entries(entries: &[FileSystemEntry], directory: &Path) -> bool {
     entries.iter().any(|entry| {
         entry.is_directory
@@ -1130,25 +1261,22 @@ fn clone_dirty_directory_entries(
     entries: &[FileSystemEntry],
     dirty_directories: &[PathBuf],
 ) -> Vec<FileSystemEntry> {
-    dirty_directories
-        .iter()
-        .filter_map(|directory| find_directory_entry(entries, directory).cloned())
-        .collect()
-}
-
-fn find_directory_entry<'a>(
-    entries: &'a [FileSystemEntry],
-    directory: &Path,
-) -> Option<&'a FileSystemEntry> {
+    let mut selected = Vec::new();
     for entry in entries {
-        if entry.is_directory && entry.resolved_path == directory {
-            return Some(entry);
-        }
-        if let Some(found) = find_directory_entry(&entry.children, directory) {
-            return Some(found);
+        if entry.is_directory
+            && dirty_directories
+                .iter()
+                .any(|directory| path_is_same_or_child(&entry.resolved_path, directory))
+        {
+            selected.push(entry.clone());
+        } else {
+            selected.extend(clone_dirty_directory_entries(
+                &entry.children,
+                dirty_directories,
+            ));
         }
     }
-    None
+    selected
 }
 
 fn replace_directory_children(
@@ -1168,14 +1296,16 @@ fn replace_directory_children_inner(
     directory_error: Option<&(PathResolutionStatus, String)>,
 ) -> bool {
     for entry in entries {
-        if entry.is_directory && entry.resolved_path == directory {
+        if entry.is_directory && entry.display_path == directory {
             entry.children = children.take().unwrap_or_default();
             if let Some((status, message)) = directory_error {
                 entry.resolution_status = *status;
                 entry.resolution_message = Some(message.clone());
             } else if matches!(
                 entry.resolution_status,
-                PathResolutionStatus::PermissionDenied | PathResolutionStatus::Broken
+                PathResolutionStatus::PermissionDenied
+                    | PathResolutionStatus::Broken
+                    | PathResolutionStatus::Cycle
             ) {
                 entry.resolution_status = PathResolutionStatus::Resolved;
                 entry.resolution_message = None;
@@ -1196,7 +1326,7 @@ fn replace_directory_children_inner(
 
 fn remove_directory_entry(entries: &mut Vec<FileSystemEntry>, directory: &Path) -> bool {
     let original_len = entries.len();
-    entries.retain(|entry| !(entry.is_directory && entry.resolved_path == directory));
+    entries.retain(|entry| !(entry.is_directory && entry.display_path == directory));
     if entries.len() != original_len {
         return true;
     }
@@ -1313,12 +1443,6 @@ fn file_entry_changed(lhs: &FileSystemEntry, rhs: &FileSystemEntry) -> bool {
         || lhs.can_edit_scriptmeta != rhs.can_edit_scriptmeta
         || lhs.can_append_scriptmeta != rhs.can_append_scriptmeta
         || lhs.scriptmeta_edit_state != rhs.scriptmeta_edit_state
-}
-
-fn relative_depth(root_path: &Path, path: &Path) -> usize {
-    path.strip_prefix(root_path)
-        .map(|relative| relative.components().count())
-        .unwrap_or(0)
 }
 
 fn path_is_same_or_child(path: &Path, parent: &Path) -> bool {

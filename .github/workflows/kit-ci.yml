@@ -28,6 +28,8 @@ jobs:
         run: cargo test --workspace --all-features --lib
       - name: Rust package tests
         run: cargo test -p scriptmetakit --all-features --test package_smoke -- --test-threads=1
+      - name: Rust directory alias tests
+        run: cargo test -p scriptmetakit --all-features --test directory_aliases_smoke
       - name: Rust FFI tests
         run: cargo test -p scriptmetakit_ffi --all-features --test ffi_smoke
       - name: Build binary XCFramework
