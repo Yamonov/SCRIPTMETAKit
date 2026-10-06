@@ -44,8 +44,9 @@ use crate::{
     },
     storage::CachePayload,
     watcher::{
-        ChangeRoutingOptions, RawChangeBatch, WatchPlan, WatchPolicy,
-        build_watch_plan_with_resolved_targets, normalize_path, route_change_batch,
+        ChangeRoutingOptions, RawChangeBatch, ReferenceWatchTargets, WatchPlan, WatchPolicy,
+        build_watch_plan_with_resolved_targets, normalize_path, normalize_reference_source,
+        route_change_batch,
     },
 };
 
@@ -60,7 +61,7 @@ pub struct ScriptMetaKitEngine {
     known_directory_paths: BTreeSet<PathBuf>,
     known_file_paths: BTreeSet<PathBuf>,
     resolved_watch_targets: BTreeMap<RootId, BTreeSet<PathBuf>>,
-    resolved_watch_sources: BTreeMap<RootId, BTreeSet<PathBuf>>,
+    resolved_watch_sources: BTreeMap<RootId, ReferenceWatchTargets>,
     catalog_snapshot: Option<Arc<ScriptMetaCatalogSnapshot>>,
     update_check_result: Option<Arc<UpdateCheckResult>>,
     dirty_roots: BTreeMap<RootId, DirtyRootState>,
@@ -632,6 +633,7 @@ impl ScriptMetaKitEngine {
             self.config.watcher.monitor_root_strategy,
             self.visible_root_id.as_ref(),
             &self.resolved_watch_targets,
+            &self.resolved_watch_sources,
         );
         self.watch_plan_with_delivery_options(plan)
     }
@@ -2465,12 +2467,20 @@ impl ScriptMetaKitEngine {
             collect_file_paths(children, &mut files);
             directories.extend(snapshot.directory_states.keys().map(PathBuf::from));
         }
-        for targets in self.resolved_watch_targets.values() {
-            directories.extend(targets.iter().cloned());
+        for paths in self.resolved_watch_targets.values() {
+            for path in paths {
+                if path.is_dir() {
+                    directories.insert(path.clone());
+                } else {
+                    files.insert(path.clone());
+                }
+            }
         }
-        for sources in self.resolved_watch_sources.values() {
-            directories.extend(sources.iter().cloned());
-        }
+        files.extend(
+            self.resolved_watch_sources
+                .values()
+                .flat_map(|sources| sources.keys().cloned()),
+        );
         self.known_directory_paths = directories;
         self.known_file_paths = files;
     }
@@ -2479,10 +2489,7 @@ impl ScriptMetaKitEngine {
         for snapshot in snapshots {
             match snapshot.root.status {
                 RootStatus::Ready => self.replace_resolved_watch_paths(snapshot),
-                RootStatus::Missing => {
-                    self.resolved_watch_targets.remove(&snapshot.root.root_id);
-                    self.resolved_watch_sources.remove(&snapshot.root.root_id);
-                }
+                RootStatus::Missing => self.replace_resolved_watch_paths(snapshot),
                 RootStatus::NotLoaded
                 | RootStatus::Dirty
                 | RootStatus::Loading
@@ -2511,6 +2518,23 @@ impl ScriptMetaKitEngine {
             .map(|path| normalize_path(&path))
             .filter(|path| !path.starts_with(&physical_root))
             .collect::<Vec<_>>();
+        let previous = self.resolved_watch_sources.get(&snapshot.root.root_id);
+        let mut sources = ReferenceWatchTargets::new();
+        record_watch_reference(
+            &root_resolution.source_path,
+            &root_resolution.resolved_path,
+            root_resolution.path_kind,
+            root_resolution.resolution_status,
+            previous,
+            &mut sources,
+        );
+        collect_watch_references(
+            snapshot.children.as_deref().unwrap_or_default(),
+            &physical_root,
+            previous,
+            &mut sources,
+        );
+        targets.extend(sources.values().flatten().cloned());
         targets.sort_by(|lhs, rhs| {
             lhs.components()
                 .count()
@@ -2527,11 +2551,6 @@ impl ScriptMetaKitEngine {
             }
         }
 
-        let mut sources = BTreeSet::new();
-        collect_resolved_directory_link_sources(
-            snapshot.children.as_deref().unwrap_or_default(),
-            &mut sources,
-        );
         if minimal_targets.is_empty() {
             self.resolved_watch_targets.remove(&snapshot.root.root_id);
         } else {
@@ -4001,18 +4020,56 @@ fn collect_directory_paths(entries: &[FileSystemEntry], output: &mut BTreeSet<Pa
     }
 }
 
-fn collect_resolved_directory_link_sources(
+fn record_watch_reference(
+    source: &Path,
+    resolved: &Path,
+    kind: PathKind,
+    status: PathResolutionStatus,
+    previous: Option<&ReferenceWatchTargets>,
+    output: &mut ReferenceWatchTargets,
+) {
+    if kind == PathKind::Normal {
+        return;
+    }
+    let source = normalize_reference_source(source);
+    let target = match status {
+        PathResolutionStatus::Resolved
+        | PathResolutionStatus::Broken
+        | PathResolutionStatus::PermissionDenied => {
+            if source != resolved {
+                Some(normalize_path(resolved))
+            } else {
+                // A temporarily broken alias may no longer reveal its target.
+                // Keep its last watch while the reference itself still exists.
+                previous
+                    .and_then(|paths| paths.get(&source))
+                    .cloned()
+                    .flatten()
+            }
+        }
+        _ => None,
+    };
+    output.insert(source, target);
+}
+
+fn collect_watch_references(
     entries: &[FileSystemEntry],
-    output: &mut BTreeSet<PathBuf>,
+    physical_parent: &Path,
+    previous: Option<&ReferenceWatchTargets>,
+    output: &mut ReferenceWatchTargets,
 ) {
     for entry in entries {
-        if entry.is_directory
-            && entry.path_kind != PathKind::Normal
-            && entry.resolution_status == PathResolutionStatus::Resolved
-        {
-            output.insert(entry.display_path.clone());
+        if let Some(name) = entry.display_path.file_name() {
+            record_watch_reference(
+                &physical_parent.join(name),
+                &entry.resolved_path,
+                entry.path_kind,
+                entry.resolution_status,
+                previous,
+                output,
+            );
         }
-        collect_resolved_directory_link_sources(&entry.children, output);
+        collect_watch_references(&entry.children, &entry.resolved_path, previous, output);
     }
 }
 

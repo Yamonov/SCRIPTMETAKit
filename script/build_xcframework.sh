@@ -43,6 +43,7 @@ MODULEMAP
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   "${CARGO_BIN}" build \
+    --locked \
     -p scriptmetakit_ffi \
     --features "${RELEASE_FEATURES}" \
     --release \

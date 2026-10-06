@@ -128,7 +128,27 @@ pub(crate) fn resolve_scannable_path(
         .as_ref()
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
-        return resolve_symlink_path(display_path, source_path, options);
+        let resolved = resolve_symlink_path(display_path, source_path, options);
+        #[cfg(windows)]
+        if resolved.resolution_status == PathResolutionStatus::Resolved
+            && is_windows_shortcut_path(&resolved.resolved_path)
+        {
+            return super::windows_shortcut::resolve(resolved);
+        }
+        return resolved;
+    }
+
+    #[cfg(windows)]
+    if is_windows_shortcut_path(&source_path) {
+        let resolved = ResolvedPath {
+            display_path,
+            resolved_path: source_path.clone(),
+            source_path,
+            path_kind: PathKind::WindowsShortcut,
+            resolution_status: PathResolutionStatus::NotRequested,
+            resolution_message: None,
+        };
+        return super::windows_shortcut::resolve(resolved);
     }
 
     if options.resolve_macos_alias
@@ -151,6 +171,14 @@ pub(crate) fn resolve_scannable_path(
         resolution_status: PathResolutionStatus::NotRequested,
         resolution_message: None,
     }
+}
+
+pub(crate) fn is_windows_shortcut_path(path: &Path) -> bool {
+    cfg!(windows)
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
 }
 
 fn should_probe_macos_alias_file(

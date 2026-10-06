@@ -3,6 +3,9 @@ mod metadata_scan;
 mod options;
 mod path_resolution;
 mod root_preflight;
+#[cfg(windows)]
+#[allow(unsafe_code)] // Windows COM calls are contained in this platform adapter.
+mod windows_shortcut;
 
 pub use crate::formats::{ScriptFileInfo, detect_script_file};
 pub use file_list::{
@@ -23,6 +26,7 @@ pub(crate) use metadata_scan::{
     scan_metadata_roots_scoped_with_file_lists_controlled,
 };
 pub use options::{ExtensionPolicy, RootPreflightOptions, ScannerOptions};
+pub(crate) use path_resolution::is_windows_shortcut_path;
 pub use path_resolution::{
     PathKind, PathResolutionStatus, ScannablePathResolution, resolve_registered_path,
 };

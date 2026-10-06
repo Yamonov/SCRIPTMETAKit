@@ -14,6 +14,8 @@ use crate::{
     watcher::{MonitorRootStrategy, OverflowPolicy, WatchPolicy},
 };
 
+pub(crate) type ReferenceWatchTargets = BTreeMap<PathBuf, Option<PathBuf>>;
+
 pub const DEFAULT_DEBOUNCE_DELAY_MILLIS: u64 = 500;
 pub const DEFAULT_MAX_DELIVERY_DELAY_MILLIS: u64 = 2_000;
 pub const DEFAULT_MAX_PENDING_PATHS: usize = 1_024;
@@ -172,6 +174,7 @@ pub fn build_watch_plan(
         strategy,
         visible_root_id,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     )
 }
 
@@ -181,6 +184,7 @@ pub(crate) fn build_watch_plan_with_resolved_targets(
     strategy: MonitorRootStrategy,
     visible_root_id: Option<&RootId>,
     resolved_targets_by_root: &BTreeMap<RootId, BTreeSet<PathBuf>>,
+    resolved_sources_by_root: &BTreeMap<RootId, ReferenceWatchTargets>,
 ) -> WatchPlan {
     if matches!(global_policy, WatchPolicy::Disabled | WatchPolicy::Manual) {
         return WatchPlan::empty();
@@ -201,23 +205,44 @@ pub(crate) fn build_watch_plan_with_resolved_targets(
         }
     }
 
+    for (root_id, sources) in resolved_sources_by_root {
+        if !roots.iter().any(|root| {
+            &root.root_id == root_id && should_watch_root(root, global_policy, visible_root_id)
+        }) {
+            continue;
+        }
+        for source in sources.keys() {
+            if let Some(parent) = source.parent() {
+                candidates.push((root_id.clone(), normalize_path(parent), false));
+            }
+        }
+    }
+    let mut candidates: Vec<_> = candidates
+        .into_iter()
+        .map(|(root_id, path, is_logical_root)| {
+            let watch_path = native_watch_directory(&path);
+            (root_id, path, is_logical_root, watch_path)
+        })
+        .collect();
     candidates.sort_by(|lhs, rhs| {
-        lhs.1
+        lhs.3
             .components()
             .count()
-            .cmp(&rhs.1.components().count())
-            .then_with(|| lhs.1.cmp(&rhs.1))
+            .cmp(&rhs.3.components().count())
+            .then_with(|| lhs.3.cmp(&rhs.3))
             .then_with(|| lhs.0.cmp(&rhs.0))
             .then_with(|| rhs.2.cmp(&lhs.2))
     });
 
     let mut plan = WatchPlan::empty();
-    for (root_id, path, is_logical_root) in candidates {
+    for (root_id, path, is_logical_root, watch_path) in candidates {
         let physical_index = match strategy {
-            MonitorRootStrategy::ExactRoots => physical_index_for_exact_path(&mut plan, &path),
+            MonitorRootStrategy::ExactRoots => {
+                physical_index_for_exact_path(&mut plan, &watch_path)
+            }
             MonitorRootStrategy::DeduplicateNestedRoots
             | MonitorRootStrategy::PlatformRecommended => {
-                physical_index_for_deduplicated_path(&mut plan, &path)
+                physical_index_for_deduplicated_path(&mut plan, &watch_path)
             }
         };
 
@@ -240,6 +265,28 @@ pub(crate) fn build_watch_plan_with_resolved_targets(
     plan
 }
 
+// Native APIs watch directories. Files and missing targets are covered by the
+// nearest readable ancestor; routing still uses the original reference paths.
+fn native_watch_directory(path: &Path) -> PathBuf {
+    let mut candidate = path;
+    loop {
+        if crate::scanner::can_read_directory_contents(candidate) {
+            return candidate.to_path_buf();
+        }
+        let Some(parent) = candidate.parent() else {
+            return candidate.to_path_buf();
+        };
+        candidate = parent;
+    }
+}
+
+pub(crate) fn normalize_reference_source(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => normalize_path(parent).join(name),
+        _ => normalize_path(path),
+    }
+}
+
 pub(crate) struct ChangeRoutingOptions<'a> {
     pub extensions: &'a ExtensionPolicy,
     pub skip_hidden_paths: bool,
@@ -247,7 +294,7 @@ pub(crate) struct ChangeRoutingOptions<'a> {
     pub known_directory_paths: &'a BTreeSet<PathBuf>,
     pub known_file_paths: &'a BTreeSet<PathBuf>,
     pub resolved_targets_by_root: &'a BTreeMap<RootId, BTreeSet<PathBuf>>,
-    pub resolved_sources_by_root: &'a BTreeMap<RootId, BTreeSet<PathBuf>>,
+    pub resolved_sources_by_root: &'a BTreeMap<RootId, ReferenceWatchTargets>,
     pub scanner_options: &'a ScannerOptions,
     pub overflow_policy: OverflowPolicy,
     pub max_deferred_dirty_directories: usize,
@@ -262,7 +309,7 @@ pub(crate) fn route_change_batch(
     let normalized_paths: Vec<PathBuf> = raw
         .paths
         .into_iter()
-        .map(|path| normalize_path(&path))
+        .map(|path| normalize_reference_source(&path))
         .collect();
     let mut observed_paths = BTreeSet::new();
     let mut affected_roots = Vec::new();
@@ -285,22 +332,21 @@ pub(crate) fn route_change_batch(
                     .iter()
                     .find(|target| path_affects_root(path, target))
             });
-            let matches_known_source = resolved_sources.is_some_and(|sources| {
-                sources.iter().any(|source| path_affects_root(path, source))
+            let matching_source = resolved_sources.and_then(|sources| {
+                sources
+                    .keys()
+                    .find(|source| path_affects_root(path, source))
             });
-            let matches_new_source = affects_registered_root
+            let matches_new_source = (affects_registered_root
+                || matching_target.is_some_and(|target| target.is_dir()))
                 && !options.extensions.contains_path(path)
-                && path_is_resolved_directory_link(
-                    path,
-                    options.scanner_options,
-                    options.extensions,
-                );
+                && path_is_resolved_link(path, options.scanner_options, options.extensions);
             let may_be_removed_source = affects_registered_root
                 && resolved_targets.is_some_and(|targets| !targets.is_empty())
                 && !path.try_exists().unwrap_or(false)
                 && !options.extensions.contains_path(path);
             let matches_source =
-                matches_known_source || matches_new_source || may_be_removed_source;
+                matching_source.is_some() || matches_new_source || may_be_removed_source;
             if !affects_registered_root && matching_target.is_none() && !matches_source {
                 continue;
             }
@@ -320,9 +366,13 @@ pub(crate) fn route_change_batch(
             }
 
             if matches_source {
+                let source_scope = matching_source
+                    .and_then(|source| source.parent())
+                    .or_else(|| matching_target.map(PathBuf::as_path))
+                    .unwrap_or(&root_path);
                 match observe_change_path_visibility(
                     path,
-                    &root_path,
+                    source_scope,
                     options.skip_hidden_paths,
                     options.skip_package_paths,
                 ) {
@@ -495,18 +545,20 @@ fn observe_change_path_visibility(
     Ok(())
 }
 
-fn path_is_resolved_directory_link(
+fn path_is_resolved_link(
     path: &Path,
     scanner_options: &ScannerOptions,
     extensions: &ExtensionPolicy,
 ) -> bool {
+    if crate::scanner::is_windows_shortcut_path(path) {
+        return true; // Retain broken/new links so a repaired reference can be reconciled.
+    }
     let resolved = resolve_registered_path(path, scanner_options, Some(extensions));
     resolved.path_kind != PathKind::Normal
         && resolved.resolution_status == PathResolutionStatus::Resolved
-        && resolved
-            .resolved_path
-            .metadata()
-            .is_ok_and(|metadata| metadata.is_dir())
+        && resolved.resolved_path.metadata().is_ok_and(|metadata| {
+            metadata.is_dir() || extensions.contains_path(&resolved.resolved_path)
+        })
 }
 
 fn watch_path_event(
@@ -516,7 +568,7 @@ fn watch_path_event(
     known_file_paths: &BTreeSet<PathBuf>,
     known_directory_paths: &BTreeSet<PathBuf>,
 ) -> WatchPathEvent {
-    let normalized_path = normalize_path(path);
+    let normalized_path = normalize_reference_source(path);
     let exists = normalized_path.try_exists().unwrap_or(false);
     let is_known_directory = known_directory_paths.contains(&normalized_path);
     let is_known_file = known_file_paths.contains(&normalized_path);

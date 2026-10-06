@@ -290,7 +290,9 @@ fn should_keep_event_path(
         return false;
     }
 
-    if filter.supported_extensions.contains_path(path) {
+    if filter.supported_extensions.contains_path(path)
+        || crate::scanner::is_windows_shortcut_path(path)
+    {
         return true;
     }
 
@@ -951,7 +953,10 @@ mod platform {
 
             for root in &plan.physical_roots {
                 let directory = match open_directory(&root.path) {
-                    Ok(directory) => directory,
+                    Ok(directory) => Some(directory),
+                    // An unavailable volume must not stop every other physical watch.
+                    // Its one owned worker waits for the directory to return.
+                    Err(_) if !root.path.try_exists().unwrap_or(false) => None,
                     Err(error) => {
                         stop_workers(&mut stop_events, &mut workers);
                         return Err(error);
@@ -960,7 +965,9 @@ mod platform {
                 let stop_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
                 if stop_event.is_null() || stop_event == INVALID_HANDLE_VALUE {
                     unsafe {
-                        CloseHandle(directory);
+                        if let Some(directory) = directory {
+                            CloseHandle(directory);
+                        }
                     }
                     stop_workers(&mut stop_events, &mut workers);
                     return Err(ScriptMetaKitError::Io {
@@ -971,14 +978,14 @@ mod platform {
 
                 let root_path = root.path.clone();
                 let sender = event_sender.clone();
-                let directory_value = directory as isize;
+                let directory_value = directory.map(|handle| handle as isize);
                 let stop_event_value = stop_event as isize;
                 let worker = thread::Builder::new()
                     .name("scriptmetakit-read-directory-changes".to_string())
                     .spawn(move || {
                         watch_root(
                             root_path,
-                            directory_value as HANDLE,
+                            directory_value.map(|handle| handle as HANDLE),
                             stop_event_value as HANDLE,
                             sender,
                         );
@@ -986,7 +993,9 @@ mod platform {
                     .map_err(|error| {
                         unsafe {
                             CloseHandle(stop_event);
-                            CloseHandle(directory);
+                            if let Some(directory) = directory {
+                                CloseHandle(directory);
+                            }
                         }
                         stop_workers(&mut stop_events, &mut workers);
                         ScriptMetaKitError::InvalidConfig(error.to_string())
@@ -1049,8 +1058,19 @@ mod platform {
         Ok(handle)
     }
 
-    fn watch_root(root: PathBuf, directory: HANDLE, stop_event: HANDLE, sender: NativeEventSender) {
-        let mut directory = Some(directory);
+    fn watch_root(
+        root: PathBuf,
+        directory: Option<HANDLE>,
+        stop_event: HANDLE,
+        sender: NativeEventSender,
+    ) {
+        let mut directory = directory;
+        if directory.is_none() {
+            directory = wait_for_directory(&root, stop_event);
+            if directory.is_some() {
+                let _ = sender.send(NativeFsEvent::Overflow);
+            }
+        }
         while let Some(directory_handle) = directory {
             let mut buffer = [0u8; BUFFER_SIZE];
             let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
@@ -1159,6 +1179,10 @@ mod platform {
             CloseHandle(directory);
         }
 
+        wait_for_directory(root, stop_event)
+    }
+
+    fn wait_for_directory(root: &Path, stop_event: HANDLE) -> Option<HANDLE> {
         loop {
             let wait_result = unsafe { WaitForSingleObject(stop_event, RETRY_OPEN_DELAY_MILLIS) };
             if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_FAILED {

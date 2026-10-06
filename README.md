@@ -4,7 +4,7 @@ SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning
 
 The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer applications that need a reusable SCRIPTMETA engine across platforms.
 
-Registered macOS aliases and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. `PathKind::WindowsShortcut` is reserved for compatibility; `.lnk` resolution is not implemented in the 1.x series and callers must treat it as unsupported.
+Registered macOS aliases, Windows Shell links (`.lnk`), and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. OS-specific resolution and native notifications are compiled only on their corresponding platforms.
 
 ## Package Version
 
@@ -17,7 +17,29 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 - Parses escaped line endings in SCRIPTMETA-DIST blocks embedded in JSON, including note article metadata.
 - Preserves literal backslash pairs and unknown escapes while decoding supported HTML and line-ending escapes in one pass.
 - Adds regression coverage for body-over-head selection, streamed chunk boundaries, and public distribution resolution.
+- Resolves Windows Shell links to filesystem targets without launching or repairing them, including file and folder references.
+- Watches file-reference targets through their parent directories on macOS and Windows. Shared watches are deduplicated, and unrelated sibling files do not invalidate a reference's registered root.
+- Tracks reference sources separately from targets, detects retargeting, and retains the last known watch target while a reference is temporarily broken.
+- Adds a standalone Windows DLL build script and native reference-watch tests for both platforms.
 - Retains the existing C/Swift API, ABI, and metadata-source selection policy.
+
+This release consolidates the previously local Windows reference support into the common 1.3.2 release. The version follows the project's chosen numbering; the additional Windows capability would ordinarily be a minor release under strict SemVer. The published Rust `ScannerOptions` fields remain unchanged.
+
+### Platform builds
+
+Build the Universal macOS XCFramework on macOS:
+
+```sh
+./script/build_xcframework.sh
+```
+
+Build the Windows x64 DLL on Windows:
+
+```powershell
+./script/build_windows.ps1 -Release
+```
+
+Both builds use the same source, version, and fixed `blocking-http,native-watch` features. See [WindowsReferences.md](WindowsReferences.md) for Shell-link behavior.
 
 ## 1.3.1
 
