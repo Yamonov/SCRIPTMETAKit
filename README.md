@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 1.3.2
+# SCRIPTMETAKit 1.3.3
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -8,9 +8,16 @@ Registered macOS aliases, Windows Shell links (`.lnk`), and symbolic links can b
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.3.2`
-- Rust FFI crate: `scriptmetakit_ffi` `1.3.2`
+- Rust crate: `scriptmetakit` `1.3.3`
+- Rust FFI crate: `scriptmetakit_ffi` `1.3.3`
 - Swift package product: `ScriptMetaKit`
+
+## 1.3.3
+
+- Fixes Intel linking of the macOS Universal dylib by disabling Rust's implicit debuginfo strip and retaining Apple's final symbol reduction.
+- Validates LINKEDIT string-pool alignment and real native linking for both arm64 and x86_64 in the final XCFramework; runs engine create/free on every architecture available on the build host.
+- Checks the committed binary in CI before rebuilding it, so a locally generated invalid slice cannot pass through native-architecture-only Swift tests.
+- Keeps the Rust implementation, public API, ABI, and cache format unchanged from 1.3.2.
 
 ## 1.3.2
 

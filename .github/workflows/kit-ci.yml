@@ -34,6 +34,8 @@ jobs:
         run: cargo test -p scriptmetakit --all-features --test reference_watch_smoke -- --test-threads=1
       - name: Rust FFI tests
         run: cargo test -p scriptmetakit_ffi --all-features --test ffi_smoke
+      - name: Validate the committed macOS binary for both CPUs
+        run: python3 script/validate_macos_binary.py Artifacts/ScriptMetaKitFFI.xcframework/macos-arm64_x86_64/libscriptmetakit_ffi.dylib
       - name: Build binary XCFramework
         run: ./script/build_xcframework.sh
       - name: Reject local build paths in the binary
