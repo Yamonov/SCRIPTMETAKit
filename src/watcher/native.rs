@@ -907,6 +907,7 @@ mod platform {
         os::windows::ffi::{OsStrExt, OsStringExt},
         path::{Path, PathBuf},
         ptr,
+        sync::mpsc,
         thread::{self, JoinHandle},
     };
 
@@ -980,6 +981,7 @@ mod platform {
                 let sender = event_sender.clone();
                 let directory_value = directory.map(|handle| handle as isize);
                 let stop_event_value = stop_event as isize;
+                let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
                 let worker = thread::Builder::new()
                     .name("scriptmetakit-read-directory-changes".to_string())
                     .spawn(move || {
@@ -988,6 +990,7 @@ mod platform {
                             directory_value.map(|handle| handle as HANDLE),
                             stop_event_value as HANDLE,
                             sender,
+                            ready_sender,
                         );
                     })
                     .map_err(|error| {
@@ -1003,6 +1006,16 @@ mod platform {
 
                 stop_events.push(stop_event as isize);
                 workers.push(worker);
+                // Publish an active watch only after its first notification
+                // request is armed, or its missing-directory retry is ready.
+                if ready_receiver.recv().is_err() {
+                    stop_workers(&mut stop_events, &mut workers);
+                    return Err(ScriptMetaKitError::Io {
+                        path: root.path.clone(),
+                        message: "Windows watcher exited before registering notifications"
+                            .to_string(),
+                    });
+                }
             }
 
             Ok(Self {
@@ -1063,9 +1076,12 @@ mod platform {
         directory: Option<HANDLE>,
         stop_event: HANDLE,
         sender: NativeEventSender,
+        ready_sender: mpsc::SyncSender<()>,
     ) {
+        let mut ready_sender = Some(ready_sender);
         let mut directory = directory;
         if directory.is_none() {
+            signal_ready(&mut ready_sender);
             directory = wait_for_directory(&root, stop_event);
             if directory.is_some() {
                 let _ = sender.send(NativeFsEvent::Overflow);
@@ -1100,6 +1116,7 @@ mod platform {
                     None,
                 )
             };
+            signal_ready(&mut ready_sender);
 
             if read_started == 0 {
                 unsafe {
@@ -1167,6 +1184,12 @@ mod platform {
             unsafe {
                 CloseHandle(directory);
             }
+        }
+    }
+
+    fn signal_ready(sender: &mut Option<mpsc::SyncSender<()>>) {
+        if let Some(sender) = sender.take() {
+            let _ = sender.send(());
         }
     }
 

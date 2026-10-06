@@ -234,6 +234,41 @@ fn retargeting_a_file_reference_replaces_the_external_watch() {
     );
 }
 
+#[test]
+fn notified_reference_target_is_reread_when_size_and_timestamp_are_unchanged() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("root");
+    let external = temp.path().join("external");
+    fs::create_dir(&root).expect("root");
+    fs::create_dir(&external).expect("external");
+    let target = external.join("Target.jsx");
+    write_script(&target, "1.0.0");
+    let source = root.join(reference_name());
+    create_reference(&target, &source);
+    let mut engine = engine(&root);
+    let original_time = fs::metadata(&target).unwrap().modified().unwrap();
+    write_script(&target, "2.0.0");
+    fs::File::options()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(original_time))
+        .unwrap();
+    assert!(notify(&mut engine, &target));
+    engine
+        .refresh_dirty_roots(RefreshRequest {
+            mode: ScanMode::FileListAndMetadata,
+        })
+        .expect("refresh");
+    assert_eq!(
+        entry(&engine, &source)
+            .scriptmeta_item
+            .as_ref()
+            .and_then(|item| item.version.as_deref()),
+        Some("2.0.0")
+    );
+}
+
 #[cfg(feature = "native-watch")]
 fn wait_until(
     phase: &str,

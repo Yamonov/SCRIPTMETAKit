@@ -2804,11 +2804,17 @@ impl ScriptMetaKitEngine {
         let dirty_scopes = dirty_scopes?;
         let dirty_directories = dirty_scopes
             .iter()
-            .filter(|(_, dirty)| !dirty.requires_full_rescan && !dirty.dirty_directories.is_empty())
+            .filter(|(_, dirty)| dirty.requires_full_rescan || !dirty.dirty_directories.is_empty())
             .map(|(root_id, dirty)| {
                 (
                     root_id.clone(),
-                    dirty.dirty_directories.iter().cloned().collect::<Vec<_>>(),
+                    if dirty.requires_full_rescan {
+                        // Keep the dirty root in the map. An empty scope scans
+                        // the whole root without reusing timestamp-matched records.
+                        Vec::new()
+                    } else {
+                        dirty.dirty_directories.iter().cloned().collect::<Vec<_>>()
+                    },
                 )
             })
             .collect::<BTreeMap<_, _>>();

@@ -20,6 +20,7 @@ Registered macOS aliases, Windows Shell links (`.lnk`), and symbolic links can b
 - Resolves Windows Shell links to filesystem targets without launching or repairing them, including file and folder references.
 - Watches file-reference targets through their parent directories on macOS and Windows. Shared watches are deduplicated, and unrelated sibling files do not invalidate a reference's registered root.
 - Tracks reference sources separately from targets, detects retargeting, and retains the last known watch target while a reference is temporarily broken.
+- Starts Windows watches after notification requests are registered, and rereads notified metadata even when file size and modification time are unchanged.
 - Adds a standalone Windows DLL build script and native reference-watch tests for both platforms.
 - Retains the existing C/Swift API, ABI, and metadata-source selection policy.
 
