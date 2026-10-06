@@ -2130,6 +2130,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_body_json_distribution_across_source_chunk_boundaries() {
+        let source = include_bytes!("../../tests/fixtures/note_distribution_escaped.html");
+        // One-byte chunks also split the body marker, block markers, and escapes.
+        for chunk_size in [1, 7, 64, SOURCE_READ_CHUNK_BYTES] {
+            let mut accumulator = super::MetadataSourceAccumulator::new(
+                DistributionResolverOptions::default().max_metadata_block_bytes,
+                DistributionResolverOptions::default().max_source_bytes,
+            );
+            let mut extracted = None;
+            for chunk in source.chunks(chunk_size) {
+                if let Some(block) = accumulator.feed(chunk).expect("source chunk") {
+                    extracted = Some(block);
+                    break;
+                }
+            }
+            let block = super::metadata_block_to_string(extracted.expect("body block"));
+            let metadata =
+                crate::parse_distribution_metadata_for_script(&block, "ai-linkpanelplus-mini")
+                    .expect("body JSON distribution metadata");
+
+            assert_eq!(metadata.script_id.as_deref(), Some("ai-linkpanelplus-mini"));
+            assert_eq!(metadata.latest_version.as_deref(), Some("2.1.1"));
+            assert_eq!(
+                metadata.latest_page_url.as_ref().map(Url::as_str),
+                Some("https://note.com/nice_lotus120/n/n7ac58d4d86f6")
+            );
+        }
+    }
+
+    #[test]
     fn rejects_head_distribution_block_when_html_body_exists_without_metadata() {
         let source = br#"
 <html>

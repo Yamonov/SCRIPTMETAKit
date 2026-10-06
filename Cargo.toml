@@ -1,6 +1,6 @@
 [package]
 name = "scriptmetakit"
-version = "1.3.1"
+version = "1.3.2"
 edition = "2024"
 rust-version = "1.94"
 description = "Rust library for parsing and scanning SCRIPTMETA metadata."
@@ -33,6 +33,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 scriptmetakit_macos_io = { path = "scriptmetakit_macos_io" }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_Storage_FileSystem", "Win32_UI_Shell"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
 
 [features]

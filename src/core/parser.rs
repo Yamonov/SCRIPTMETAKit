@@ -516,8 +516,7 @@ fn clean_line(line: &str) -> &str {
 }
 
 fn normalize_distribution_body(body: &str) -> Cow<'_, str> {
-    if !body.contains('<') && !body.contains('&') && !body.contains("\\u") && !body.contains("\\/")
-    {
+    if !body.contains('<') && !body.contains('&') && !body.contains('\\') {
         return Cow::Borrowed(body);
     }
 
@@ -527,20 +526,54 @@ fn normalize_distribution_body(body: &str) -> Cow<'_, str> {
 }
 
 fn decode_json_html_escapes(text: &str) -> Cow<'_, str> {
-    if !text.contains("\\u") && !text.contains("\\/") && !text.contains("\\\"") {
+    if !text.contains('\\') {
         return Cow::Borrowed(text);
     }
 
-    Cow::Owned(
-        text.replace("\\u003C", "<")
-            .replace("\\u003c", "<")
-            .replace("\\u003E", ">")
-            .replace("\\u003e", ">")
-            .replace("\\u002F", "/")
-            .replace("\\u002f", "/")
-            .replace("\\/", "/")
-            .replace("\\\"", "\""),
-    )
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => {
+                if chars.as_str().starts_with(r"\n") {
+                    chars.next();
+                    chars.next();
+                }
+                output.push('\n');
+            }
+            Some('/') => output.push('/'),
+            Some('"') => output.push('"'),
+            Some('u') => {
+                let decoded = match chars.as_str().get(..4) {
+                    Some("003c" | "003C") => Some('<'),
+                    Some("003e" | "003E") => Some('>'),
+                    Some("002f" | "002F") => Some('/'),
+                    _ => None,
+                };
+                if let Some(decoded) = decoded {
+                    for _ in 0..4 {
+                        chars.next();
+                    }
+                    output.push(decoded);
+                } else {
+                    output.push_str(r"\u");
+                }
+            }
+            Some(escaped) => {
+                // The extracted block has no JSON container context. Preserve
+                // literal backslash pairs and unknown escapes without a second pass.
+                output.push('\\');
+                output.push(escaped);
+            }
+            None => output.push('\\'),
+        }
+    }
+    Cow::Owned(output)
 }
 
 fn strip_html_tags(text: &str) -> String {
@@ -731,6 +764,55 @@ SCRIPTMETA-DIST-END
         .expect("distribution metadata");
 
         assert_eq!(metadata.latest_version.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn distribution_parses_escaped_line_endings() {
+        for separator in [r"\n", r"\r\n", r"\r"] {
+            let text = [
+                "SCRIPTMETA-DIST-BEGIN",
+                "Script-ID=com.example.escaped",
+                "Version=2.1.1",
+                "Latest-Page-URL=https://example.com/script",
+                "SCRIPTMETA-DIST-END",
+            ]
+            .join(separator);
+            let metadata = parse_distribution_metadata_for_script(&text, "com.example.escaped")
+                .expect("escaped line endings should delimit distribution fields");
+
+            assert_eq!(metadata.script_id.as_deref(), Some("com.example.escaped"));
+            assert_eq!(metadata.latest_version.as_deref(), Some("2.1.1"));
+            assert_eq!(
+                metadata.latest_page_url.as_ref().map(url::Url::as_str),
+                Some("https://example.com/script")
+            );
+        }
+    }
+
+    #[test]
+    fn distribution_parses_escaped_html_and_line_endings_together() {
+        let text = r#"SCRIPTMETA-DIST-BEGIN\nScript-ID=com.example.html\r\nVersion=2.1.1\nLatest-Page-URL=\u003ca href=\"https:\/\/example.com\/script?a=1&amp;b=2\"\u003ehttps:\/\/example.com\/script?a=1&amp;b=2\u003c/a\u003e\nSCRIPTMETA-DIST-END"#;
+        let metadata = parse_distribution_metadata_for_script(text, "com.example.html")
+            .expect("escaped HTML and line endings should parse together");
+
+        assert_eq!(metadata.latest_version.as_deref(), Some("2.1.1"));
+        assert_eq!(
+            metadata.latest_page_url.as_ref().map(url::Url::as_str),
+            Some("https://example.com/script?a=1&b=2")
+        );
+    }
+
+    #[test]
+    fn distribution_preserves_literal_backslashes_and_unknown_escapes() {
+        let script_id = r"com.example\q\\n\\u003c";
+        let text = format!(
+            r"SCRIPTMETA-DIST-BEGIN\nScript-ID={script_id}\nVersion=2.1.1\nSCRIPTMETA-DIST-END"
+        );
+        let metadata = parse_distribution_metadata_for_script(&text, script_id)
+            .expect("literal backslashes should not be recursively decoded");
+
+        assert_eq!(metadata.script_id.as_deref(), Some(script_id));
+        assert_eq!(metadata.latest_version.as_deref(), Some("2.1.1"));
     }
 
     #[test]

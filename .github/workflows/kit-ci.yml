@@ -30,6 +30,8 @@ jobs:
         run: cargo test -p scriptmetakit --all-features --test package_smoke -- --test-threads=1
       - name: Rust directory alias tests
         run: cargo test -p scriptmetakit --all-features --test directory_aliases_smoke
+      - name: Rust file reference watch tests
+        run: cargo test -p scriptmetakit --all-features --test reference_watch_smoke -- --test-threads=1
       - name: Rust FFI tests
         run: cargo test -p scriptmetakit_ffi --all-features --test ffi_smoke
       - name: Build binary XCFramework
@@ -62,4 +64,4 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --all-features
       - name: Build release FFI DLL
-        run: cargo build -p scriptmetakit_ffi --features blocking-http,native-watch --release
+        run: ./script/build_windows.ps1 -Release
