@@ -1,13 +1,14 @@
 {
-  "packageVersion": "1.3.2",
-  "gitRevision": "a1e071fdc4a08922b1ae446694ba0e6ca574cf7c",
+  "packageVersion": "1.3.3",
+  "gitRevision": "649e9c082e4948c8fe12b266ec63e2a0236def79",
   "sourceState": "clean",
-  "sourceTreeSHA256": "a4df8b316233b8c3c4f2e16a4c70b43d250d9692df9d75e5b48c16266404f161",
+  "sourceTreeSHA256": "1f78a8f43f1928f8c5df4838b8a6491cc8515c18c473d7654e7c958025050281",
   "features": "blocking-http,native-watch",
   "architectures": "x86_64 arm64",
-  "dylibSHA256": "8d09e0576d27eee44562cee5d46a76f180520a2e773043211fa690838676b741",
+  "dylibSHA256": "4cf025323e515a676523eb33dd93d872a64341a68434ade1927033a9093ac363",
   "signingTeamIdentifier": "5NFE273M7M",
-  "notarizationSubmissionID": "805b7db5-2f9b-4a5c-ae10-ab060842c879",
+  "nativeLinkValidation": "arm64 and x86_64: aligned string pools, link passed, engine create/free passed",
+  "notarizationSubmissionID": "89e825bb-f65c-4d8e-af32-ac0dba418c02",
   "notarizationStatus": "Accepted",
-  "notarizedArchiveSHA256": "004e4b688cfea380264587edea6f173a7065fa52f7350bc13e1fd14fa2a26984"
+  "notarizedArchiveSHA256": "3043fafbb3579c7d1addc1d55a3b6d357ebb0826a9f6a85df98be6ee851146a7"
 }

@@ -1,0 +1,25 @@
+{
+  "logFormatVersion": 1,
+  "jobId": "89e825bb-f65c-4d8e-af32-ac0dba418c02",
+  "status": "Accepted",
+  "statusSummary": "Ready for distribution",
+  "statusCode": 0,
+  "archiveFilename": "ScriptMetaKitFFI-1.3.3-macos.zip",
+  "uploadDate": "2026-10-06T14:29:34.186Z",
+  "sha256": "3043fafbb3579c7d1addc1d55a3b6d357ebb0826a9f6a85df98be6ee851146a7",
+  "ticketContents": [
+    {
+      "path": "ScriptMetaKitFFI-1.3.3-macos.zip/ScriptMetaKitFFI.xcframework/macos-arm64_x86_64/libscriptmetakit_ffi.dylib",
+      "digestAlgorithm": "SHA-256",
+      "cdhash": "7ac3cba9cb0857f5cdc9d6dddfcfa500df0d9a7e",
+      "arch": "x86_64"
+    },
+    {
+      "path": "ScriptMetaKitFFI-1.3.3-macos.zip/ScriptMetaKitFFI.xcframework/macos-arm64_x86_64/libscriptmetakit_ffi.dylib",
+      "digestAlgorithm": "SHA-256",
+      "cdhash": "bc65fd595756943160c87ce8de910f86c33e803b",
+      "arch": "arm64"
+    }
+  ],
+  "issues": null
+}
