@@ -36,7 +36,7 @@ Build the Universal macOS XCFramework on macOS:
 Build the Windows x64 DLL on Windows:
 
 ```powershell
-./script/build_windows.ps1 -Release
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./script/build_windows.ps1 -Release
 ```
 
 Both builds use the same source, version, and fixed `blocking-http,native-watch` features. See [WindowsReferences.md](WindowsReferences.md) for Shell-link behavior.
