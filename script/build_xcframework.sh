@@ -25,6 +25,9 @@ fi
 
 export PATH="${HOME}/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${ROOT}=. --remap-path-prefix=${HOME}=~"
+# Rust's implicit debuginfo strip can misalign the Mach-O string pool. Keep
+# the linker layout intact; the Apple strip below performs the final reduction.
+export CARGO_PROFILE_RELEASE_STRIP=none
 
 CARGO_BIN="$(command -v cargo || true)"
 if [[ -z "${CARGO_BIN}" ]]; then
@@ -88,6 +91,9 @@ nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_save_cache_file_with_limit$'
 cmp \
   "${ROOT}/scriptmetakit_ffi/include/scriptmetakit_ffi.h" \
   "${STAGED_XCFRAMEWORK_PATH}/macos-arm64_x86_64/Headers/scriptmetakit_ffi.h"
+
+python3 "${ROOT}/script/validate_macos_binary.py" \
+  "${STAGED_XCFRAMEWORK_PATH}/macos-arm64_x86_64/libscriptmetakit_ffi.dylib"
 
 PACKAGE_VERSION="$(awk -F '"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
 GIT_REVISION="$(git rev-parse HEAD)"

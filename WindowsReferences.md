@@ -1,4 +1,4 @@
-# Windows references (1.3.2)
+# Windows references (1.3.3)
 
 Windows Shell links (`.lnk`) are filesystem references in the scanner and native
 watcher. Shell-link resolution is provided internally on Windows without adding
