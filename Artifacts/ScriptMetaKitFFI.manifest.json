@@ -1,13 +1,13 @@
 {
   "packageVersion": "1.3.2",
-  "gitRevision": "e3d00aee0748c1fbca2a73ce3648879d2fd60424",
+  "gitRevision": "a1e071fdc4a08922b1ae446694ba0e6ca574cf7c",
   "sourceState": "clean",
-  "sourceTreeSHA256": "0386fb168048d44a7b25cea4f11e622fe03601f414921a3063db04942693125e",
+  "sourceTreeSHA256": "a4df8b316233b8c3c4f2e16a4c70b43d250d9692df9d75e5b48c16266404f161",
   "features": "blocking-http,native-watch",
   "architectures": "x86_64 arm64",
-  "dylibSHA256": "8b44220edf827c1f6f36bca2f7c71de863eeb3862d555c5ae5895b4aace24cfd",
+  "dylibSHA256": "8d09e0576d27eee44562cee5d46a76f180520a2e773043211fa690838676b741",
   "signingTeamIdentifier": "5NFE273M7M",
-  "notarizationSubmissionID": "831a2af9-c563-4c29-a7f7-3c91516163cd",
+  "notarizationSubmissionID": "805b7db5-2f9b-4a5c-ae10-ab060842c879",
   "notarizationStatus": "Accepted",
-  "notarizedArchiveSHA256": "1d0f60e5387ed2d1a2deb0b62f7166a22b87eff453a0bab7cdaa23266ade941f"
+  "notarizedArchiveSHA256": "004e4b688cfea380264587edea6f173a7065fa52f7350bc13e1fd14fa2a26984"
 }
