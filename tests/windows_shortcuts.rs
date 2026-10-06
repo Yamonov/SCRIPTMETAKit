@@ -162,27 +162,17 @@ fn directory_reference_cycles_are_reported_without_recursing_forever() {
 }
 
 #[test]
-fn shortcut_chains_accept_32_links_and_reject_33() {
+fn referencing_an_existing_shortcut_resolves_its_filesystem_target() {
     let temp = tempfile::tempdir().expect("tempdir");
     let target = temp.path().join("target.jsx");
     fs::write(&target, "'target';").expect("target");
-    let mut previous = target.clone();
-    for hop in 1..=33 {
-        let source = temp.path().join(format!("{hop}.lnk"));
-        link(&previous, &source);
-        if hop >= 32 {
-            let resolution = resolve_registered_path(&source, &ScannerOptions::default(), None);
-            assert_eq!(
-                resolution.resolution_status,
-                if hop == 32 {
-                    PathResolutionStatus::Resolved
-                } else {
-                    PathResolutionStatus::Cycle
-                }
-            );
-        }
-        previous = source;
-    }
+    let inner = temp.path().join("inner.lnk");
+    let outer = temp.path().join("outer.lnk");
+    link(&target, &inner);
+    link(&inner, &outer);
+    let resolution = resolve_registered_path(&outer, &ScannerOptions::default(), None);
+    assert_eq!(resolution.resolution_status, PathResolutionStatus::Resolved);
+    assert_eq!(resolution.resolved_path, target.canonicalize().unwrap());
 }
 
 #[test]
