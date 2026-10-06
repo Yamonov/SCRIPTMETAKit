@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 1.3.1
+# SCRIPTMETAKit 1.3.2
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -8,9 +8,16 @@ Registered macOS aliases and symbolic links can be inspected through the shared 
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.3.1`
-- Rust FFI crate: `scriptmetakit_ffi` `1.3.1`
+- Rust crate: `scriptmetakit` `1.3.2`
+- Rust FFI crate: `scriptmetakit_ffi` `1.3.2`
 - Swift package product: `ScriptMetaKit`
+
+## 1.3.2
+
+- Parses escaped line endings in SCRIPTMETA-DIST blocks embedded in JSON, including note article metadata.
+- Preserves literal backslash pairs and unknown escapes while decoding supported HTML and line-ending escapes in one pass.
+- Adds regression coverage for body-over-head selection, streamed chunk boundaries, and public distribution resolution.
+- Retains the existing C/Swift API, ABI, and metadata-source selection policy.
 
 ## 1.3.1
 

@@ -168,6 +168,30 @@ SCRIPTMETA-DIST-BEGIN Script-ID=com.kojirasetakuma.ai.datamergekit Version=2.5.0
 }
 
 #[test]
+fn resolves_note_body_json_distribution_instead_of_head_description() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("note.html");
+    std::fs::write(
+        &path,
+        include_bytes!("fixtures/note_distribution_escaped.html"),
+    )
+    .expect("write note fixture");
+    let url = url::Url::from_file_path(path).expect("file URL");
+    let resolver = scriptmetakit::DistributionResolver::new(Default::default()).expect("resolver");
+
+    let resolution = resolver
+        .resolve(&url, "ai-linkpanelplus-mini", 123)
+        .expect("note body JSON should resolve");
+
+    assert_eq!(resolution.latest_version.as_deref(), Some("2.1.1"));
+    assert_eq!(
+        resolution.latest_page_url.as_ref().map(url::Url::as_str),
+        Some("https://note.com/nice_lotus120/n/n7ac58d4d86f6")
+    );
+    assert!(!resolution.is_unresolved);
+}
+
+#[test]
 fn parses_html_distribution_metadata_from_note_body() {
     let metadata = scriptmetakit::parse_distribution_metadata_for_script(
         r#"
