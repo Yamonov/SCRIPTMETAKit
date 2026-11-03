@@ -1,10 +1,10 @@
 use std::time::Duration;
+use std::{collections::BTreeMap, sync::atomic::AtomicU64};
 use std::{
-    collections::BTreeMap,
     fmt,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 

@@ -3,3 +3,7 @@
 build/
 target/
 scriptmetakitApp/
+**/xcuserdata/
+*.xcuserstate
+__pycache__/
+*.py[cod]

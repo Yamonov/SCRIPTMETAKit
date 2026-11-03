@@ -14,8 +14,8 @@ use scriptmetakit_ffi::{
     SmkScanChangeInfo, SmkScanResult, SmkScriptItemSlice, SmkScriptMetaBackupGenerationSlice,
     SmkScriptMetaBackupRecord, SmkScriptMetadataDraft, SmkScriptMetadataEditPreviewResult,
     SmkScriptMetadataFileWriteResult, SmkScriptMetadataWriteRequest, SmkStatus, SmkUpdateCheckInfo,
-    SmkUpdateProgress, SmkUpdateStatusEntrySlice, SmkUtf8Slice, SmkWatchDeliveryInfo,
-    smk_compare_versions, smk_edit_result_backup_generations, smk_edit_result_backup_record,
+    SmkUpdateProgress, SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_compare_versions,
+    smk_edit_result_backup_generations, smk_edit_result_backup_record,
     smk_edit_result_file_write_result, smk_edit_result_free,
     smk_edit_result_metadata_edit_preview_result, smk_edit_result_text,
     smk_engine_cancel_current_operation, smk_engine_cancel_current_or_reserved_operation,
@@ -36,17 +36,17 @@ use scriptmetakit_ffi::{
     smk_scan_result_file_lists, smk_scan_result_free, smk_scan_result_items,
     smk_scan_result_operation_info, smk_scan_result_root_revisions, smk_scan_result_roots,
     smk_scan_result_update_info, smk_scan_result_update_resolutions,
-    smk_scan_result_update_statuses, smk_scan_result_watch_delivery_info,
-    smk_validate_edit_password_sha256_format, smk_validate_version_string,
+    smk_scan_result_update_statuses, smk_validate_edit_password_sha256_format,
+    smk_validate_version_string,
 };
 #[cfg(unix)]
 use scriptmetakit_ffi::{SmkPathResolution, smk_resolve_registered_path};
 #[cfg(feature = "native-watch")]
 use scriptmetakit_ffi::{
-    smk_engine_poll_watcher_scan, smk_engine_poll_watcher_scan_dirty_only,
+    SmkWatchDeliveryInfo, smk_engine_poll_watcher_scan, smk_engine_poll_watcher_scan_dirty_only,
     smk_engine_start_watching, smk_engine_start_watching_with_callback,
     smk_engine_start_watching_with_callback_v2, smk_engine_stop_watching,
-    smk_engine_watcher_requires_restart,
+    smk_engine_watcher_requires_restart, smk_scan_result_watch_delivery_info,
 };
 
 #[test]

@@ -29,6 +29,7 @@ static dispatch_queue_t smk_dispatch_io_queue(void) {
 void *smk_dispatch_io_open(
     const char *path,
     size_t high_water,
+    size_t read_limit,
     void *data_context,
     void *cleanup_context,
     smk_dispatch_io_data_handler data_handler,
@@ -53,7 +54,7 @@ void *smk_dispatch_io_open(
     dispatch_io_read(
         channel,
         0,
-        SIZE_MAX,
+        read_limit,
         queue,
         ^(bool done, dispatch_data_t data, int error) {
             if (data != NULL) {

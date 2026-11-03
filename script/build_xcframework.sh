@@ -9,6 +9,7 @@ readonly PROFILE="release"
 readonly OUT_DIR="${ROOT}/Artifacts"
 readonly XCFRAMEWORK_PATH="${OUT_DIR}/ScriptMetaKitFFI.xcframework"
 readonly MANIFEST_PATH="${OUT_DIR}/ScriptMetaKitFFI.manifest.json"
+readonly SIGNING_IDENTITY="${SCRIPTMETAKIT_SIGNING_IDENTITY:--}"
 
 mkdir -p "${OUT_DIR}"
 BUILD_DIR="$(mktemp -d "${OUT_DIR}/.scriptmetakit-xcframework.XXXXXX")"
@@ -24,7 +25,8 @@ if [[ -n "${FEATURES:-}" && "${FEATURES}" != "${RELEASE_FEATURES}" ]]; then
 fi
 
 export PATH="${HOME}/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
-export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${ROOT}=. --remap-path-prefix=${HOME}=~"
+export CARGO_ENCODED_RUSTFLAGS="$(python3 script/build_support.py rust-flags)"
+export MACOSX_DEPLOYMENT_TARGET=13.0
 # Rust's implicit debuginfo strip can misalign the Mach-O string pool. Keep
 # the linker layout intact; the Apple strip below performs the final reduction.
 export CARGO_PROFILE_RELEASE_STRIP=none
@@ -64,30 +66,34 @@ lipo -create \
   -output "${UNIVERSAL_DYLIB}"
 install_name_tool -id "@rpath/libscriptmetakit_ffi.dylib" "${UNIVERSAL_DYLIB}"
 strip -S -x "${UNIVERSAL_DYLIB}"
+if [[ "${SIGNING_IDENTITY}" == "-" ]]; then
+  codesign --force --sign - --identifier org.iwashi.SCRIPTMETAKit.ffi "${UNIVERSAL_DYLIB}"
+  SIGNATURE_KIND="ad-hoc"
+else
+  codesign --force --sign "${SIGNING_IDENTITY}" --identifier org.iwashi.SCRIPTMETAKit.ffi \
+    --options runtime --timestamp "${UNIVERSAL_DYLIB}"
+  SIGNATURE_KIND="identity"
+fi
+codesign --verify --strict "${UNIVERSAL_DYLIB}"
 
 xcodebuild -create-xcframework \
   -library "${UNIVERSAL_DYLIB}" \
   -headers "${HEADERS_DIR}" \
   -output "${STAGED_XCFRAMEWORK_PATH}"
 
+if [[ "${SIGNING_IDENTITY}" == "-" ]]; then
+  codesign --force --sign - --identifier ScriptMetaKitFFI "${STAGED_XCFRAMEWORK_PATH}"
+else
+  codesign --force --sign "${SIGNING_IDENTITY}" --identifier ScriptMetaKitFFI \
+    --timestamp "${STAGED_XCFRAMEWORK_PATH}"
+fi
+codesign --verify --deep --strict "${STAGED_XCFRAMEWORK_PATH}"
+
 ARCHITECTURES="$(lipo -archs "${UNIVERSAL_DYLIB}")"
 if [[ " ${ARCHITECTURES} " != *" arm64 "* || " ${ARCHITECTURES} " != *" x86_64 "* ]]; then
   echo "Unexpected XCFramework architectures: ${ARCHITECTURES}" >&2
   exit 1
 fi
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_create_default$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_resolve_registered_path$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_write_script_metadata_file_if_unchanged$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_file_list_directory_state_ranges$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_set_operational_policy$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_start_watching_with_callback$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_start_watching_with_callback_v2$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_root_revisions$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_file_list_details$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_scan_result_watch_delivery_info$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_preflight_root$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_load_cache_file_with_limit$'
-nm -gU "${UNIVERSAL_DYLIB}" | grep -q '_smk_engine_save_cache_file_with_limit$'
 cmp \
   "${ROOT}/scriptmetakit_ffi/include/scriptmetakit_ffi.h" \
   "${STAGED_XCFRAMEWORK_PATH}/macos-arm64_x86_64/Headers/scriptmetakit_ffi.h"
@@ -101,14 +107,7 @@ SOURCE_STATE="clean"
 if [[ -n "$(git status --porcelain --untracked-files=normal -- . ':(exclude)Artifacts')" ]]; then
   SOURCE_STATE="dirty"
 fi
-SOURCE_TREE_SHA256="$({
-  git ls-files --cached --others --exclude-standard \
-    | grep -Ev '^(Artifacts/|target/|\.build/)' \
-    | LC_ALL=C sort \
-    | while IFS= read -r source_path; do
-        shasum -a 256 "${source_path}"
-      done
-} | shasum -a 256 | awk '{print $1}')"
+SOURCE_TREE_SHA256="$(python3 script/build_support.py source-hash)"
 DYLIB_SHA256="$(shasum -a 256 "${UNIVERSAL_DYLIB}" | awk '{print $1}')"
 cat > "${STAGED_MANIFEST_PATH}" <<MANIFEST
 {
@@ -116,8 +115,11 @@ cat > "${STAGED_MANIFEST_PATH}" <<MANIFEST
   "gitRevision": "${GIT_REVISION}",
   "sourceState": "${SOURCE_STATE}",
   "sourceTreeSHA256": "${SOURCE_TREE_SHA256}",
+  "sourceHashFormatVersion": 2,
+  "sourceHashScope": "build inputs, source, tests and fixtures, resources and CI; excludes documentation",
   "features": "${RELEASE_FEATURES}",
   "architectures": "${ARCHITECTURES}",
+  "signatureKind": "${SIGNATURE_KIND}",
   "dylibSHA256": "${DYLIB_SHA256}"
 }
 MANIFEST

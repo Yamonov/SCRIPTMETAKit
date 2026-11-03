@@ -14,6 +14,7 @@ jobs:
         with:
           toolchain: 1.94.0
           components: clippy,rustfmt
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Install cargo-about
         run: cargo install --locked --features cli --version 0.9.1 cargo-about
       - name: Verify third-party licenses
@@ -21,19 +22,11 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --all --check
       - name: Rust default feature boundary
-        run: cargo check --workspace --no-default-features
+        run: cargo check --workspace --no-default-features --locked
       - name: Rust lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Rust unit tests
-        run: cargo test --workspace --all-features --lib
-      - name: Rust package tests
-        run: cargo test -p scriptmetakit --all-features --test package_smoke -- --test-threads=1
-      - name: Rust directory alias tests
-        run: cargo test -p scriptmetakit --all-features --test directory_aliases_smoke
-      - name: Rust file reference watch tests
-        run: cargo test -p scriptmetakit --all-features --test reference_watch_smoke -- --test-threads=1
-      - name: Rust FFI tests
-        run: cargo test -p scriptmetakit_ffi --all-features --test ffi_smoke
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: All Rust and C ABI regression tests
+        run: cargo test --workspace --all-features --locked -- --test-threads=1
       - name: Validate the committed macOS binary for both CPUs
         run: python3 script/validate_macos_binary.py Artifacts/ScriptMetaKitFFI.xcframework/macos-arm64_x86_64/libscriptmetakit_ffi.dylib
       - name: Build binary XCFramework
@@ -48,6 +41,13 @@ jobs:
         run: swift test -Xswiftc -swift-version -Xswiftc 5
       - name: Swift 6 strict concurrency
         run: swift test -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -strict-concurrency=complete
+      - name: Xcode package embedding and headless application smoke
+        run: |
+          xcodebuild -workspace tests/integration/KitIntegration.xcworkspace \
+            -scheme KitIntegration -configuration Release -destination 'platform=macOS' \
+            -derivedDataPath build/kit-integration build
+          codesign --verify --deep --strict build/kit-integration/Build/Products/Release/KitIntegration.app
+          build/kit-integration/Build/Products/Release/KitIntegration.app/Contents/MacOS/KitIntegration
 
   windows:
     runs-on: windows-latest
@@ -58,12 +58,12 @@ jobs:
           toolchain: 1.94.0
           components: clippy,rustfmt
       - name: Rust default feature boundary
-        run: cargo check --workspace --no-default-features
+        run: cargo check --workspace --no-default-features --locked
       - name: Rust all feature boundary
-        run: cargo check --workspace --all-features
+        run: cargo check --workspace --all-features --locked
       - name: Rust lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Rust tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
       - name: Build release FFI DLL
         run: ./script/build_windows.ps1 -Release

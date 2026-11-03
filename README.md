@@ -1,16 +1,85 @@
-# SCRIPTMETAKit 1.3.3
+# SCRIPTMETAKit 2.0.0
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
-The 1.0 release is intended for use by Scripta, ACEMenuPlus, and other consumer applications that need a reusable SCRIPTMETA engine across platforms.
+Scripta, ACEMenuPlus and other consumer applications share the same metadata rules
+through the Rust core, C ABI and macOS Swift package.
 
 Registered macOS aliases, Windows Shell links (`.lnk`), and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. OS-specific resolution and native notifications are compiled only on their corresponding platforms.
 
+## 2.0.0 macOS package
+
+Version 2.0.0 adds common `Tags`, BCP 47 metadata localization,
+explicit ordered language preferences, and per-root watch suspension with a fresh
+reload on resume. This release provides the macOS Swift package and Universal
+XCFramework. Windows application integration and release binaries will follow separately.
+
+The Swift package requires Swift 6.1 / Xcode 16.3 or later and targets macOS 13 or
+later. Swift 5 and Swift 6 language modes are supported. The macOS binary contains
+arm64 and x86_64 slices. The Windows DLL uses the same C ABI and shared Rust core.
+
+Use `https://github.com/Yamonov/SCRIPTMETAKit.git` and version **2.0.0** in Xcode.
+An existing dependency rule starting at 1.3.3 and allowing updates up to the next
+major version excludes 2.0.0; change its minimum version to 2.0.0 when upgrading.
+
+- Consumers supply priorities, such as `ja`, `en`, `fr`. The Kit never obtains OS/UI languages.
+- Normal results retain selected Name, Author and Description only, plus Tags and selection diagnostics.
+- Changing canonical preferences invalidates language-dependent caches. Scan again to reload source files.
+- Full editing drafts preserve all translations; Description remains the complete raw multilingual body.
+- Repeated valid localized text is concatenated, including identical content. Tags instead merge with exact deduplication.
+- The C ABI additions leave legacy public struct layouts unchanged. Cache schema 4 / projection 4 identifies the language and metadata-read context.
+
+See [Tags and localization](docs/TagsLocalization.md) for syntax and APIs.
+See [Swift application API](docs/SwiftApplicationAPI.md) for configuration, text
+parsing/editing, validation, cache invalidation and external change notifications.
+See [macOS package integration](docs/MacOSIntegration-2.0.md) and
+[2.0 release validation](docs/Release2.0Validation.md) for embedding requirements,
+the reproducible Xcode consumer and the final verification scope.
+
+Apple Silicon-only sample:
+
+```sh
+cargo run --locked --target aarch64-apple-darwin --example localized_scan
+```
+
+The sample passes `ja`, `en`, `fr` directly and reads only the bundled fixture folder
+(or an explicitly supplied folder argument). It does not execute scripts or check remote updates.
+
+For the Swift SDK, build an isolated native test package without replacing the
+committed Universal XCFramework:
+
+```sh
+python3 script/build_arm64_test_package.py
+```
+
+Use the printed `ARM64_TEST_PACKAGE` path for SwiftPM build/test. Consumers can
+also set `SCRIPT_META_KIT_FFI_PATH` to a local development XCFramework path when
+using the main package manifest. For an application dependency, use the main
+package with its matching Universal artifact. Rebuild it with
+`script/build_xcframework.sh` after changing Rust or C code.
+
 ## Package Version
 
-- Rust crate: `scriptmetakit` `1.3.3`
-- Rust FFI crate: `scriptmetakit_ffi` `1.3.3`
+- Rust crate: `scriptmetakit` `2.0.0`
+- Rust FFI crate: `scriptmetakit_ffi` `2.0.0`
 - Swift package product: `ScriptMetaKit`
+- C ABI generation: `1` (existing layouts/calls retained; additions are additive)
+
+## 2.0.0
+
+- Adds Tags and explicit BCP 47 metadata language selection, with full-language editing preservation.
+- Exposes safe configuration, metadata text tools, validation, cache invalidation and change notifications to Swift.
+- Retains selected metadata only during normal operation and shares immutable data between result views.
+- Uses lightweight revision queries for Workspace cache bookkeeping instead of converting complete file trees and metadata.
+- Finishes watch streams and cancels delayed saves when a Workspace is released. Idle watching is notification-driven.
+- Bounds native macOS metadata-source read-ahead by the configured source-byte limit.
+- Uses notification-driven source-load cancellation, including Windows builds without HTTP support.
+- Makes `cacheNetworkResponses` effective; its default is true to preserve prior conditional HTTP revalidation. Disabling it or global memory caching prevents response retention between checks.
+- Treats incompatible version/language/read-context caches as expected misses. C cache loads return `SMK_STATUS_CACHE_INCOMPATIBLE`; Workspace discards those derived caches without a failure diagnostic.
+- Adds `pauseWatching(rootIDs:)`, `resumeWatching(rootIDs:)` and `isWatchingPaused(rootID:)` to Engine and Workspace. Resume rereads changed roots before returning and keeps incomplete batches paused.
+- Prevents stale watch-result publication across pause/resume, honors dirty scopes during progressive reconciliation, and avoids duplicate source reads and catalog-index copies during root control.
+- Joins retired native watchers after releasing the engine mutex, allowing notification callbacks to query the C API safely.
+- Validates all public C exports, both macOS slices, install names, deployment targets and runtime version/capabilities before installing an artifact.
 
 ## 1.3.3
 

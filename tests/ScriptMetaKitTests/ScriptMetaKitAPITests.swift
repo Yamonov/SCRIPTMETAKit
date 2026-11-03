@@ -340,7 +340,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
 
     func testRuntimeVersionIsOne() {
         XCTAssertEqual(ScriptMetaKitRuntime.apiVersion, 1)
-        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "1.3.3")
+        XCTAssertEqual(ScriptMetaKitRuntime.packageVersion, "2.0.0")
     }
 
     func testRuntimeAcknowledgementSummaryIsConciseAndLinksToComponents() {

@@ -21,6 +21,7 @@ unsafe extern "C" {
     fn smk_dispatch_io_open(
         path: *const c_char,
         high_water: usize,
+        read_limit: usize,
         data_context: *mut c_void,
         cleanup_context: *mut c_void,
         data_handler: unsafe extern "C" fn(*mut c_void, *const c_void, usize, bool, c_int),
@@ -112,7 +113,9 @@ pub struct CancelableFileReader {
 }
 
 impl CancelableFileReader {
-    pub fn open(path: &Path, chunk_bytes: usize) -> io::Result<Self> {
+    /// `read_limit` bounds native read-ahead as well as queued owned chunks.
+    /// The caller may request one extra byte to detect a source-size overflow.
+    pub fn open(path: &Path, chunk_bytes: usize, read_limit: usize) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -123,6 +126,12 @@ impl CancelableFileReader {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Dispatch I/O chunk size must be greater than zero",
+            ));
+        }
+        if read_limit == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file read limit must be greater than zero",
             ));
         }
 
@@ -150,6 +159,7 @@ impl CancelableFileReader {
             smk_dispatch_io_open(
                 path.as_ptr(),
                 chunk_bytes,
+                read_limit,
                 data_context,
                 cleanup_context,
                 receive_data,
@@ -259,5 +269,50 @@ impl Drop for CancelableFileReader {
         } else {
             drop(cleaned);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs::File, thread, time::Instant};
+
+    #[test]
+    fn native_read_ahead_stays_within_the_source_budget_without_a_consumer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-source");
+        File::create(&path)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let budget = 64 * 1024 + 1;
+        let reader = CancelableFileReader::open(&path, 16 * 1024, budget).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !reader.state.completed.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(reader.state.completed.load(Ordering::Acquire));
+        let mut queued_bytes = 0;
+        let mut completed = false;
+        while !completed {
+            let event = reader
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            match event {
+                ReadEvent::Data(bytes) => queued_bytes += bytes.len(),
+                ReadEvent::Complete(result) => {
+                    result.unwrap();
+                    completed = true;
+                }
+            }
+        }
+        assert_eq!(queued_bytes, budget);
+        assert!(completed);
+    }
+
+    #[test]
+    fn rejects_an_empty_read_budget() {
+        assert!(CancelableFileReader::open(Path::new("/tmp/unused"), 1024, 0).is_err());
     }
 }

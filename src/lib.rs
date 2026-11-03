@@ -22,11 +22,13 @@ pub use catalog::{
     path_based_root_id,
 };
 pub use core::{
-    DistributionMetadata, DistributionResolution, FileIssue, OperationCancellation,
+    DistributionMetadata, DistributionResolution, FileIssue, LanguagePreferences,
+    MetadataDiagnostic, MetadataEditExtensions, MetadataPresentation, OperationCancellation,
     OperationCancellationReservation, OperationStatus, OperationSummary, ParserOptions,
     ScriptMetaEditCapability, ScriptMetaEditState, ScriptMetaItem, ScriptMetaItemRef,
     ScriptMetaKitError, ScriptMetaKitResult, ScriptMetadata, ScriptRuntimeKind, VersionOrdering,
-    compare_versions, decode_script_text, decode_script_text_strict, normalize_metadata_url,
+    compare_versions, decode_script_text, decode_script_text_strict, is_valid_metadata_tag,
+    normalize_language_tag, normalize_metadata_tags, normalize_metadata_url,
     normalize_version_string, parse_distribution_metadata, parse_distribution_metadata_for_script,
     parse_distribution_metadata_records, parse_script_metadata, parse_script_metadata_with_options,
 };
@@ -47,7 +49,7 @@ pub use editkit::{
     write_script_metadata_to_file, write_script_metadata_to_file_if_unchanged,
     write_script_metadata_to_text,
 };
-pub use engine::ScriptMetaKitEngine;
+pub use engine::{EngineConfigurationChange, ScriptMetaKitEngine};
 pub use formats::{
     CommentSyntax, ScriptFileInfo, ScriptFileInspection, ScriptFormatKind, ScriptFormatSpec,
     all_format_specs, comment_syntax_for_path, detect_script_file, format_for_path,
@@ -104,6 +106,6 @@ mod tests {
     #[test]
     fn exposes_package_metadata() {
         assert_eq!(package_name(), "scriptmetakit");
-        assert_eq!(package_version(), "1.3.3");
+        assert_eq!(package_version(), "2.0.0");
     }
 }
