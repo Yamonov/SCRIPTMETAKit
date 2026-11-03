@@ -4,9 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     LanguagePreferences, MetadataDiagnostic, MetadataEditExtensions, MetadataPresentation,
-    append_value, description_starts_with_language_label, description_translations, diagnostic,
-    is_block_marker, is_valid_metadata_tag, item_separator, normalize_language_tag,
-    normalized_newlines, select_text,
+    append_value, description_translations, diagnostic, is_block_marker, is_valid_metadata_tag,
+    item_separator, normalize_language_tag, normalized_newlines, select_text,
 };
 
 #[derive(Clone, Debug)]
@@ -179,7 +178,7 @@ pub(crate) fn metadata_sections(body: &str) -> MetadataSections {
             };
             entries.push(ScalarValue {
                 language: None,
-                value: value.to_owned(),
+                value: raw.trim_start()[separator + 1..].to_owned(),
                 line: index + 1,
             });
             // Legacy compact fields remain available only in legacy documents.
@@ -188,14 +187,14 @@ pub(crate) fn metadata_sections(body: &str) -> MetadataSections {
             result.has_extensions = true;
             result.names.push(ScalarValue {
                 language: Some(language.to_owned()),
-                value: value.to_owned(),
+                value: raw.trim_start()[separator + 1..].to_owned(),
                 line: index + 1,
             });
         } else if let Some(language) = localized_key(key, "Author") {
             result.has_extensions = true;
             result.authors.push(ScalarValue {
                 language: Some(language.to_owned()),
-                value: value.to_owned(),
+                value: raw.trim_start()[separator + 1..].to_owned(),
                 line: index + 1,
             });
         } else {
@@ -210,14 +209,6 @@ pub(crate) fn metadata_sections(body: &str) -> MetadataSections {
             None,
             None,
         );
-    }
-    if !result.has_extensions
-        && result
-            .raw_description
-            .as_deref()
-            .is_some_and(description_starts_with_language_label)
-    {
-        result.has_extensions = true;
     }
     result.legacy_body = legacy
         .into_iter()
@@ -245,7 +236,7 @@ fn scalar_values(
     default_language: Option<&str>,
     field: &str,
     diagnostics: &mut Vec<MetadataDiagnostic>,
-    keep_invalid: bool,
+    for_editing: bool,
 ) -> (Option<String>, BTreeMap<String, String>) {
     let mut values = BTreeMap::<String, String>::new();
     let mut plain = String::new();
@@ -262,7 +253,7 @@ fn scalar_values(
     }
     for entry in entries
         .iter()
-        .filter(|entry| !entry.value.trim().is_empty())
+        .filter(|entry| for_editing || !entry.value.trim().is_empty())
     {
         let language = match &entry.language {
             Some(raw) => match normalize_language_tag(raw) {
@@ -275,7 +266,7 @@ fn scalar_values(
                         Some(raw),
                         Some(entry.line),
                     );
-                    if keep_invalid {
+                    if for_editing {
                         Some(raw.clone())
                     } else {
                         continue;
@@ -301,13 +292,20 @@ fn scalar_values(
                 Some(entry.line),
             );
         }
-        append_value(target, &entry.value, " ");
+        if for_editing {
+            if !target.is_empty() && !entry.value.is_empty() {
+                target.push(' ');
+            }
+            target.push_str(&entry.value);
+        } else {
+            append_value(target, entry.value.trim(), " ");
+        }
     }
     let default = if has_plain {
         if let Some(language) = default_language {
             values.remove(language)
         } else {
-            (!plain.is_empty()).then_some(plain)
+            (for_editing || !plain.is_empty()).then_some(plain)
         }
     } else {
         None
@@ -400,7 +398,12 @@ impl MetadataSections {
                     None,
                 ),
             }
-        } else if self.has_extensions {
+        } else if self
+            .names
+            .iter()
+            .chain(&self.authors)
+            .any(|value| value.language.is_some())
+        {
             diagnostic(
                 &mut presentation.diagnostics,
                 "missing_default_language",
@@ -447,7 +450,12 @@ impl MetadataSections {
         } else {
             (legacy_author.map(str::to_owned), BTreeMap::new())
         };
-        if self.has_extensions
+        if (self.default_language.is_some()
+            || self
+                .names
+                .iter()
+                .chain(&self.authors)
+                .any(|value| value.language.is_some()))
             && name_default
                 .as_deref()
                 .is_none_or(|name| name.trim().is_empty())

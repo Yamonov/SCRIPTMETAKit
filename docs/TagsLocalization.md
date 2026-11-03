@@ -1,6 +1,7 @@
 # Tags and metadata localization
 
-SCRIPTMETAKit 2.0.0.
+SCRIPTMETAKit 2.0.1.
+See [field requirements and relationships](MetadataFieldRules.md) for required and optional items.
 See [release validation](Release2.0Validation.md) for the current macOS Universal
 package and verified architectures.
 
@@ -38,8 +39,8 @@ With a valid `Meta-Default-language`, text before the first valid language label
 belongs to that default language; the initial label may be omitted. For example,
 with `Meta-Default-language=ja`, `日本語\n[en]\nEnglish` contains Japanese and
 English sections. The default field can appear before or after Description.
-Without a valid default language, the first nonempty line must be a valid label
-to enable localized parsing; otherwise the entire body remains default text.
+Without a valid default language, the entire Description remains ordinary text,
+including leading language-looking labels and literal backslashes.
 A body containing no valid labels always remains plain default text. Ordinary
 headings such as `[Note]` are text. Description outer markers retain their
 canonical case.
@@ -97,14 +98,15 @@ candidates, before using the metadata default. Thus an English name and a French
 description can be returned together when the caller supplies `ja, en, fr`.
 No configured languages means metadata defaults. Missing/empty values fall back;
 unavailable Description/Author remains absent. Names in old/incomplete documents
-can be displayed via existing filename fallback, but new-format saves require
-a nonempty unqualified Name and a valid default language.
+can be displayed via existing filename fallback. Localized saves require
+a nonempty unqualified Name and a valid default language; Tags alone require neither.
 
 The consumer owns OS preference acquisition and change detection. The Kit does
 not read OS languages, application localizations or environment locale values.
 After changing priorities, request a new scan; old language projections are not
 reused. Cache schema 4 includes the canonical language order and projection
-version and metadata-read settings. Projection version 4 includes the parser,
+version and metadata-read settings. Projection version 5 also makes Description
+without a valid default language ordinary text. Projection version 4 included the parser,
 file-filter and inspection settings, in addition to correct partial-file decoding
 and recognition of an implicit default Description section.
 Old/context-mismatched metadata caches require a source rescan.
@@ -138,12 +140,17 @@ preserves extensions found in the original for legacy callers. An explicit
 extensions value is authoritative; an empty Tags array clears all Tags fields.
 Unrelated edits preserve tag fragments and every Description language.
 
-New-feature writes require Name and Meta-Default-language; legacy-only writes
-retain their previous requirements. Invalid new language identifiers, reserved
+Localized writes require Name and Meta-Default-language; Tags and legacy-only
+writes retain their independent requirements. Empty localized Name/Author fields
+are retained as language declarations but are not selected for display. Invalid new language identifiers, reserved
 Tags, line breaks in scalar names/authors, and ending-marker injection are
 rejected. Unclosed/repeated outer Description blocks require repair before an
 edit, avoiding silent loss of their contents. Conditional writes reject external
 source changes.
+
+See [multilingual editing API](LocalizationEditingAPI.md) for safe default-language
+changes, Description section editing, empty languages and returning the last
+language to ordinary fields.
 
 ## C ABI
 

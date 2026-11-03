@@ -81,7 +81,7 @@ private enum KitIntegrationProbe {
         }
 
         let info = try ScriptMetaKitRuntime.linkedRuntimeInfo()
-        precondition(info.packageVersion == "2.0.0" && info.apiVersion == 1)
+        precondition(info.packageVersion == "2.0.1" && info.apiVersion == 1)
         precondition(info.nativeWatch && info.httpUpdates)
         precondition(!ScriptMetaKitRuntime.acknowledgementsText.isEmpty)
         precondition(!ScriptMetaKitRuntime.acknowledgementsSummaryText.isEmpty)

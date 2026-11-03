@@ -221,13 +221,6 @@ pub(crate) fn description_label(line: &str) -> Option<(&str, &str)> {
     Some((language, &rest[end + 1..]))
 }
 
-pub(crate) fn description_starts_with_language_label(body: &str) -> bool {
-    body.split(['\r', '\n'])
-        .find(|line| !line.trim().is_empty())
-        .and_then(|line| description_label(line.trim_start()))
-        .is_some_and(|(language, _)| normalize_language_tag(language).is_ok())
-}
-
 pub(crate) fn description_translations(
     body: &str,
     default_language: Option<&str>,
@@ -235,16 +228,14 @@ pub(crate) fn description_translations(
 ) -> Option<BTreeMap<String, String>> {
     let normalized = normalized_newlines(body);
     let default_language = default_language.and_then(|value| normalize_language_tag(value).ok());
-    let starts_with_label = description_starts_with_language_label(&normalized);
-    if !starts_with_label
-        && (default_language.is_none()
-            || !normalized.lines().any(|line| {
-                description_label(line.trim_start())
-                    .is_some_and(|(language, _)| normalize_language_tag(language).is_ok())
-            }))
+    if default_language.is_none()
+        || !normalized.lines().any(|line| {
+            description_label(line.trim_start())
+                .is_some_and(|(language, _)| normalize_language_tag(language).is_ok())
+        })
     {
-        // No usable default means an unlabeled preamble is legacy text. A body
-        // with no actual labels also stays literal, including its backslashes.
+        // Localized metadata requires an explicit default. Without it, legacy
+        // text (including leading [en] or literal backslashes) remains literal.
         return None;
     }
     let mut result = BTreeMap::<String, String>::new();
@@ -424,7 +415,7 @@ mod tests {
     fn repeated_description_is_joined_even_when_identical() {
         let mut diagnostics = Vec::new();
         let result =
-            description_translations("[en]same\n[EN]\nsame", None, &mut diagnostics).unwrap();
+            description_translations("[en]same\n[EN]\nsame", Some("en"), &mut diagnostics).unwrap();
         assert_eq!(result["en"], "same\n\nsame");
     }
 
@@ -432,7 +423,7 @@ mod tests {
     fn escaped_label_and_unknown_backslash_sequences_remain_text() {
         let result = description_translations(
             "[ja]\n\\[en\\] C:\\temp\\new\n[en]English",
-            None,
+            Some("ja"),
             &mut Vec::new(),
         )
         .unwrap();
@@ -443,7 +434,7 @@ mod tests {
     fn nonlanguage_brackets_remain_description_content() {
         let result = description_translations(
             "[ja]日本語\n[jp]invalid\n[en]English",
-            None,
+            Some("ja"),
             &mut Vec::new(),
         )
         .unwrap();

@@ -15,7 +15,7 @@ use crate::{
 
 pub const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 // Version 4 also records the parser/scanner configuration used for cached data.
-const METADATA_PROJECTION_VERSION: u32 = 4;
+const METADATA_PROJECTION_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheSchema {

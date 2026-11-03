@@ -6,6 +6,11 @@ pub mod core;
 pub mod editkit;
 pub mod engine;
 pub mod formats;
+pub mod localization_edit;
+pub use localization_edit::{
+    LocalizedMetadataText, MetadataLocalizationEditor, MetadataLocalizationOperation,
+    MetadataLocalizedField,
+};
 pub mod resolver;
 pub mod scanner;
 pub mod storage;
@@ -106,6 +111,6 @@ mod tests {
     #[test]
     fn exposes_package_metadata() {
         assert_eq!(package_name(), "scriptmetakit");
-        assert_eq!(package_version(), "2.0.0");
+        assert_eq!(package_version(), "2.0.1");
     }
 }

@@ -189,3 +189,56 @@ fn cache_revision_query_matches_full_results_without_serializing_metadata() {
         ffi::smk_engine_free(engine);
     }
 }
+
+#[test]
+fn localization_editor_services_preserve_tags_and_explicitly_clear_last_language() {
+    let draft = serde_json::json!({
+        "script_id":"ffi.editor", "name":"日本語", "author":"作者", "description":"[ja]説明\n[en]Description",
+        "extensions":{"default_language":"ja","names":{"en":"English"},"authors":{},"tags":["image","画像"]}
+    }).to_string();
+    // SAFETY: owned UTF-8 inputs remain live, and response frees every result including errors.
+    unsafe {
+        let (status, mut editor) =
+            response(|out| ffi::smk_metadata_localization_read(input(&draft), out));
+        assert_eq!(status, ffi::SmkStatus::Ok);
+        for operation in [
+            serde_json::json!({"operation":"add_language","language":"fr"}),
+            serde_json::json!({"operation":"set_text","field":"description","language":"fr","value":"\n[en]literal\n"}),
+            serde_json::json!({"operation":"set_default_language","language":"en"}),
+            serde_json::json!({"operation":"remove_language","language":"fr"}),
+            serde_json::json!({"operation":"remove_language","language":"ja"}),
+            serde_json::json!({"operation":"clear_default_language"}),
+        ] {
+            let operation = operation.to_string();
+            let (status, updated) = response(|out| {
+                ffi::smk_metadata_localization_edit(input(&editor), input(&operation), out)
+            });
+            assert_eq!(status, ffi::SmkStatus::Ok, "{updated}");
+            editor = updated;
+        }
+        let (status, applied) = response(|out| {
+            ffi::smk_metadata_localization_apply(input(&editor), input(&draft), out)
+        });
+        assert_eq!(status, ffi::SmkStatus::Ok, "{applied}");
+        let applied: serde_json::Value = serde_json::from_str(&applied).unwrap();
+        assert_eq!(applied["name"], "English");
+        assert_eq!(applied["description"], "Description");
+        assert!(applied["extensions"]["default_language"].is_null());
+        assert_eq!(
+            applied["extensions"]["tags"],
+            serde_json::json!(["image", "画像"])
+        );
+        let (status, _) = response(|out| {
+            ffi::smk_metadata_localization_edit(
+                input(&editor),
+                input("{\"operation\":\"add_language\",\"language\":\"jp\"}"),
+                out,
+            )
+        });
+        assert_eq!(status, ffi::SmkStatus::InvalidArgument);
+        assert_eq!(
+            ffi::smk_metadata_localization_read(input(&draft), ptr::null_mut()),
+            ffi::SmkStatus::NullArgument
+        );
+    }
+}

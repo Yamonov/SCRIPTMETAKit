@@ -177,6 +177,14 @@ fn edit_extensions_roundtrip_without_losing_other_languages() {
             .find(|item| text(item.language) == "en")
             .unwrap();
         english.value = input("Updated English");
+        names.push(ffi::SmkLocalizedText {
+            language: input("it"),
+            value: input(""),
+        });
+        names.push(ffi::SmkLocalizedText {
+            language: input("es"),
+            value: input("  \t"),
+        });
         extensions.names = ffi::SmkLocalizedTextSlice {
             ptr: names.as_ptr(),
             len: names.len(),
@@ -201,6 +209,8 @@ fn edit_extensions_roundtrip_without_losing_other_languages() {
         let _written = Edit(written);
         let source = fs::read_to_string(&file).unwrap();
         assert!(source.contains("Name[en]=Updated English"));
+        assert!(source.contains("Name[it]=\n"));
+        assert!(source.contains("Name[es]=  \t\n"));
         assert!(source.contains("Name[fr]=Français"));
         assert!(source.contains("German description"));
         assert!(source.contains("French description"));
