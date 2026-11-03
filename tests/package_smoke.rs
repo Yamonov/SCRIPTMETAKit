@@ -5027,21 +5027,38 @@ fn full_metadata_rescan_preserves_last_good_catalog_after_permission_error() {
     );
 }
 
+#[cfg(feature = "blocking-http")]
 #[test]
 fn update_check_cancellation_returns_partial_result() {
     let temp = tempfile::tempdir().expect("tempdir");
     let first_dist = temp.path().join("first.txt");
-    let second_dist = temp.path().join("second.txt");
     std::fs::write(
         &first_dist,
         "SCRIPTMETA-DIST-BEGIN\nScript-ID=com.example.cancel.first\nLatest-Version=2.0.0\nSCRIPTMETA-DIST-END\n",
     )
     .expect("first dist");
-    std::fs::write(
-        &second_dist,
-        "SCRIPTMETA-DIST-BEGIN\nScript-ID=com.example.cancel.second\nLatest-Version=2.0.0\nSCRIPTMETA-DIST-END\n",
-    )
-    .expect("second dist");
+    use std::io::Write as _;
+    let listener =
+        std::sync::Arc::new(std::net::TcpListener::bind("127.0.0.1:0").expect("listener"));
+    let address = listener.local_addr().expect("address");
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    // A worker may finish another local file before the caller observes progress.
+    // Hold the second response until cancellation, rather than depending on timing.
+    let server_listener = listener.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = server_listener.accept().expect("second connection");
+        release_receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("release response");
+        let body = "SCRIPTMETA-DIST-BEGIN\nScript-ID=com.example.cancel.second\nLatest-Version=2.0.0\nSCRIPTMETA-DIST-END\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        // Cancellation may already have closed the connection.
+        let _ = stream.write_all(response.as_bytes());
+    });
 
     let mut config = scriptmetakit::ScriptMetaKitConfig::new("Test", "CancelUpdate");
     config.update_check.max_concurrent_meta_url_checks = 1;
@@ -5062,17 +5079,22 @@ fn update_check_cancellation_returns_partial_result() {
                     "com.example.cancel.second",
                     "1.0.0",
                     &second_path,
-                    url::Url::from_file_path(&second_dist).expect("second url"),
+                    url::Url::parse(&format!("http://{address}/second.txt")).expect("second url"),
                 ),
             ],
         },
         |progress| {
             if progress.phase == scriptmetakit::UpdateCheckProgressPhase::FinishedItem {
                 cancellation.cancel();
+                let _ = release_sender.send(());
             }
         },
-    ))
-    .expect("update check");
+    ));
+    let _ = release_sender.send(());
+    // Wake accept if cancellation prevented the second request from starting.
+    let _ = std::net::TcpStream::connect(address);
+    server.join().expect("response server");
+    let result = result.expect("update check");
 
     assert_eq!(
         result.operation.status,
