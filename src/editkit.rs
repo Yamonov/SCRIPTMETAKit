@@ -18,10 +18,9 @@ use crate::{
     core::{
         LanguagePreferences, MetadataDiagnostic, MetadataEditExtensions, ScriptMetaKitError,
         ScriptMetaKitResult, ScriptRuntimeKind, clean_metadata_line, decode_script_text_prefix,
-        decode_script_text_with_encoding, description_starts_with_language_label,
-        encode_script_text, has_script_metadata_block, metadata_sections, normalize_language_tag,
-        normalize_metadata_tags, normalize_metadata_url, normalize_version_string,
-        normalized_newlines,
+        decode_script_text_with_encoding, encode_script_text, has_script_metadata_block,
+        metadata_sections, normalize_language_tag, normalize_metadata_tags, normalize_metadata_url,
+        normalize_version_string, normalized_newlines,
     },
     formats::{self, CommentSyntax, compiled_osa},
 };
@@ -1225,7 +1224,9 @@ pub fn reset_scriptmeta_backups_with_current_as_initial(
     Ok(record)
 }
 
-fn validate_script_metadata_draft(draft: &ScriptMetadataDraft) -> ScriptMetaKitResult<()> {
+pub(crate) fn validate_script_metadata_draft(
+    draft: &ScriptMetadataDraft,
+) -> ScriptMetaKitResult<()> {
     validate_required_field("Script-ID", draft.script_id.as_str())?;
     for (field, value) in [
         ("Script-ID", Some(draft.script_id.as_str())),
@@ -1237,7 +1238,13 @@ fn validate_script_metadata_draft(draft: &ScriptMetadataDraft) -> ScriptMetaKitR
     ] {
         if let Some(value) = value {
             validate_scalar_field(field, value, SCRIPT_END)?;
-            if draft.extensions.is_none() || !matches!(field, "Name" | "Author") {
+            let marked_format = draft.extensions.as_ref().is_some_and(|value| {
+                value.default_language.is_some()
+                    || !value.names.is_empty()
+                    || !value.authors.is_empty()
+                    || !value.tags.is_empty()
+            });
+            if !marked_format || !matches!(field, "Name" | "Author") {
                 validate_no_inline_fields(field, value, false)?;
             }
         }
@@ -1272,17 +1279,22 @@ fn validate_script_metadata_draft(draft: &ScriptMetadataDraft) -> ScriptMetaKitR
         ));
     }
     if let Some(extensions) = &draft.extensions {
-        validate_required_field("Name", draft.name.as_deref().unwrap_or_default())?;
-        let default = extensions
-            .default_language
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                ScriptMetaKitError::InvalidConfig(
-                    "Meta-Default-language is required for localized metadata or Tags".into(),
-                )
-            })?;
-        normalize_language_tag(default)?;
+        if extensions.default_language.is_some()
+            || !extensions.names.is_empty()
+            || !extensions.authors.is_empty()
+        {
+            validate_required_field("Name", draft.name.as_deref().unwrap_or_default())?;
+            let default = extensions
+                .default_language
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    ScriptMetaKitError::InvalidConfig(
+                        "Meta-Default-language is required for localized metadata".into(),
+                    )
+                })?;
+            normalize_language_tag(default)?;
+        }
         for (field, values) in [("Name", &extensions.names), ("Author", &extensions.authors)] {
             for (language, value) in values {
                 normalize_language_tag(language)?;
@@ -1318,14 +1330,6 @@ fn render_script_metadata_block_with_existing(
     if effective.extensions.is_none() {
         effective.extensions = old_extensions.clone();
     }
-    if effective.extensions.is_none()
-        && effective
-            .description
-            .as_deref()
-            .is_some_and(description_starts_with_language_label)
-    {
-        effective.extensions = Some(MetadataEditExtensions::default());
-    }
     let draft = &effective;
     validate_script_metadata_draft(draft)?;
 
@@ -1344,8 +1348,14 @@ fn render_script_metadata_block_with_existing(
         "Meta-URL",
         draft.meta_url.as_ref().map(Url::as_str),
     );
-    append_field_line(&mut lines, "Name", draft.name.as_deref());
-    append_field_line(&mut lines, "Author", draft.author.as_deref());
+    for (key, value) in [
+        ("Name", draft.name.as_ref()),
+        ("Author", draft.author.as_ref()),
+    ] {
+        if let Some(value) = value {
+            lines.push(format!("{key}={value}"));
+        }
+    }
     append_field_line(&mut lines, "Release-Date", draft.release_date.as_deref());
     append_field_line(&mut lines, "Target-App", draft.target_app.as_deref());
     append_field_line(
@@ -1373,14 +1383,14 @@ fn render_script_metadata_block_with_existing(
             let mut canonical = BTreeMap::<String, String>::new();
             for (language, value) in values {
                 let language = normalize_language_tag(language)?;
-                crate::core::append_value(
-                    canonical.entry(language).or_default(),
-                    value.trim(),
-                    " ",
-                );
+                let target = canonical.entry(language).or_default();
+                if !target.is_empty() && !value.is_empty() {
+                    target.push(' ');
+                }
+                target.push_str(value);
             }
             for (language, value) in canonical {
-                append_field_line(&mut lines, &format!("{field}[{language}]"), Some(&value));
+                lines.push(format!("{field}[{language}]={value}"));
             }
         }
         let tags = normalize_metadata_tags(&extensions.tags)?;
@@ -1430,10 +1440,10 @@ fn append_normalized_version_field_line(lines: &mut Vec<String>, key: &str, valu
 }
 
 fn append_description_lines(lines: &mut Vec<String>, value: Option<&str>, force_block: bool) {
-    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+    let Some(value) = value else {
         return;
     };
-    if description_needs_block(value, force_block) {
+    if value.is_empty() || description_needs_block(value, force_block) {
         lines.push(DESCRIPTION_BEGIN.to_string());
         lines.extend(normalized_newlines(value).split('\n').map(str::to_string));
         lines.push(DESCRIPTION_END.to_string());

@@ -893,7 +893,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "scriptmetakit"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "encoding_rs",
  "fsevent-sys",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "scriptmetakit_ffi"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "objc2-foundation",
  "pollster",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "scriptmetakit_macos_io"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "cc",
  "tempfile",

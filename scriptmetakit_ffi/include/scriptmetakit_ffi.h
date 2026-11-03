@@ -692,6 +692,11 @@ SmkStatus smk_engine_configuration_json(SmkEngine *engine, SmkEditResult **out_r
 SmkStatus smk_engine_cache_revisions_json(SmkEngine *engine, const SmkUtf8Slice *root_ids, size_t count, uint32_t mode, SmkEditResult **out_result);
 SmkStatus smk_engine_apply_configuration_json(SmkEngine *engine, SmkUtf8Slice configuration_json, SmkEditResult **out_result);
 SmkStatus smk_metadata_parse_text(SmkUtf8Slice source, const SmkUtf8Slice *languages, size_t language_count, uint8_t require_closed_block, SmkEditResult **out_result);
+/** Editing-model JSON services. No file I/O. Free every returned result, including errors.
+ * These calls do not change existing ABI layouts or the nil-extensions preserve contract. */
+SmkStatus smk_metadata_localization_read(SmkUtf8Slice draft_json, SmkEditResult **out_result);
+SmkStatus smk_metadata_localization_edit(SmkUtf8Slice editor_json, SmkUtf8Slice operation_json, SmkEditResult **out_result);
+SmkStatus smk_metadata_localization_apply(SmkUtf8Slice editor_json, SmkUtf8Slice draft_json, SmkEditResult **out_result);
 SmkStatus smk_metadata_read_draft_text(SmkUtf8Slice source, SmkUtf8Slice file_name, SmkEditResult **out_result);
 /* Comment style: 0=plain text, 1=JavaScript block, 2=AppleScript block. */
 SmkStatus smk_metadata_render_text(SmkUtf8Slice draft_json, uint32_t style, SmkEditResult **out_result);

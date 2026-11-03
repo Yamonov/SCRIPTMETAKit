@@ -15,8 +15,8 @@ pub use localization::{
     is_valid_metadata_tag, normalize_language_tag, normalize_metadata_tags,
 };
 pub(crate) use localization::{
-    append_value, description_starts_with_language_label, description_translations, diagnostic,
-    is_block_marker, item_separator, select_text,
+    append_value, description_label, description_translations, diagnostic, is_block_marker,
+    item_separator, select_text, unescape_description,
 };
 pub use metadata::{
     ParserOptions, ScriptMetaEditCapability, ScriptMetaEditState, ScriptMetaItem,

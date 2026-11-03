@@ -6263,10 +6263,7 @@ fn metadata_edit_extensions_from_ffi(
                 let raw = required_str_from_slice(item.language, "language")?;
                 let language = scriptmetakit::normalize_language_tag(raw)
                     .map_err(|error| (SmkStatus::InvalidArgument, error.to_string()))?;
-                let text = utf8_from_raw(item.value.ptr, item.value.len)?.trim();
-                if text.is_empty() {
-                    continue;
-                }
+                let text = utf8_from_raw(item.value.ptr, item.value.len)?;
                 let target = values.entry(language).or_default();
                 if !target.is_empty() {
                     target.push(' ');

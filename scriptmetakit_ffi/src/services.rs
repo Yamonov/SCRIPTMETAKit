@@ -459,3 +459,51 @@ pub unsafe extern "C" fn smk_engine_refresh_dirty_roots(
     }
     status
 }
+
+/// Builds an exact-language editing model from a full editing draft, without file I/O.
+/// # Safety
+/// Input is readable UTF-8 JSON. Free every returned result, including errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smk_metadata_localization_read(
+    draft: SmkUtf8Slice,
+    output: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    service_text(output, || {
+        let draft: KitScriptMetadataDraft = decode(draft)?;
+        json(
+            &scriptmetakit::MetadataLocalizationEditor::from_draft(&draft)
+                .map_err(service_error)?,
+        )
+    })
+}
+
+/// Applies one explicit editing operation. No OS preferences or display fallback are used.
+/// # Safety
+/// Inputs are readable UTF-8 JSON. Free every returned result, including errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smk_metadata_localization_edit(
+    editor: SmkUtf8Slice,
+    operation: SmkUtf8Slice,
+    output: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    service_text(output, || {
+        let mut editor: scriptmetakit::MetadataLocalizationEditor = decode(editor)?;
+        editor.edit(decode(operation)?).map_err(service_error)?;
+        json(&editor)
+    })
+}
+
+/// Produces a save draft retaining common fields and Tags. Commit with the conditional file API.
+/// # Safety
+/// Inputs are readable UTF-8 JSON. Free every returned result, including errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smk_metadata_localization_apply(
+    editor: SmkUtf8Slice,
+    draft: SmkUtf8Slice,
+    output: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    service_text(output, || {
+        let editor: scriptmetakit::MetadataLocalizationEditor = decode(editor)?;
+        json(&editor.applying_to(&decode(draft)?).map_err(service_error)?)
+    })
+}

@@ -407,7 +407,7 @@ fn clearing_tags_removes_all_occurrences_but_keeps_description_examples() {
 }
 
 #[test]
-fn new_fields_require_default_name_and_language_but_legacy_writes_remain_valid() {
+fn localized_fields_require_name_and_default_but_tags_are_independent() {
     let mut draft = ScriptMetadataDraft {
         script_id: "legacy".into(),
         ..ScriptMetadataDraft::default()
@@ -417,6 +417,13 @@ fn new_fields_require_default_name_and_language_but_legacy_writes_remain_valid()
         tags: vec!["image".into()],
         ..MetadataEditExtensions::default()
     });
+    assert!(render_script_metadata_block(&draft).is_ok());
+    draft
+        .extensions
+        .as_mut()
+        .unwrap()
+        .names
+        .insert("en".into(), "English".into());
     assert!(render_script_metadata_block(&draft).is_err());
     draft.name = Some("Default".into());
     assert!(render_script_metadata_block(&draft).is_err());

@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 2.0.0
+# SCRIPTMETAKit 2.0.1
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -7,28 +7,31 @@ through the Rust core, C ABI and macOS Swift package.
 
 Registered macOS aliases, Windows Shell links (`.lnk`), and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. OS-specific resolution and native notifications are compiled only on their corresponding platforms.
 
-## 2.0.0 macOS package
+## 2.0.1 macOS and Windows package
 
 Version 2.0.0 adds common `Tags`, BCP 47 metadata localization,
 explicit ordered language preferences, and per-root watch suspension with a fresh
 reload on resume. This release provides the macOS Swift package and Universal
-XCFramework. Windows application integration and release binaries will follow separately.
+XCFramework, plus a Windows x64 DLL. Version 2.0.1 adds exact-language editing,
+safe default-language changes/removal and persistent empty translations.
 
 The Swift package requires Swift 6.1 / Xcode 16.3 or later and targets macOS 13 or
 later. Swift 5 and Swift 6 language modes are supported. The macOS binary contains
 arm64 and x86_64 slices. The Windows DLL uses the same C ABI and shared Rust core.
 
-Use `https://github.com/Yamonov/SCRIPTMETAKit.git` and version **2.0.0** in Xcode.
+Use `https://github.com/Yamonov/SCRIPTMETAKit.git` and version **2.0.1** in Xcode.
 An existing dependency rule starting at 1.3.3 and allowing updates up to the next
-major version excludes 2.0.0; change its minimum version to 2.0.0 when upgrading.
+major version excludes 2.0.0; change its minimum version to 2.0.1 when upgrading.
 
 - Consumers supply priorities, such as `ja`, `en`, `fr`. The Kit never obtains OS/UI languages.
 - Normal results retain selected Name, Author and Description only, plus Tags and selection diagnostics.
 - Changing canonical preferences invalidates language-dependent caches. Scan again to reload source files.
 - Full editing drafts preserve all translations; Description remains the complete raw multilingual body.
 - Repeated valid localized text is concatenated, including identical content. Tags instead merge with exact deduplication.
-- The C ABI additions leave legacy public struct layouts unchanged. Cache schema 4 / projection 4 identifies the language and metadata-read context.
+- The C ABI additions leave legacy public struct layouts unchanged. Cache schema 4 / projection 5 identifies the language and metadata-read context.
 
+See [multilingual editing APIs](docs/LocalizationEditingAPI.md) and
+[field requirements and relationships](docs/MetadataFieldRules.md).
 See [Tags and localization](docs/TagsLocalization.md) for syntax and APIs.
 See [Swift application API](docs/SwiftApplicationAPI.md) for configuration, text
 parsing/editing, validation, cache invalidation and external change notifications.
@@ -60,10 +63,18 @@ package with its matching Universal artifact. Rebuild it with
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `2.0.0`
-- Rust FFI crate: `scriptmetakit_ffi` `2.0.0`
+- Rust crate: `scriptmetakit` `2.0.1`
+- Rust FFI crate: `scriptmetakit_ffi` `2.0.1`
 - Swift package product: `ScriptMetaKit`
 - C ABI generation: `1` (existing layouts/calls retained; additions are additive)
+
+## 2.0.1
+
+- Adds a shared multilingual editor to Rust, C and Swift; editing never applies display fallback.
+- Safely changes the default language and returns the last language to ordinary fields, preserving Tags and unknown fields.
+- Retains empty languages, whitespace and untouched Description sections.
+- Makes Tags independent of Name/default-language requirements. Description without a valid default remains ordinary text.
+- Keeps legacy nil-extensions preservation, conditional saves and backups.
 
 ## 2.0.0
 
