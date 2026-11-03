@@ -165,6 +165,8 @@ impl ScanMode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScanResult {
+    #[serde(default)]
+    pub preferred_languages: crate::LanguagePreferences,
     pub roots: Vec<RootSnapshot>,
     pub file_list_snapshots: Vec<Arc<FileListSnapshot>>,
     pub catalog_snapshot: Option<Arc<ScriptMetaCatalogSnapshot>>,

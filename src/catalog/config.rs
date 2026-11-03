@@ -100,6 +100,8 @@ pub struct UpdateCheckOptions {
     pub request_timeout_millis: Option<u64>,
     #[serde(default = "default_update_resource_timeout_millis")]
     pub resource_timeout_millis: Option<u64>,
+    /// Retain bounded HTTP validators and extracted bodies between update checks.
+    /// In-operation source sharing remains enabled independently of this option.
     pub cache_network_responses: bool,
 }
 
@@ -114,7 +116,7 @@ impl Default for UpdateCheckOptions {
             max_retry_delay_millis: default_update_max_retry_delay_millis(),
             request_timeout_millis: default_update_request_timeout_millis(),
             resource_timeout_millis: default_update_resource_timeout_millis(),
-            cache_network_responses: false,
+            cache_network_responses: true,
         }
     }
 }
@@ -140,6 +142,20 @@ fn default_update_resource_timeout_millis() -> Option<u64> {
 }
 
 impl ScriptMetaKitConfig {
+    pub(crate) fn read_context(&self) -> MetadataReadContext {
+        MetadataReadContext {
+            max_prefix_bytes: self.parser.max_prefix_bytes,
+            require_closed_block: self.parser.require_closed_block,
+            skip_hidden: self.scanner.skip_hidden,
+            skip_packages: self.scanner.skip_packages,
+            follow_symlinks: self.scanner.follow_symlinks,
+            resolve_macos_alias: self.scanner.resolve_macos_alias,
+            decompile_compiled_osa_during_scan: self.scanner.decompile_compiled_osa_during_scan,
+            include_empty_directories: self.scanner.include_empty_directories,
+            supported_extensions: self.supported_extensions.clone(),
+        }
+    }
+
     #[must_use]
     pub fn new(app_id: impl Into<String>, cache_namespace: impl Into<String>) -> Self {
         Self {
@@ -153,6 +169,19 @@ impl ScriptMetaKitConfig {
             update_check: UpdateCheckOptions::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetadataReadContext {
+    pub max_prefix_bytes: usize,
+    pub require_closed_block: bool,
+    pub skip_hidden: bool,
+    pub skip_packages: bool,
+    pub follow_symlinks: bool,
+    pub resolve_macos_alias: bool,
+    pub decompile_compiled_osa_during_scan: bool,
+    pub include_empty_directories: bool,
+    pub supported_extensions: ExtensionPolicy,
 }
 
 impl Default for ScriptMetaKitConfig {

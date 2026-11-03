@@ -184,11 +184,19 @@ impl HttpValidationCache {
         Ok(())
     }
 
-    pub(crate) fn clear(&self) {
+    pub(crate) fn clear(&mut self) {
         #[cfg(feature = "blocking-http")]
-        if let Ok(mut cache) = self.inner.lock() {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            let cache = inner
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.entries.clear();
             cache.order.clear();
+            inner.clear_poison();
+        } else {
+            // Transactional engine clones share immutable response contents.
+            // Clearing a candidate must not clear the original after rollback.
+            self.inner = Arc::new(Mutex::new(HttpValidationCacheState::default()));
         }
     }
 }
@@ -639,6 +647,20 @@ impl DistributionResolver {
         &self,
         flight: Arc<SourceLoadFlight>,
     ) -> ScriptMetaKitResult<Arc<LoadedMetadataSource>> {
+        // Register before taking result's lock: registration may notify
+        // synchronously when cancellation already happened. The callback takes
+        // the same lock as wait() to prevent a lost wakeup between check/wait.
+        let _listener = self.cancellation.as_ref().map(|cancellation| {
+            let flight = Arc::clone(&flight);
+            cancellation.register_cancel_listener(move || {
+                let guard = flight
+                    .result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                flight.completed.notify_all();
+                drop(guard);
+            })
+        });
         let mut result = flight
             .result
             .lock()
@@ -648,11 +670,10 @@ impl DistributionResolver {
                 return result.clone();
             }
             self.ensure_not_cancelled()?;
-            let (next_result, _) = flight
+            result = flight
                 .completed
-                .wait_timeout(result, Duration::from_millis(50))
+                .wait(result)
                 .map_err(|_| ScriptMetaKitError::Cache("source flight is poisoned".to_string()))?;
-            result = next_result;
         }
     }
 
@@ -1309,7 +1330,18 @@ fn read_metadata_source_file_controlled(
     resource_timeout_millis: Option<u64>,
     cancellation: Option<&OperationCancellation>,
 ) -> Result<String, MetadataSourceReadError> {
-    let reader = scriptmetakit_macos_io::CancelableFileReader::open(path, SOURCE_READ_CHUNK_BYTES)?;
+    // Include one byte beyond the logical limit so the accumulator can report
+    // overflow. Bound Dispatch's producer too, not only the consuming parser.
+    let read_limit = if max_source_bytes == 0 {
+        usize::MAX
+    } else {
+        max_source_bytes.saturating_add(1)
+    };
+    let reader = scriptmetakit_macos_io::CancelableFileReader::open(
+        path,
+        SOURCE_READ_CHUNK_BYTES,
+        read_limit,
+    )?;
     read_metadata_source_file_reader_controlled(
         reader,
         max_block_bytes,
@@ -1870,6 +1902,70 @@ impl ResolvedItemUpdate {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    #[cfg(feature = "blocking-http")]
+    #[test]
+    fn clearing_a_shared_http_cache_preserves_the_other_owner() {
+        let original = super::HttpValidationCache::default();
+        let url = url::Url::parse("https://example.com/metadata").unwrap();
+        original
+            .store_response(
+                url.to_string(),
+                Some("tag".into()),
+                None,
+                super::LoadedMetadataSource {
+                    text: "body".into(),
+                    resolved_url: url.clone(),
+                },
+            )
+            .unwrap();
+        let mut candidate = original.clone();
+        candidate.clear();
+        assert!(candidate.cached_source(url.as_str()).unwrap().is_none());
+        assert_eq!(
+            original.cached_source(url.as_str()).unwrap().unwrap().text,
+            "body"
+        );
+    }
+
+    #[test]
+    fn source_followers_cancel_without_a_leader_completion() {
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+        let cancellation = crate::OperationCancellation::new();
+        let resolver = Arc::new(
+            super::DistributionResolver::new_with_cancellation(
+                super::DistributionResolverOptions::default(),
+                Some(cancellation.clone()),
+            )
+            .unwrap(),
+        );
+        for already_cancelled in [true, false] {
+            for _ in 0..16 {
+                let _scope = cancellation.begin_scope();
+                if already_cancelled {
+                    cancellation.cancel();
+                }
+                let resolver = Arc::clone(&resolver);
+                let (started_sender, started_receiver) = mpsc::channel();
+                let (done_sender, done_receiver) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    started_sender.send(()).unwrap();
+                    let result =
+                        resolver.wait_for_source_load(Arc::new(super::SourceLoadFlight::default()));
+                    done_sender.send(result.is_err()).unwrap();
+                });
+                started_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                cancellation.cancel();
+                assert!(done_receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+                worker.join().unwrap();
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     use std::{fs::File, thread, time::Duration};

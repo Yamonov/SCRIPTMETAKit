@@ -175,6 +175,7 @@ pub fn build_watch_plan(
         visible_root_id,
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &BTreeSet::new(),
     )
 }
 
@@ -185,16 +186,17 @@ pub(crate) fn build_watch_plan_with_resolved_targets(
     visible_root_id: Option<&RootId>,
     resolved_targets_by_root: &BTreeMap<RootId, BTreeSet<PathBuf>>,
     resolved_sources_by_root: &BTreeMap<RootId, ReferenceWatchTargets>,
+    paused_root_ids: &BTreeSet<RootId>,
 ) -> WatchPlan {
     if matches!(global_policy, WatchPolicy::Disabled | WatchPolicy::Manual) {
         return WatchPlan::empty();
     }
 
     let mut candidates = Vec::with_capacity(roots.len());
-    for root in roots
-        .iter()
-        .filter(|root| should_watch_root(root, global_policy, visible_root_id))
-    {
+    for root in roots.iter().filter(|root| {
+        !paused_root_ids.contains(&root.root_id)
+            && should_watch_root(root, global_policy, visible_root_id)
+    }) {
         candidates.push((root.root_id.clone(), normalize_path(&root.path), true));
         if let Some(targets) = resolved_targets_by_root.get(&root.root_id) {
             candidates.extend(
@@ -207,7 +209,9 @@ pub(crate) fn build_watch_plan_with_resolved_targets(
 
     for (root_id, sources) in resolved_sources_by_root {
         if !roots.iter().any(|root| {
-            &root.root_id == root_id && should_watch_root(root, global_policy, visible_root_id)
+            &root.root_id == root_id
+                && !paused_root_ids.contains(root_id)
+                && should_watch_root(root, global_policy, visible_root_id)
         }) {
             continue;
         }
@@ -300,8 +304,8 @@ pub(crate) struct ChangeRoutingOptions<'a> {
     pub max_deferred_dirty_directories: usize,
 }
 
-pub(crate) fn route_change_batch(
-    roots: &[RootRegistration],
+pub(crate) fn route_change_batch<'a>(
+    roots: impl IntoIterator<Item = &'a RootRegistration>,
     raw: RawChangeBatch,
     options: ChangeRoutingOptions<'_>,
 ) -> RootChangeBatch {

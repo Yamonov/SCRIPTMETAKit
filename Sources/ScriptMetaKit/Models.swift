@@ -421,6 +421,7 @@ public nonisolated struct ScriptMetaRootPreflightOptions: Codable, Sendable, Equ
 }
 
 public nonisolated struct ScriptMetaScanResult: Codable, Sendable {
+    public var preferredLanguages: [String]
     public var roots: [RootSnapshot]
     public var fileListSnapshots: [FileListSnapshot]
     public var catalogSnapshot: ScriptMetaCatalogSnapshot?
@@ -432,6 +433,7 @@ public nonisolated struct ScriptMetaScanResult: Codable, Sendable {
     public var watchDelivery: ScriptMetaKitWatchDelivery?
 
     enum CodingKeys: String, CodingKey {
+        case preferredLanguages = "preferred_languages"
         case roots
         case fileListSnapshots = "file_list_snapshots"
         case catalogSnapshot = "catalog_snapshot"
@@ -441,6 +443,37 @@ public nonisolated struct ScriptMetaScanResult: Codable, Sendable {
         case changeSummary = "change_summary"
         case watchChangeBatch = "watch_change_batch"
         case watchDelivery = "watch_delivery"
+    }
+
+    public init(roots: [RootSnapshot], fileListSnapshots: [FileListSnapshot],
+                catalogSnapshot: ScriptMetaCatalogSnapshot? = nil, operation: OperationInfo? = nil,
+                fileIssues: [FileIssue]? = nil, updateCheckResult: UpdateCheckResult? = nil,
+                changeSummary: ScanChangeSummary? = nil, watchChangeBatch: WatchChangeBatch? = nil,
+                watchDelivery: ScriptMetaKitWatchDelivery? = nil, preferredLanguages: [String] = []) {
+        self.roots = roots
+        self.fileListSnapshots = fileListSnapshots
+        self.catalogSnapshot = catalogSnapshot
+        self.operation = operation
+        self.fileIssues = fileIssues
+        self.updateCheckResult = updateCheckResult
+        self.changeSummary = changeSummary
+        self.watchChangeBatch = watchChangeBatch
+        self.watchDelivery = watchDelivery
+        self.preferredLanguages = preferredLanguages
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(roots: try values.decode([RootSnapshot].self, forKey: .roots),
+                  fileListSnapshots: try values.decode([FileListSnapshot].self, forKey: .fileListSnapshots),
+                  catalogSnapshot: try values.decodeIfPresent(ScriptMetaCatalogSnapshot.self, forKey: .catalogSnapshot),
+                  operation: try values.decodeIfPresent(OperationInfo.self, forKey: .operation),
+                  fileIssues: try values.decodeIfPresent([FileIssue].self, forKey: .fileIssues),
+                  updateCheckResult: try values.decodeIfPresent(UpdateCheckResult.self, forKey: .updateCheckResult),
+                  changeSummary: try values.decodeIfPresent(ScanChangeSummary.self, forKey: .changeSummary),
+                  watchChangeBatch: try values.decodeIfPresent(WatchChangeBatch.self, forKey: .watchChangeBatch),
+                  watchDelivery: try values.decodeIfPresent(ScriptMetaKitWatchDelivery.self, forKey: .watchDelivery),
+                  preferredLanguages: try values.decodeIfPresent([String].self, forKey: .preferredLanguages) ?? [])
     }
 
     public var allItems: [ScriptMetaItem] {
@@ -943,6 +976,72 @@ public nonisolated struct CandidateRecord: Codable, Sendable {
 
 }
 
+public nonisolated struct MetadataDiagnostic: Codable, Equatable, Sendable {
+    public var code: String
+    public var field: String
+    public var language: String?
+    public var line: Int?
+
+    public init(code: String, field: String, language: String? = nil, line: Int? = nil) {
+        self.code = code; self.field = field; self.language = language; self.line = line
+    }
+}
+
+public nonisolated struct MetadataPresentation: Codable, Equatable, Sendable {
+    public var defaultLanguage: String?
+    public var nameLanguage: String?
+    public var authorLanguage: String?
+    public var descriptionLanguage: String?
+    public var tags: [String]
+    public var diagnostics: [MetadataDiagnostic]
+
+    enum CodingKeys: String, CodingKey {
+        case defaultLanguage = "default_language", nameLanguage = "name_language"
+        case authorLanguage = "author_language", descriptionLanguage = "description_language"
+        case tags, diagnostics
+    }
+
+    public init(defaultLanguage: String? = nil, nameLanguage: String? = nil,
+                authorLanguage: String? = nil, descriptionLanguage: String? = nil,
+                tags: [String] = [], diagnostics: [MetadataDiagnostic] = []) {
+        self.defaultLanguage = defaultLanguage; self.nameLanguage = nameLanguage
+        self.authorLanguage = authorLanguage; self.descriptionLanguage = descriptionLanguage
+        self.tags = tags; self.diagnostics = diagnostics
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(defaultLanguage: try values.decodeIfPresent(String.self, forKey: .defaultLanguage),
+                  nameLanguage: try values.decodeIfPresent(String.self, forKey: .nameLanguage),
+                  authorLanguage: try values.decodeIfPresent(String.self, forKey: .authorLanguage),
+                  descriptionLanguage: try values.decodeIfPresent(String.self, forKey: .descriptionLanguage),
+                  tags: try values.decodeIfPresent([String].self, forKey: .tags) ?? [],
+                  diagnostics: try values.decodeIfPresent([MetadataDiagnostic].self, forKey: .diagnostics) ?? [])
+    }
+}
+
+public nonisolated struct MetadataEditExtensions: Codable, Equatable, Sendable {
+    public var defaultLanguage: String?
+    public var names: [String: String]
+    public var authors: [String: String]
+    public var tags: [String]
+
+    enum CodingKeys: String, CodingKey { case defaultLanguage = "default_language", names, authors, tags }
+
+    public init(defaultLanguage: String? = nil, names: [String: String] = [:],
+                authors: [String: String] = [:], tags: [String] = []) {
+        self.defaultLanguage = defaultLanguage; self.names = names; self.authors = authors; self.tags = tags
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(defaultLanguage: try values.decodeIfPresent(String.self, forKey: .defaultLanguage),
+                  names: try values.decodeIfPresent([String: String].self, forKey: .names) ?? [:],
+                  authors: try values.decodeIfPresent([String: String].self, forKey: .authors) ?? [:],
+                  tags: try values.decodeIfPresent([String].self, forKey: .tags) ?? [])
+    }
+}
+
 public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
     public var rootID: String
     public var filePath: String
@@ -966,6 +1065,13 @@ public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
     public var canEditScriptMeta: Bool
     public var canAppendScriptMeta: Bool
     public var scriptMetaEditState: String
+    private var storedPresentation: MetadataPresentation?
+
+    public var presentation: MetadataPresentation {
+        get { storedPresentation ?? MetadataPresentation() }
+        set { storedPresentation = newValue }
+    }
+    public var tags: [String] { presentation.tags }
 
     public var id: String { "\(rootID):\(filePath)" }
     public var displayName: String { name ?? URL(fileURLWithPath: filePath).lastPathComponent }
@@ -993,6 +1099,7 @@ public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
         case canEditScriptMeta = "can_edit_scriptmeta"
         case canAppendScriptMeta = "can_append_scriptmeta"
         case scriptMetaEditState = "scriptmeta_edit_state"
+        case storedPresentation = "presentation"
     }
 
     public init(
@@ -1017,7 +1124,8 @@ public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
         isReadOnly: Bool = false,
         canEditScriptMeta: Bool = true,
         canAppendScriptMeta: Bool = true,
-        scriptMetaEditState: String = "editable"
+        scriptMetaEditState: String = "editable",
+        presentation: MetadataPresentation = MetadataPresentation()
     ) {
         self.rootID = rootID
         self.filePath = filePath
@@ -1041,6 +1149,7 @@ public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
         self.canEditScriptMeta = canEditScriptMeta
         self.canAppendScriptMeta = canAppendScriptMeta
         self.scriptMetaEditState = scriptMetaEditState
+        self.storedPresentation = presentation
     }
 }
 
@@ -1279,6 +1388,7 @@ public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
     public var author: String?
     public var releaseDate: String?
     public var editPasswordSHA256: String?
+    public var extensions: MetadataEditExtensions?
 
     enum CodingKeys: String, CodingKey {
         case scriptID = "script_id"
@@ -1291,6 +1401,7 @@ public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
         case author
         case releaseDate = "release_date"
         case editPasswordSHA256 = "edit_password_sha256"
+        case extensions
     }
 
     public init(
@@ -1303,7 +1414,8 @@ public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
         name: String? = nil,
         author: String? = nil,
         releaseDate: String? = nil,
-        editPasswordSHA256: String? = nil
+        editPasswordSHA256: String? = nil,
+        extensions: MetadataEditExtensions? = nil
     ) {
         self.scriptID = scriptID
         self.version = version
@@ -1315,6 +1427,7 @@ public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
         self.author = author
         self.releaseDate = releaseDate
         self.editPasswordSHA256 = editPasswordSHA256
+        self.extensions = extensions
     }
 }
 
@@ -1328,6 +1441,7 @@ public nonisolated struct ScriptMetadataEditReadResult: Codable, Sendable {
     public var unknownLines: [String]
     public var existingBlockText: String?
     public var sourceFingerprint: String
+    public var diagnostics: [MetadataDiagnostic]?
 
     enum CodingKeys: String, CodingKey {
         case filePath = "file_path"
@@ -1339,6 +1453,7 @@ public nonisolated struct ScriptMetadataEditReadResult: Codable, Sendable {
         case unknownLines = "unknown_lines"
         case existingBlockText = "existing_block_text"
         case sourceFingerprint = "source_fingerprint"
+        case diagnostics
     }
 }
 

@@ -267,6 +267,7 @@ public nonisolated struct ScriptMetaKitPersistentCacheStore: Sendable {
 }
 
 public nonisolated struct ScriptMetaKitWorkspaceConfiguration: Sendable {
+    public var preferredLanguages: [String]
     public var cacheStore: ScriptMetaKitPersistentCacheStore?
     public var rootPreflightOptions: ScriptMetaRootPreflightOptions?
     public var resolvesMacOSAliases: Bool
@@ -282,7 +283,8 @@ public nonisolated struct ScriptMetaKitWorkspaceConfiguration: Sendable {
         nativeEventLatencyMillis: UInt64? = nil,
         cacheSaveDebounceMillis: UInt64 = 300,
         operationalPolicy: ScriptMetaKitOperationalPolicy? = nil,
-        diagnosticHandler: (@Sendable (ScriptMetaKitDiagnostic) -> Void)? = nil
+        diagnosticHandler: (@Sendable (ScriptMetaKitDiagnostic) -> Void)? = nil,
+        preferredLanguages: [String] = []
     ) {
         self.cacheStore = cacheStore
         self.rootPreflightOptions = rootPreflightOptions
@@ -291,6 +293,7 @@ public nonisolated struct ScriptMetaKitWorkspaceConfiguration: Sendable {
         self.cacheSaveDebounceMillis = cacheSaveDebounceMillis
         self.operationalPolicy = operationalPolicy
         self.diagnosticHandler = diagnosticHandler
+        self.preferredLanguages = preferredLanguages
     }
 }
 
@@ -313,6 +316,7 @@ public actor ScriptMetaKitWorkspace {
     private let engine = ScriptMetaKitEngine()
     private let configuration: ScriptMetaKitWorkspaceConfiguration
     private var didConfigureEngine = false
+    private var persistentCacheEnabled = false
     private var hasExclusiveOperation = false
     private var nextExclusiveOperationWaiterID: UInt64 = 0
     private var exclusiveOperationWaiters: [ExclusiveOperationWaiter] = []
@@ -321,11 +325,160 @@ public actor ScriptMetaKitWorkspace {
     private var persistentCacheLoadStates: [UInt32: PersistentCacheLoadState] = [:]
     private var persistentFileListRootIDs: Set<String> = []
     private var registeredRootIDsByGroup: [String: Set<String>] = [:]
+    private var pausedWatchRootIDs: Set<String> = []
+    private var watchControlGeneration: UInt64 = 0
+    private var beforeWatchPublicationForTesting: (@Sendable () async -> Void)?
+
+    private struct WatchPublicationState: Sendable {
+        var sequence: UInt64 = 0
+        var reconciledRootIDs: Set<String> = []
+        var reconciliationIsInProgress = false
+    }
     private var activeWatchSessionID: String?
     private var activeWatchSessionInvalidator: (@Sendable () -> Void)?
 
     public init(configuration: ScriptMetaKitWorkspaceConfiguration = ScriptMetaKitWorkspaceConfiguration()) {
         self.configuration = configuration
+    }
+
+    deinit {
+        activeWatchSessionInvalidator?()
+        for task in pendingCacheSaveTasks.values { task.cancel() }
+    }
+
+    public func engineConfiguration() async throws -> ScriptMetaKitConfiguration {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        return try await engine.configuration()
+    }
+
+    /// A workspace without a cache store disables persistent cache retention.
+    /// Runtime settings survive shutdown and clearVolatileState.
+    @discardableResult
+    public func applyConfiguration(_ requested: ScriptMetaKitConfiguration) async throws -> ScriptMetaKitConfigurationChange {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        var effective = requested
+        if configuration.cacheStore == nil { effective.cache.persistentCache = false }
+        let change = try await engine.applyConfiguration(effective)
+        if !effective.watcher.allowsWatching { invalidateActiveWatchSession() }
+        persistentCacheEnabled = effective.cache.enabled && effective.cache.persistentCache
+        if change.metadataInvalidated || change.persistenceChanged {
+            resetPersistentCacheTracking(clearFileListProvenance: change.metadataInvalidated)
+        }
+        return change
+    }
+
+    /// Also removes this workspace's stored caches containing the requested scope.
+    public func invalidateCache(scope: ScriptMetaCacheScope = .all) async throws {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        try await engine.invalidateCache(scope: scope)
+        resetPersistentCacheTracking(clearFileListProvenance: scope != .catalog)
+        let store = configuration.cacheStore
+        store?.remove(scope: .all)
+        if scope == .all || scope == .catalog { store?.remove(scope: .catalog) }
+        if scope == .all || scope == .fileList || scope == .root {
+            store?.remove(scope: .fileList)
+            store?.remove(scope: .root)
+        }
+    }
+
+    public func notifyChangedPaths(_ fileURLs: [URL], overflowed: Bool = false) async throws {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        try await engine.notifyChangedPaths(fileURLs, overflowed: overflowed)
+    }
+
+    public func refreshDirtyRoots(mode: ScriptMetaScanMode = .fileListAndMetadata, cacheScope: ScriptMetaCacheScope? = nil) async throws -> ScriptMetaScanResult {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        let result = try await engine.refreshDirtyRoots(mode: mode)
+        markReconciledFileListRoots(in: result)
+        if let cacheScope { await savePersistentCache(scope: cacheScope) }
+        return result
+    }
+
+    /// Suspends automatic reads for these root IDs while retaining the current
+    /// watch stream, other roots, policies and cached content. Explicit scans are
+    /// still allowed. Pause calls are idempotent, not reference counted.
+    public func pauseWatching(rootIDs: [String]) async throws {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
+        try await configureEngineIfNeeded()
+        try await engine.pauseWatching(rootIDs: rootIDs)
+        let previous = pausedWatchRootIDs
+        pausedWatchRootIDs.formUnion(rootIDs)
+        if previous != pausedWatchRootIDs { watchControlGeneration &+= 1 }
+    }
+
+    /// Reloads file lists and metadata without unchanged-record reuse, then
+    /// resumes the roots' configured watch policies. Monitoring is armed before
+    /// the read when the workspace already has a running watcher.
+    /// Incomplete results leave the entire batch paused; inspect root statuses.
+    /// Does not start a globally stopped watcher or perform network update checks.
+    public func resumeWatching(rootIDs: [String], cacheScope: ScriptMetaCacheScope? = nil) async throws -> ScriptMetaScanResult {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try Task.checkCancellation()
+        try await configureEngineIfNeeded()
+        let result: ScriptMetaScanResult
+        do {
+            result = try await engine.resumeWatching(rootIDs: rootIDs)
+        } catch {
+            // Cancellation can occur after the bridge has begun its source read.
+            // Query the engine instead of assuming the pre-call suspension state.
+            let engine = self.engine
+            let suspended = try? await Task.detached { try await engine.pausedWatchRoots(rootIDs: rootIDs) }.value
+            if let suspended {
+                let previous = pausedWatchRootIDs
+                pausedWatchRootIDs.subtract(rootIDs)
+                pausedWatchRootIDs.formUnion(suspended)
+                if previous != pausedWatchRootIDs { watchControlGeneration &+= 1 }
+            }
+            throw error
+        }
+        if result.roots.allSatisfy({ $0.status == "ready" }) {
+            pausedWatchRootIDs.subtract(rootIDs)
+            markReconciledFileListRoots(in: result)
+        } else {
+            pausedWatchRootIDs.formUnion(rootIDs)
+        }
+        watchControlGeneration &+= 1
+        if let cacheScope { await savePersistentCache(scope: cacheScope) }
+        return result
+    }
+
+    public func isWatchingPaused(rootID: String) async throws -> Bool {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        return try await engine.isWatchingPaused(rootID: rootID)
+    }
+
+    /// The consumer supplies priorities. Call scanRoots/scanRoot after a change
+    /// to reload source metadata; the Kit does not monitor OS language changes.
+    public func setPreferredLanguages(_ languages: [String]) async throws {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await configureEngineIfNeeded()
+        let changed = try await engine.setPreferredLanguages(languages)
+        guard changed else { return }
+        resetPersistentCacheTracking()
+    }
+
+    private func resetPersistentCacheTracking(clearFileListProvenance: Bool = true) {
+        for task in pendingCacheSaveTasks.values { task.cancel() }
+        pendingCacheSaveTasks.removeAll()
+        cacheSaveGenerationByScope = cacheSaveGenerationByScope.mapValues { $0 &+ 1 }
+        persistentCacheLoadStates.removeAll()
+        if clearFileListProvenance { persistentFileListRootIDs.removeAll() }
     }
 
     func performExclusiveOperation<T: Sendable>(
@@ -761,57 +914,19 @@ public actor ScriptMetaKitWorkspace {
             bufferingPolicy: .bufferingNewest(1)
         )
         let pump = Task { [weak self] in
-            var sequence: UInt64 = 0
-            var reconciledRootIDs = Set<String>()
-            var reconciliationIsInProgress = false
+            var publicationState = WatchPublicationState()
             for await _ in notifications {
                 guard let self else { break }
                 do {
-                    guard var result = try await self.pollWatchChanges(
-                        sessionID: streamID,
-                        dirtyOnly: dirtyOnly,
-                        cacheScope: cacheScope
+                    guard let polled = try await self.pollWatchChanges(
+                        sessionID: streamID, dirtyOnly: dirtyOnly, cacheScope: cacheScope
                     ) else { continue }
-                    guard sequence < UInt64.max else {
-                        throw ScriptMetaKitWorkspaceError.watchSequenceOverflow
-                    }
-                    sequence += 1
-                    var delivery = result.watchDelivery ?? ScriptMetaKitWatchDelivery(
-                        isReconciliation: false,
-                        coversAllWatchedRoots: watchedRootIDs.isSubset(
-                            of: Set(result.roots.map(\.rootID))
-                        ),
-                        streamID: nil,
-                        sequence: nil
+                    if let hook = await self.takeWatchPublicationHookForTesting() { await hook() }
+                    publicationState = try await self.publishWatchResult(
+                        polled.result, generation: polled.generation, streamID: streamID,
+                        watchedRootIDs: watchedRootIDs, state: publicationState,
+                        continuation: updateContinuation
                     )
-                    delivery.streamID = streamID
-                    delivery.sequence = sequence
-                    result.watchDelivery = delivery
-                    let kind: ScriptMetaKitWatchUpdateKind = delivery.isReconciliation
-                        ? .reconciliation
-                        : .incremental
-                    if delivery.isReconciliation {
-                        if reconciliationIsInProgress == false {
-                            reconciledRootIDs.removeAll(keepingCapacity: true)
-                            reconciliationIsInProgress = true
-                        }
-                        if delivery.coversAllWatchedRoots {
-                            reconciledRootIDs = watchedRootIDs
-                            reconciliationIsInProgress = false
-                        } else {
-                            reconciledRootIDs.formUnion(result.roots.map(\.rootID))
-                        }
-                    }
-                    let pendingRootIDs = watchedRootIDs.subtracting(reconciledRootIDs)
-                    updateContinuation.yield(ScriptMetaKitWatchUpdate(
-                        streamID: streamID,
-                        sequence: sequence,
-                        kind: kind,
-                        coversAllWatchedRoots: delivery.coversAllWatchedRoots,
-                        reconciledRootIDs: reconciledRootIDs.sorted(),
-                        pendingRootIDs: pendingRootIDs.sorted(),
-                        result: result
-                    ))
                 } catch is CancellationError {
                     break
                 } catch {
@@ -859,14 +974,14 @@ public actor ScriptMetaKitWorkspace {
         sessionID: String,
         dirtyOnly: Bool,
         cacheScope: ScriptMetaCacheScope?
-    ) async throws -> ScriptMetaScanResult? {
+    ) async throws -> (result: ScriptMetaScanResult, generation: UInt64)? {
         guard activeWatchSessionID == sessionID else { return nil }
         try await enterExclusiveOperation()
         defer { leaveExclusiveOperation() }
         guard activeWatchSessionID == sessionID else { return nil }
         let result = try await pollWatchChangesUnlocked(dirtyOnly: dirtyOnly, cacheScope: cacheScope)
         guard activeWatchSessionID == sessionID else { return nil }
-        return result
+        return result.map { ($0, watchControlGeneration) }
     }
 
     private func stopWatching(sessionID: String) async {
@@ -880,6 +995,72 @@ public actor ScriptMetaKitWorkspace {
         activeWatchSessionID = nil
         activeWatchSessionInvalidator = nil
         invalidator?()
+    }
+
+    // Generation validation and publication are one actor turn. A result read
+    // before a pause/resume must not be published afterward as current content.
+    private func publishWatchResult(
+        _ value: ScriptMetaScanResult, generation: UInt64, streamID: String,
+        watchedRootIDs: Set<String>, state previous: WatchPublicationState,
+        continuation: AsyncThrowingStream<ScriptMetaKitWatchUpdate, Error>.Continuation
+    ) throws -> WatchPublicationState {
+        guard activeWatchSessionID == streamID, generation == watchControlGeneration else { return previous }
+        let activeRootIDs = activeWatchedRootIDs(watchedRootIDs)
+        var result = value
+        result.roots.removeAll { !activeRootIDs.contains($0.rootID) }
+        result.fileListSnapshots.removeAll { !activeRootIDs.contains($0.root.rootID) }
+        guard !result.roots.isEmpty else { return previous }
+        var state = previous
+        guard state.sequence < UInt64.max else { throw ScriptMetaKitWorkspaceError.watchSequenceOverflow }
+        state.sequence += 1
+        var delivery = result.watchDelivery ?? ScriptMetaKitWatchDelivery(
+            isReconciliation: false,
+            coversAllWatchedRoots: activeRootIDs.isSubset(of: Set(result.roots.map(\.rootID))),
+            streamID: nil, sequence: nil
+        )
+        delivery.streamID = streamID
+        delivery.sequence = state.sequence
+        result.watchDelivery = delivery
+        if delivery.isReconciliation {
+            if !state.reconciliationIsInProgress {
+                state.reconciledRootIDs.removeAll(keepingCapacity: true)
+                state.reconciliationIsInProgress = true
+            }
+            if delivery.coversAllWatchedRoots {
+                state.reconciledRootIDs = activeRootIDs
+                state.reconciliationIsInProgress = false
+            } else {
+                state.reconciledRootIDs.formUnion(result.roots.map(\.rootID))
+            }
+        }
+        state.reconciledRootIDs.formIntersection(activeRootIDs)
+        continuation.yield(ScriptMetaKitWatchUpdate(
+            streamID: streamID, sequence: state.sequence,
+            kind: delivery.isReconciliation ? .reconciliation : .incremental,
+            coversAllWatchedRoots: delivery.coversAllWatchedRoots,
+            reconciledRootIDs: state.reconciledRootIDs.sorted(),
+            pendingRootIDs: activeRootIDs.subtracting(state.reconciledRootIDs).sorted(), result: result
+        ))
+        return state
+    }
+
+    private func activeWatchedRootIDs(_ rootIDs: Set<String>) -> Set<String> {
+        rootIDs.subtracting(pausedWatchRootIDs)
+    }
+
+    func beforeNextWatchPublicationForTesting(_ hook: @escaping @Sendable () async -> Void) {
+        beforeWatchPublicationForTesting = hook
+    }
+
+    func cancelNextWatchResumeForTesting() async throws {
+        try await enterExclusiveOperation()
+        defer { leaveExclusiveOperation() }
+        try await engine.cancelNextWatchResumeForTesting()
+    }
+
+    private func takeWatchPublicationHookForTesting() -> (@Sendable () async -> Void)? {
+        defer { beforeWatchPublicationForTesting = nil }
+        return beforeWatchPublicationForTesting
     }
 
     public func pollWatchChanges(
@@ -919,7 +1100,7 @@ public actor ScriptMetaKitWorkspace {
         maxPollCount: Int = 20
     ) async throws {
         if initialDelayMillis > 0 {
-            try await Task.sleep(nanoseconds: initialDelayMillis * 1_000_000)
+            try await Task.sleep(for: .milliseconds(initialDelayMillis))
         }
 
         let requiredIdlePolls = max(1, idlePollCount)
@@ -935,7 +1116,7 @@ public actor ScriptMetaKitWorkspace {
                 idlePolls = 0
             }
             if pollingIntervalMillis > 0 {
-                try await Task.sleep(nanoseconds: pollingIntervalMillis * 1_000_000)
+                try await Task.sleep(for: .milliseconds(pollingIntervalMillis))
             }
         }
     }
@@ -992,23 +1173,17 @@ public actor ScriptMetaKitWorkspace {
     public func clearVolatileState(
         operationPolicy: ScriptMetaOperationTerminationPolicy = .waitForCurrentOperation
     ) async {
-        invalidateActiveWatchSession()
-        if operationPolicy == .cancelCurrentOperation {
-            engine.cancelCurrentOrPendingOperationForTermination()
-        }
-        await enterExclusiveOperationIgnoringCancellation()
-        defer { leaveExclusiveOperation() }
-        await flushPendingPersistentCacheSaves()
-        await engine.shutdown()
-        resetStateAfterEngineShutdown()
+        await shutdown(operationPolicy: operationPolicy)
     }
 
     private func resetStateAfterEngineShutdown() {
-        didConfigureEngine = false
+        // EngineBox preserves the canonical runtime configuration across recreation.
         cacheSaveGenerationByScope.removeAll(keepingCapacity: false)
         persistentCacheLoadStates.removeAll(keepingCapacity: false)
         persistentFileListRootIDs.removeAll(keepingCapacity: false)
         registeredRootIDsByGroup.removeAll(keepingCapacity: false)
+        pausedWatchRootIDs.removeAll(keepingCapacity: false)
+        beforeWatchPublicationForTesting = nil
     }
 
     public func checkUpdate(
@@ -1045,6 +1220,7 @@ public actor ScriptMetaKitWorkspace {
 
     private func configureEngineIfNeeded() async throws {
         guard didConfigureEngine == false else { return }
+        try await engine.setPreferredLanguages(configuration.preferredLanguages)
         if let options = configuration.rootPreflightOptions {
             try await engine.setRootPreflightOptions(options)
         }
@@ -1055,6 +1231,12 @@ public actor ScriptMetaKitWorkspace {
         if let nativeEventLatencyMillis = configuration.nativeEventLatencyMillis {
             try await engine.setNativeEventLatencyMillis(nativeEventLatencyMillis)
         }
+        var settings = try await engine.configuration()
+        if configuration.cacheStore == nil {
+            settings.cache.persistentCache = false
+            try await engine.applyConfiguration(settings)
+        }
+        persistentCacheEnabled = settings.cache.enabled && settings.cache.persistentCache
         didConfigureEngine = true
     }
 
@@ -1083,13 +1265,14 @@ public actor ScriptMetaKitWorkspace {
             $0.formUnion($1)
         }
         persistentFileListRootIDs.formIntersection(registeredRootIDs)
+        pausedWatchRootIDs.formIntersection(registeredRootIDs)
     }
 
     private func loadPersistentCacheIfNeeded(
         scope: ScriptMetaCacheScope,
         rootIDs: [String]
     ) async throws {
-        guard let cacheStore = configuration.cacheStore else { return }
+        guard persistentCacheEnabled, let cacheStore = configuration.cacheStore else { return }
         let canonicalScope = canonicalCacheScope(scope)
         let cacheStateKey = canonicalScope.rawValue
         guard let maximumCacheBytes = cacheStore.validatedMaximumCacheBytes else {
@@ -1114,7 +1297,7 @@ public actor ScriptMetaKitWorkspace {
         case .all: .fileListAndMetadata
         case .fileList, .root: .fileListOnly
         }
-        let resident = try? await engine.cachedRoots(rootIDs: probedRootIDs, mode: probeMode)
+        let resident = try await engine.cacheRevisions(rootIDs: probedRootIDs, mode: probeMode)
         let residentFileListRevisions = fileListRevisions(in: resident)
         if canonicalScope == .fileList,
            Set(residentFileListRevisions.keys).isSuperset(of: requestedRootIDs) {
@@ -1130,8 +1313,9 @@ public actor ScriptMetaKitWorkspace {
             return
         }
         do {
-            try await engine.loadCache(from: url, maximumBytes: maximumCacheBytes)
-            let loaded = try? await engine.cachedRoots(rootIDs: probedRootIDs, mode: probeMode)
+            let loaded = try await engine.loadCacheRevisions(
+                from: url, maximumBytes: maximumCacheBytes, rootIDs: probedRootIDs, mode: probeMode
+            )
             persistentCacheLoadStates[cacheStateKey] = PersistentCacheLoadState(
                 signature: cacheSignature,
                 rootRevisions: rootRevisions(in: loaded)
@@ -1145,6 +1329,10 @@ public actor ScriptMetaKitWorkspace {
             }
         } catch let error as CancellationError {
             throw error
+        } catch ScriptMetaKitError.operationFailed(let status, _) where status == smkStatusCacheIncompatible {
+            // Upgrades and language/read-setting changes are normal cache misses.
+            cacheStore.remove(scope: scope)
+            persistentCacheLoadStates[cacheStateKey] = nil
         } catch {
             emitDiagnostic(
                 severity: .warning,
@@ -1158,7 +1346,7 @@ public actor ScriptMetaKitWorkspace {
     }
 
     private func savePersistentCache(scope: ScriptMetaCacheScope) async {
-        guard let cacheStore = configuration.cacheStore else { return }
+        guard persistentCacheEnabled, let cacheStore = configuration.cacheStore else { return }
         let scope = canonicalCacheScope(scope)
         guard let maximumCacheBytes = cacheStore.validatedMaximumCacheBytes else {
             emitDiagnostic(
@@ -1215,20 +1403,21 @@ public actor ScriptMetaKitWorkspace {
     }
 
     private func rootRevisions(
-        in result: ScriptMetaScanResult?
+        in result: [ScriptMetaCacheRevision]
     ) -> [String: ScriptMetaKitRevision] {
-        Dictionary(uniqueKeysWithValues: result?.roots.map { ($0.rootID, $0.stateRevision) } ?? [])
+        Dictionary(uniqueKeysWithValues: result.map { ($0.rootID, $0.stateRevision) })
     }
 
     private func fileListRevisions(
-        in result: ScriptMetaScanResult?
+        in result: [ScriptMetaCacheRevision]
     ) -> [String: ScriptMetaKitRevision] {
-        Dictionary(uniqueKeysWithValues: result?.fileListSnapshots.compactMap { snapshot in
-            snapshot.children.map { _ in (snapshot.root.rootID, snapshot.contentRevision) }
-        } ?? [])
+        Dictionary(uniqueKeysWithValues: result.compactMap { revision in
+            revision.fileListRevision.map { (revision.rootID, $0) }
+        })
     }
 
     private func schedulePersistentCacheSave(scope: ScriptMetaCacheScope) {
+        guard persistentCacheEnabled, configuration.cacheStore != nil else { return }
         let scope = canonicalCacheScope(scope)
         let scopeKey = scope.rawValue
         let generation = cacheSaveGenerationByScope[scopeKey, default: 0] &+ 1

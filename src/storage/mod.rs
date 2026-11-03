@@ -14,6 +14,8 @@ use crate::{
 };
 
 pub const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+// Version 4 also records the parser/scanner configuration used for cached data.
+const METADATA_PROJECTION_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheSchema {
@@ -27,30 +29,39 @@ pub struct CacheSchema {
     pub cache_namespace: Option<String>,
     #[serde(default)]
     pub created_at_millis: u64,
+    #[serde(default)]
+    pub metadata_projection_version: u32,
+    #[serde(default)]
+    pub preferred_languages: crate::LanguagePreferences,
+    #[serde(default)]
+    pub read_context: Option<crate::catalog::MetadataReadContext>,
 }
 
 impl CacheSchema {
-    pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+    pub const CURRENT_SCHEMA_VERSION: u32 = 4;
     pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
     #[must_use]
     pub fn current() -> Self {
-        Self {
-            schema_version: Self::CURRENT_SCHEMA_VERSION,
-            min_supported_schema_version: Self::MIN_SUPPORTED_SCHEMA_VERSION,
-            package_version: crate::package_version().to_string(),
-            app_id: None,
-            cache_namespace: None,
-            created_at_millis: now_timestamp_millis(),
-        }
+        Self::for_config(&ScriptMetaKitConfig::default(), false)
     }
 
     #[must_use]
     pub fn current_for_config(config: &ScriptMetaKitConfig) -> Self {
+        Self::for_config(config, true)
+    }
+
+    fn for_config(config: &ScriptMetaKitConfig, include_identity: bool) -> Self {
         Self {
-            app_id: Some(config.app_id.clone()),
-            cache_namespace: Some(config.cache_namespace.clone()),
-            ..Self::current()
+            schema_version: Self::CURRENT_SCHEMA_VERSION,
+            min_supported_schema_version: Self::MIN_SUPPORTED_SCHEMA_VERSION,
+            package_version: crate::package_version().to_string(),
+            app_id: include_identity.then(|| config.app_id.clone()),
+            cache_namespace: include_identity.then(|| config.cache_namespace.clone()),
+            created_at_millis: now_timestamp_millis(),
+            metadata_projection_version: METADATA_PROJECTION_VERSION,
+            preferred_languages: config.parser.preferred_languages.clone(),
+            read_context: Some(config.read_context()),
         }
     }
 
@@ -94,7 +105,7 @@ impl CachePayload {
 
     pub fn migrate(mut self) -> ScriptMetaKitResult<Self> {
         if !self.is_supported_schema() {
-            return Err(ScriptMetaKitError::Cache(format!(
+            return Err(ScriptMetaKitError::CacheIncompatible(format!(
                 "unsupported cache schema version {}",
                 self.schema.schema_version
             )));
@@ -110,10 +121,19 @@ impl CachePayload {
     }
 
     pub fn validate_for_config(&self, config: &ScriptMetaKitConfig) -> ScriptMetaKitResult<()> {
+        if self.schema.metadata_projection_version != METADATA_PROJECTION_VERSION
+            || self.schema.preferred_languages != config.parser.preferred_languages
+            || self.schema.read_context.as_ref() != Some(&config.read_context())
+        {
+            return Err(ScriptMetaKitError::CacheIncompatible(
+                "cached metadata has a different parsing or language selection context; reload source files"
+                    .into(),
+            ));
+        }
         if let Some(app_id) = self.schema.app_id.as_deref()
             && app_id != config.app_id
         {
-            return Err(ScriptMetaKitError::Cache(format!(
+            return Err(ScriptMetaKitError::CacheIncompatible(format!(
                 "cache app_id `{app_id}` does not match `{}`",
                 config.app_id
             )));
@@ -121,7 +141,7 @@ impl CachePayload {
         if let Some(namespace) = self.schema.cache_namespace.as_deref()
             && namespace != config.cache_namespace
         {
-            return Err(ScriptMetaKitError::Cache(format!(
+            return Err(ScriptMetaKitError::CacheIncompatible(format!(
                 "cache namespace `{namespace}` does not match `{}`",
                 config.cache_namespace
             )));
@@ -211,6 +231,9 @@ pub fn cache_payload_content_fingerprint(payload: &CachePayload) -> ScriptMetaKi
         package_version: &'a str,
         app_id: Option<&'a str>,
         cache_namespace: Option<&'a str>,
+        metadata_projection_version: u32,
+        preferred_languages: &'a crate::LanguagePreferences,
+        read_context: &'a Option<crate::catalog::MetadataReadContext>,
         scope: CacheScope,
         data: &'a Value,
     }
@@ -221,6 +244,9 @@ pub fn cache_payload_content_fingerprint(payload: &CachePayload) -> ScriptMetaKi
         package_version: &payload.schema.package_version,
         app_id: payload.schema.app_id.as_deref(),
         cache_namespace: payload.schema.cache_namespace.as_deref(),
+        metadata_projection_version: payload.schema.metadata_projection_version,
+        preferred_languages: &payload.schema.preferred_languages,
+        read_context: &payload.schema.read_context,
         scope: payload.scope,
         data: &payload.data,
     })

@@ -1,6 +1,4 @@
-use scriptmetakit::ScriptMetaKitConfig;
-
-const MAX_WATCHER_PENDING_PATHS: usize = 1_048_576;
+use scriptmetakit::{ScriptMetaKitConfig, ScriptMetaKitEngine};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -20,35 +18,26 @@ pub struct SmkOperationalPolicy {
 pub(crate) fn apply_operational_policy(
     config: &mut ScriptMetaKitConfig,
     policy: &SmkOperationalPolicy,
-) -> Result<(), &'static str> {
-    if policy.max_concurrent_meta_url_checks == 0
-        || policy.max_concurrent_meta_url_checks > 64
-        || policy.retry_attempts > 10
-        || !(1..=16).contains(&policy.retry_backoff_multiplier)
-        || policy.max_retry_delay_millis < policy.retry_initial_delay_millis
-        || policy.request_timeout_millis == 0
-        || policy.resource_timeout_millis == 0
-        || policy.watcher_max_pending_paths == 0
-        || policy.watcher_max_pending_paths > MAX_WATCHER_PENDING_PATHS
-    {
-        return Err("operational policy contains an invalid limit");
-    }
-    config.update_check.max_concurrent_meta_url_checks = policy.max_concurrent_meta_url_checks;
-    config.update_check.retry_attempts = policy.retry_attempts;
-    config.update_check.retry_initial_delay_millis = policy.retry_initial_delay_millis;
-    config.update_check.retry_backoff_multiplier = policy.retry_backoff_multiplier;
-    config.update_check.max_retry_delay_millis = policy.max_retry_delay_millis;
-    config.update_check.request_timeout_millis = Some(policy.request_timeout_millis);
-    config.update_check.resource_timeout_millis = Some(policy.resource_timeout_millis);
-    config.watcher.debounce_delay_millis = policy.watcher_debounce_delay_millis;
-    config.watcher.max_delivery_delay_millis = policy.watcher_max_delivery_delay_millis;
-    config.watcher.max_pending_paths = policy.watcher_max_pending_paths;
+) -> Result<(), String> {
+    let mut candidate = config.clone();
+    candidate.update_check.max_concurrent_meta_url_checks = policy.max_concurrent_meta_url_checks;
+    candidate.update_check.retry_attempts = policy.retry_attempts;
+    candidate.update_check.retry_initial_delay_millis = policy.retry_initial_delay_millis;
+    candidate.update_check.retry_backoff_multiplier = policy.retry_backoff_multiplier;
+    candidate.update_check.max_retry_delay_millis = policy.max_retry_delay_millis;
+    candidate.update_check.request_timeout_millis = Some(policy.request_timeout_millis);
+    candidate.update_check.resource_timeout_millis = Some(policy.resource_timeout_millis);
+    candidate.watcher.debounce_delay_millis = policy.watcher_debounce_delay_millis;
+    candidate.watcher.max_delivery_delay_millis = policy.watcher_max_delivery_delay_millis;
+    candidate.watcher.max_pending_paths = policy.watcher_max_pending_paths;
+    ScriptMetaKitEngine::validate_configuration(&candidate).map_err(|error| error.to_string())?;
+    *config = candidate;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_WATCHER_PENDING_PATHS, SmkOperationalPolicy, apply_operational_policy};
+    use super::{SmkOperationalPolicy, apply_operational_policy};
 
     #[test]
     fn rejects_an_excessive_watcher_queue_capacity() {
@@ -63,9 +52,11 @@ mod tests {
             resource_timeout_millis: 15_000,
             watcher_debounce_delay_millis: 500,
             watcher_max_delivery_delay_millis: 2_000,
-            watcher_max_pending_paths: MAX_WATCHER_PENDING_PATHS + 1,
+            watcher_max_pending_paths: 1_048_577,
         };
 
+        let previous = config.clone();
         assert!(apply_operational_policy(&mut config, &policy).is_err());
+        assert_eq!(config, previous);
     }
 }

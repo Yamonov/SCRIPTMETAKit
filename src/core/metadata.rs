@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use super::{LanguagePreferences, MetadataPresentation};
 use crate::RootId;
 
 pub type ScriptMetaItemRef = Arc<ScriptMetaItem>;
@@ -11,6 +12,8 @@ pub type ScriptMetaItemRef = Arc<ScriptMetaItem>;
 pub struct ParserOptions {
     pub max_prefix_bytes: usize,
     pub require_closed_block: bool,
+    #[serde(default)]
+    pub preferred_languages: LanguagePreferences,
 }
 
 impl Default for ParserOptions {
@@ -18,6 +21,7 @@ impl Default for ParserOptions {
         Self {
             max_prefix_bytes: 128 * 1024,
             require_closed_block: true,
+            preferred_languages: LanguagePreferences::default(),
         }
     }
 }
@@ -44,6 +48,8 @@ pub struct ScriptMetadata {
     pub author: Option<String>,
     pub release_date: Option<String>,
     pub edit_password_sha256: Option<String>,
+    #[serde(default)]
+    pub presentation: MetadataPresentation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -133,6 +139,8 @@ pub struct ScriptMetaItem {
     pub release_date: Option<String>,
     pub edit_password_sha256: Option<String>,
     #[serde(default)]
+    pub presentation: MetadataPresentation,
+    #[serde(default)]
     pub has_scriptmeta: bool,
     #[serde(default)]
     pub has_scriptmeta_edit_password: bool,
@@ -172,6 +180,7 @@ impl ScriptMetaItem {
             author: metadata.author,
             release_date: metadata.release_date,
             edit_password_sha256: metadata.edit_password_sha256,
+            presentation: metadata.presentation,
             has_scriptmeta: true,
             has_scriptmeta_edit_password: false,
             is_file_locked: false,

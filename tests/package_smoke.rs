@@ -4508,6 +4508,7 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
+            presentation: Default::default(),
             root_id: "scripts".into(),
             file_path: temp.path().join("Example.jsx"),
             identity_path: temp.path().join("Example.jsx"),
@@ -4572,6 +4573,7 @@ SCRIPTMETA-DIST-END
     let first_path = temp.path().join("First.jsx");
     let second_path = temp.path().join("Second.jsx");
     let first_item: scriptmetakit::ScriptMetaItemRef = scriptmetakit::ScriptMetaItem {
+        presentation: Default::default(),
         root_id: "scripts".into(),
         file_path: first_path.clone(),
         identity_path: first_path.clone(),
@@ -4597,6 +4599,7 @@ SCRIPTMETA-DIST-END
     }
     .into();
     let second_item: scriptmetakit::ScriptMetaItemRef = scriptmetakit::ScriptMetaItem {
+        presentation: Default::default(),
         root_id: "scripts".into(),
         file_path: second_path.clone(),
         identity_path: second_path.clone(),
@@ -4693,6 +4696,7 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
+            presentation: Default::default(),
             root_id: "scripts".into(),
             file_path: script_path.clone(),
             identity_path: script_path,
@@ -4748,6 +4752,7 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
+            presentation: Default::default(),
             root_id: "scripts".into(),
             file_path: script_path.clone(),
             identity_path: script_path.clone(),
@@ -5170,6 +5175,7 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
+            presentation: Default::default(),
             root_id: "scripts".into(),
             file_path: temp.path().join("Second.jsx"),
             identity_path: temp.path().join("Second.jsx"),
@@ -5234,6 +5240,7 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
+            presentation: Default::default(),
             root_id: "scripts".into(),
             file_path: script_path.clone(),
             identity_path: script_path.clone(),
@@ -5324,6 +5331,7 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
+            presentation: Default::default(),
             root_id: "scripts".into(),
             file_path: temp.path().join("Example.jsx"),
             identity_path: temp.path().join("Example.jsx"),
@@ -5467,6 +5475,7 @@ fn script_item_for_update(
     meta_url: url::Url,
 ) -> scriptmetakit::ScriptMetaItemRef {
     scriptmetakit::ScriptMetaItem {
+        presentation: Default::default(),
         root_id: "scripts".into(),
         file_path: script_path.to_path_buf(),
         identity_path: script_path.to_path_buf(),
@@ -5522,6 +5531,7 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
+            presentation: Default::default(),
             root_id: "scripts".into(),
             file_path: temp.path().join("Http.jsx"),
             identity_path: temp.path().join("Http.jsx"),

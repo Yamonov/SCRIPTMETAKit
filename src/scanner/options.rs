@@ -75,6 +75,7 @@ impl Default for ExtensionPolicy {
 pub struct ScannerOptions {
     pub max_depth: usize,
     pub max_nodes_per_root: usize,
+    #[serde(default = "default_prefix_bytes")]
     pub max_prefix_bytes: usize,
     pub skip_hidden: bool,
     pub skip_packages: bool,
@@ -149,6 +150,10 @@ impl Default for ScannerOptions {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_prefix_bytes() -> usize {
+    128 * 1024
 }
 
 fn default_scan_timeout_per_root_millis() -> Option<u64> {

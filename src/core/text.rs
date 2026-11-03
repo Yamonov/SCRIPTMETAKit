@@ -1,6 +1,26 @@
 use std::borrow::Cow;
 
-use encoding_rs::{EUC_JP, SHIFT_JIS, UTF_16BE, UTF_16LE};
+use encoding_rs::{DecoderResult, EUC_JP, SHIFT_JIS, UTF_8, UTF_16BE, UTF_16LE};
+
+/// Keep the common LF-only source borrowed; normalize CR/CRLF in one pass.
+pub(crate) fn normalized_newlines(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            result.push('\n');
+        } else {
+            result.push(character);
+        }
+    }
+    Cow::Owned(result)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScriptTextEncoding {
@@ -27,6 +47,17 @@ pub fn decode_script_text(bytes: &[u8]) -> String {
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// A limited file read must not make an unfinished final character look like
+/// an encoding error. Whole-file readers retain their existing strict handling.
+pub(crate) fn decode_script_text_prefix(bytes: &[u8], is_complete: bool) -> String {
+    if is_complete {
+        return decode_script_text(bytes);
+    }
+    decode_script_text_with_encoding_impl(bytes, false)
+        .map(|decoded| decoded.text)
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
 #[must_use]
 pub fn decode_script_text_strict(bytes: &[u8]) -> Option<Cow<'_, str>> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF])
@@ -39,7 +70,7 @@ pub fn decode_script_text_strict(bytes: &[u8]) -> Option<Cow<'_, str>> {
         return decode_script_text_with_encoding(bytes).map(|decoded| Cow::Owned(decoded.text));
     }
 
-    if let Some(decoded) = decode_bomless_utf16_text(bytes) {
+    if let Some(decoded) = decode_bomless_utf16_text(bytes, true) {
         return Some(Cow::Owned(decoded.text));
     }
 
@@ -52,13 +83,17 @@ pub fn decode_script_text_strict(bytes: &[u8]) -> Option<Cow<'_, str>> {
 
 #[must_use]
 pub fn decode_script_text_with_encoding(bytes: &[u8]) -> Option<DecodedScriptText> {
+    decode_script_text_with_encoding_impl(bytes, true)
+}
+
+fn decode_script_text_with_encoding_impl(
+    bytes: &[u8],
+    is_complete: bool,
+) -> Option<DecodedScriptText> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF])
-        && let Ok(text) = std::str::from_utf8(&bytes[3..])
+        && let Some(decoded) = decode_utf8(&bytes[3..], ScriptTextEncoding::Utf8Bom, is_complete)
     {
-        return Some(DecodedScriptText {
-            text: text.to_string(),
-            encoding: ScriptTextEncoding::Utf8Bom,
-        });
+        return Some(decoded);
     }
 
     if bytes.starts_with(&[0xFF, 0xFE]) {
@@ -66,30 +101,65 @@ pub fn decode_script_text_with_encoding(bytes: &[u8]) -> Option<DecodedScriptTex
             UTF_16LE,
             &bytes[2..],
             ScriptTextEncoding::Utf16LittleEndianBom,
+            is_complete,
         );
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        return decode_with_encoding(UTF_16BE, &bytes[2..], ScriptTextEncoding::Utf16BigEndianBom);
+        return decode_with_encoding(
+            UTF_16BE,
+            &bytes[2..],
+            ScriptTextEncoding::Utf16BigEndianBom,
+            is_complete,
+        );
     }
 
-    if let Some(decoded) = decode_bomless_utf16_text(bytes) {
+    if let Some(decoded) = decode_bomless_utf16_text(bytes, is_complete) {
         return Some(decoded);
     }
 
+    if let Some(decoded) = decode_utf8(bytes, ScriptTextEncoding::Utf8, is_complete) {
+        return Some(decoded);
+    }
+
+    decode_legacy_japanese_text(bytes, is_complete)
+        .or_else(|| {
+            decode_with_encoding(
+                UTF_16LE,
+                bytes,
+                ScriptTextEncoding::Utf16LittleEndian,
+                is_complete,
+            )
+        })
+        .or_else(|| {
+            decode_with_encoding(
+                UTF_16BE,
+                bytes,
+                ScriptTextEncoding::Utf16BigEndian,
+                is_complete,
+            )
+        })
+}
+
+fn decode_utf8(
+    bytes: &[u8],
+    script_encoding: ScriptTextEncoding,
+    is_complete: bool,
+) -> Option<DecodedScriptText> {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Some(DecodedScriptText {
             text: text.to_string(),
-            encoding: ScriptTextEncoding::Utf8,
+            encoding: script_encoding,
         });
     }
-
-    decode_legacy_japanese_text(bytes)
-        .or_else(|| decode_with_encoding(UTF_16LE, bytes, ScriptTextEncoding::Utf16LittleEndian))
-        .or_else(|| decode_with_encoding(UTF_16BE, bytes, ScriptTextEncoding::Utf16BigEndian))
+    if is_complete {
+        None
+    } else {
+        decode_with_encoding(UTF_8, bytes, script_encoding, false)
+    }
 }
 
-fn decode_bomless_utf16_text(bytes: &[u8]) -> Option<DecodedScriptText> {
-    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
+fn decode_bomless_utf16_text(bytes: &[u8], is_complete: bool) -> Option<DecodedScriptText> {
+    if bytes.len() < 4 || (is_complete && !bytes.len().is_multiple_of(2)) {
         return None;
     }
 
@@ -105,9 +175,19 @@ fn decode_bomless_utf16_text(bytes: &[u8]) -> Option<DecodedScriptText> {
         odd_zeroes * 4 >= sampled_pairs * 3 && even_zeroes * 4 <= sampled_pairs;
     let likely_big_endian = even_zeroes * 4 >= sampled_pairs * 3 && odd_zeroes * 4 <= sampled_pairs;
     if likely_little_endian {
-        decode_with_encoding(UTF_16LE, bytes, ScriptTextEncoding::Utf16LittleEndian)
+        decode_with_encoding(
+            UTF_16LE,
+            bytes,
+            ScriptTextEncoding::Utf16LittleEndian,
+            is_complete,
+        )
     } else if likely_big_endian {
-        decode_with_encoding(UTF_16BE, bytes, ScriptTextEncoding::Utf16BigEndian)
+        decode_with_encoding(
+            UTF_16BE,
+            bytes,
+            ScriptTextEncoding::Utf16BigEndian,
+            is_complete,
+        )
     } else {
         None
     }
@@ -136,17 +216,32 @@ fn decode_with_encoding(
     encoding: &'static encoding_rs::Encoding,
     bytes: &[u8],
     script_encoding: ScriptTextEncoding,
+    is_complete: bool,
 ) -> Option<DecodedScriptText> {
-    let (text, _encoding_used, had_errors) = encoding.decode(bytes);
-    (!had_errors).then(|| DecodedScriptText {
-        text: text.into_owned(),
+    if is_complete {
+        let (text, _encoding_used, had_errors) = encoding.decode(bytes);
+        return (!had_errors).then(|| DecodedScriptText {
+            text: text.into_owned(),
+            encoding: script_encoding,
+        });
+    }
+
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let capacity = decoder.max_utf8_buffer_length_without_replacement(bytes.len())?;
+    let mut text = String::with_capacity(capacity);
+    // last=false buffers an incomplete trailing character, while malformed
+    // sequences within the prefix still disqualify this encoding.
+    let (result, consumed) = decoder.decode_to_string_without_replacement(bytes, &mut text, false);
+    (result == DecoderResult::InputEmpty && consumed == bytes.len()).then_some(DecodedScriptText {
+        text,
         encoding: script_encoding,
     })
 }
 
-fn decode_legacy_japanese_text(bytes: &[u8]) -> Option<DecodedScriptText> {
-    let euc_jp = decode_with_encoding(EUC_JP, bytes, ScriptTextEncoding::EucJp);
-    let shift_jis = decode_with_encoding(SHIFT_JIS, bytes, ScriptTextEncoding::ShiftJis);
+fn decode_legacy_japanese_text(bytes: &[u8], is_complete: bool) -> Option<DecodedScriptText> {
+    let euc_jp = decode_with_encoding(EUC_JP, bytes, ScriptTextEncoding::EucJp, is_complete);
+    let shift_jis =
+        decode_with_encoding(SHIFT_JIS, bytes, ScriptTextEncoding::ShiftJis, is_complete);
     match (euc_jp, shift_jis) {
         (Some(euc_jp), Some(shift_jis)) => {
             let euc_score = decoded_japanese_score(&euc_jp.text);
@@ -223,8 +318,9 @@ fn encode_utf16(text: &str, big_endian: bool, with_bom: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cow, ScriptTextEncoding, decode_script_text, decode_script_text_strict,
-        decode_script_text_with_encoding,
+        Cow, ScriptTextEncoding, decode_script_text, decode_script_text_prefix,
+        decode_script_text_strict, decode_script_text_with_encoding,
+        decode_script_text_with_encoding_impl, decode_with_encoding, encode_script_text,
     };
 
     #[test]
@@ -299,5 +395,137 @@ mod tests {
             decode_script_text_strict(bytes),
             Some(Cow::Borrowed("alert('hello');"))
         ));
+    }
+
+    #[test]
+    fn partial_utf8_retains_completed_text_at_each_multibyte_boundary() {
+        let prefix = "SCRIPTMETA-BEGIN\nName=日本語\nSCRIPTMETA-END\n";
+        for encoding in [ScriptTextEncoding::Utf8, ScriptTextEncoding::Utf8Bom] {
+            for character in ['¢', '日', '🦀'] {
+                let bytes = encode_script_text(&format!("{prefix}{character}"), encoding).unwrap();
+                let prefix_len = bytes.len() - character.len_utf8();
+                for extra in 1..character.len_utf8() {
+                    let decoded =
+                        decode_script_text_with_encoding_impl(&bytes[..prefix_len + extra], false)
+                            .unwrap();
+                    assert_eq!(
+                        (decoded.encoding, decoded.text.as_str()),
+                        (encoding, prefix)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_utf16_retains_completed_text_at_code_unit_and_surrogate_boundaries() {
+        let prefix = "SCRIPTMETA-BEGIN\nName=日本語\nSCRIPTMETA-END\n";
+        for encoding in [
+            ScriptTextEncoding::Utf16LittleEndian,
+            ScriptTextEncoding::Utf16LittleEndianBom,
+            ScriptTextEncoding::Utf16BigEndian,
+            ScriptTextEncoding::Utf16BigEndianBom,
+        ] {
+            let bytes = encode_script_text(&format!("{prefix}🦀"), encoding).unwrap();
+            for extra in 1..4 {
+                let decoded =
+                    decode_script_text_with_encoding_impl(&bytes[..bytes.len() - 4 + extra], false)
+                        .unwrap();
+                assert_eq!(
+                    (decoded.encoding, decoded.text.as_str()),
+                    (encoding, prefix)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_legacy_japanese_retains_completed_text() {
+        let prefix = "SCRIPTMETA-BEGIN\nName=日本語のスクリプト\nSCRIPTMETA-END\n";
+        for encoding in [ScriptTextEncoding::EucJp, ScriptTextEncoding::ShiftJis] {
+            let bytes = encode_script_text(&format!("{prefix}語"), encoding).unwrap();
+            let decoded =
+                decode_script_text_with_encoding_impl(&bytes[..bytes.len() - 1], false).unwrap();
+            assert_eq!(
+                (decoded.encoding, decoded.text.as_str()),
+                (encoding, prefix)
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_trailing_character_is_only_accepted_for_partial_input() {
+        for (encoding, kind, bytes) in [
+            (
+                encoding_rs::UTF_8,
+                ScriptTextEncoding::Utf8,
+                b"abc\xe3\x81".as_slice(),
+            ),
+            (
+                encoding_rs::UTF_16LE,
+                ScriptTextEncoding::Utf16LittleEndian,
+                b"a\0b\0c\0\x3d\xd8".as_slice(),
+            ),
+            (
+                encoding_rs::EUC_JP,
+                ScriptTextEncoding::EucJp,
+                b"abc\xa4".as_slice(),
+            ),
+            (
+                encoding_rs::SHIFT_JIS,
+                ScriptTextEncoding::ShiftJis,
+                b"abc\x82".as_slice(),
+            ),
+        ] {
+            assert!(decode_with_encoding(encoding, bytes, kind, true).is_none());
+            assert_eq!(
+                decode_with_encoding(encoding, bytes, kind, false)
+                    .unwrap()
+                    .text,
+                "abc"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_decoder_does_not_ignore_malformed_characters_inside_input() {
+        for (encoding, kind, bytes) in [
+            (
+                encoding_rs::UTF_8,
+                ScriptTextEncoding::Utf8,
+                b"abc\xffxyz".as_slice(),
+            ),
+            (
+                encoding_rs::UTF_16LE,
+                ScriptTextEncoding::Utf16LittleEndian,
+                b"a\0\0\xdcx\0".as_slice(),
+            ),
+            (
+                encoding_rs::EUC_JP,
+                ScriptTextEncoding::EucJp,
+                b"abc\xffxyz".as_slice(),
+            ),
+            (
+                encoding_rs::SHIFT_JIS,
+                ScriptTextEncoding::ShiftJis,
+                b"abc\x82\x20xyz".as_slice(),
+            ),
+        ] {
+            assert!(decode_with_encoding(encoding, bytes, kind, false).is_none());
+        }
+    }
+
+    #[test]
+    fn complete_prefix_keeps_whole_file_decoding_behavior() {
+        for bytes in [
+            b"valid UTF-8".as_slice(),
+            b"unfinished\xe3\x81",
+            b"invalid\xffx",
+        ] {
+            assert_eq!(
+                decode_script_text_prefix(bytes, true),
+                decode_script_text(bytes)
+            );
+        }
     }
 }

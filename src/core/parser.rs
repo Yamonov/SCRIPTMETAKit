@@ -4,7 +4,7 @@ use url::Url;
 
 use super::{
     DistributionMetadata, ParserOptions, ScriptMetaKitError, ScriptMetaKitResult, ScriptMetadata,
-    normalize_version_string,
+    metadata_sections, normalize_version_string,
 };
 
 const SCRIPT_BEGIN: &str = "SCRIPTMETA-BEGIN";
@@ -49,25 +49,33 @@ pub fn parse_script_metadata_with_options(
 ) -> ScriptMetaKitResult<ScriptMetadata> {
     let body = script_metadata_body(text, options.require_closed_block)
         .ok_or_else(|| ScriptMetaKitError::Parse("missing SCRIPTMETA block".to_string()))?;
-    let fields = parse_script_metadata_fields(body);
+    let sections = metadata_sections(body);
+    let fields = parse_script_metadata_fields(&sections.legacy_body);
     let script_id = fields.script_id.ok_or_else(|| {
         ScriptMetaKitError::Parse("missing required SCRIPTMETA field `script-id`".to_string())
     })?;
 
+    let (name, author, description, presentation) = sections.project(
+        fields.name.as_deref(),
+        fields.author.as_deref(),
+        fields.description.as_deref(),
+        &options.preferred_languages,
+    );
     Ok(ScriptMetadata {
         script_id,
         version: optional_version_value(fields.version)?,
-        description: fields.description,
+        description,
         target_app: fields.target_app,
         min_target_version: fields.min_target_version,
         meta_url: optional_url_value(fields.meta_url)?,
         latest_url: optional_url_value(fields.latest_url)?,
         latest_version: optional_version_value(fields.latest_version)?,
         latest_page_url: optional_url_value(fields.latest_page_url)?,
-        name: fields.name,
-        author: fields.author,
+        name,
+        author,
         release_date: fields.release_date,
         edit_password_sha256: fields.edit_password_sha256,
+        presentation,
     })
 }
 
@@ -135,6 +143,7 @@ pub(crate) fn select_distribution_metadata_for_script(
 fn distribution_body(text: &str) -> ScriptMetaKitResult<Cow<'_, str>> {
     block_between(text, DIST_BEGIN, DIST_END)
         .map(normalize_distribution_body)
+        .map(|body| Cow::Owned(metadata_sections(body.as_ref()).legacy_body))
         .ok_or_else(|| {
             ScriptMetaKitError::Parse("missing SCRIPTMETA distribution block".to_string())
         })
@@ -453,6 +462,22 @@ fn find_metadata_field_boundaries(line: &str, known_keys: &[&str]) -> Vec<Metada
         }
     }
     fields
+}
+
+/// A scalar renderer puts the first value byte directly after '='. Later
+/// whitespace-delimited keys would be interpreted as additional legacy fields.
+pub(crate) fn contains_inline_metadata_field(value: &str, distribution: bool) -> bool {
+    let value = value.trim();
+    let keys = if distribution {
+        DISTRIBUTION_METADATA_KEYS
+    } else {
+        SCRIPT_METADATA_KEYS
+    };
+    value.char_indices().any(|(index, _)| {
+        index > 0
+            && is_metadata_key_boundary(value, index)
+            && metadata_field_at(value, index, keys).is_some()
+    })
 }
 
 fn metadata_field_at(
@@ -880,6 +905,7 @@ scriptmeta-end
         let metadata = parse_script_metadata_with_options(
             text,
             &ParserOptions {
+                preferred_languages: Default::default(),
                 max_prefix_bytes: 1024,
                 require_closed_block: false,
             },

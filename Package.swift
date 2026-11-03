@@ -1,5 +1,6 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.1
 import PackageDescription
+import Foundation
 
 let package = Package(
     name: "ScriptMetaKit",
@@ -15,7 +16,7 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "ScriptMetaKitFFI",
-            path: "Artifacts/ScriptMetaKitFFI.xcframework"
+            path: ProcessInfo.processInfo.environment["SCRIPT_META_KIT_FFI_PATH"] ?? "Artifacts/ScriptMetaKitFFI.xcframework"
         ),
         .target(
             name: "ScriptMetaKit",
@@ -29,5 +30,6 @@ let package = Package(
             dependencies: ["ScriptMetaKit"],
             path: "tests/ScriptMetaKitTests"
         )
-    ]
+    ],
+    swiftLanguageModes: [.v5, .v6]
 )

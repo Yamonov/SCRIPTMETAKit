@@ -24,7 +24,7 @@ use crate::{
     core::{
         OperationCancellation, ParserOptions, ScriptMetaEditState, ScriptMetaItem,
         ScriptMetaItemRef, ScriptRuntimeKind, VersionOrdering, compare_versions,
-        decode_script_text, has_script_metadata_block_with_options,
+        decode_script_text_prefix, has_script_metadata_block_with_options,
         parse_script_metadata_with_options,
     },
     formats::{
@@ -133,6 +133,8 @@ pub(crate) struct MetadataScanSources<'a> {
     pub visible_root_id: Option<&'a RootId>,
 }
 
+/// Low-level scanning. A supplied candidate cache must have been produced with
+/// the same read settings. ScriptMetaKitEngine manages this context automatically.
 pub fn scan_metadata_roots<'a, I>(
     roots: I,
     options: &ScannerOptions,
@@ -145,6 +147,8 @@ where
     scan_metadata_roots_scoped(roots, options, extensions, previous_cache, None)
 }
 
+/// Low-level scoped scanning; previous_cache has the same read-context contract
+/// as scan_metadata_roots. Consumer applications should normally use the engine.
 pub fn scan_metadata_roots_scoped<'a, I>(
     roots: I,
     options: &ScannerOptions,
@@ -1215,7 +1219,7 @@ fn candidate_record_from_observation(
         ScriptSourceReadResult::Failed(error) => (
             None,
             None,
-            true,
+            false,
             error.resolution_status,
             Some(error.message),
         ),
@@ -1318,7 +1322,8 @@ fn read_prefix(path: &Path, max_bytes: usize, file_size: u64) -> std::io::Result
         .min(max_bytes);
     let mut buffer = Vec::with_capacity(capacity);
     limited.read_to_end(&mut buffer)?;
-    Ok(decode_script_text(&buffer))
+    let is_complete = buffer.len() < max_bytes || buffer.len() as u64 >= file_size;
+    Ok(decode_script_text_prefix(&buffer, is_complete))
 }
 
 struct ScriptSourceRead {
@@ -1525,6 +1530,7 @@ fn reusable_records_by_identity_path<'a>(
             cache
                 .records
                 .iter()
+                .filter(|record| !should_skip_resolution_error(record.resolution_status))
                 .map(|record| (record.identity_path.as_path(), record))
                 .collect()
         })

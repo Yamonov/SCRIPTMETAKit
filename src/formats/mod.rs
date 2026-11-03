@@ -295,7 +295,7 @@ pub fn scriptmeta_edit_capability_from_cached_metadata(
     scriptmeta_edit_capability(
         path,
         None,
-        true,
+        previous_state != ScriptMetaEditState::Unknown,
         has_scriptmeta,
         has_scriptmeta_edit_password,
     )

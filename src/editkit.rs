@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fmt::Write as _,
     fs::{self, File},
@@ -7,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
@@ -15,9 +16,12 @@ use uuid::Uuid;
 use crate::{
     ItemId,
     core::{
-        ScriptMetaKitError, ScriptMetaKitResult, ScriptRuntimeKind, clean_metadata_line,
-        decode_script_text, decode_script_text_with_encoding, encode_script_text,
-        has_script_metadata_block, normalize_metadata_url, normalize_version_string,
+        LanguagePreferences, MetadataDiagnostic, MetadataEditExtensions, ScriptMetaKitError,
+        ScriptMetaKitResult, ScriptRuntimeKind, clean_metadata_line, decode_script_text_prefix,
+        decode_script_text_with_encoding, description_starts_with_language_label,
+        encode_script_text, has_script_metadata_block, metadata_sections, normalize_language_tag,
+        normalize_metadata_tags, normalize_metadata_url, normalize_version_string,
+        normalized_newlines,
     },
     formats::{self, CommentSyntax, compiled_osa},
 };
@@ -63,23 +67,57 @@ pub struct ScriptIdUniquenessItem {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScriptMetadataDraft {
     pub script_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_version")]
     pub version: Option<String>,
     pub description: Option<String>,
     pub target_app: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_version")]
     pub min_target_version: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_metadata_url")]
     pub meta_url: Option<Url>,
     pub name: Option<String>,
     pub author: Option<String>,
     pub release_date: Option<String>,
     pub edit_password_sha256: Option<String>,
+    /// None preserves new fields found in the original document for older callers.
+    #[serde(default)]
+    pub extensions: Option<MetadataEditExtensions>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DistributionMetadataDraft {
     pub script_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_version")]
     pub version: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_metadata_url")]
     pub latest_url: Option<Url>,
+    #[serde(default, deserialize_with = "deserialize_optional_metadata_url")]
     pub latest_page_url: Option<Url>,
+}
+
+// JSON editing inputs follow the same normalizers as the typed C/file APIs.
+fn deserialize_optional_version<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            normalize_version_string(&value).ok_or_else(|| D::Error::custom("invalid version"))
+        })
+        .transpose()
+}
+
+fn deserialize_optional_metadata_url<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Url>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            normalize_metadata_url(&value).ok_or_else(|| D::Error::custom("invalid metadata URL"))
+        })
+        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -199,6 +237,8 @@ pub struct ScriptMetadataEditReadResult {
     pub unknown_lines: Vec<String>,
     pub existing_block_text: Option<String>,
     pub source_fingerprint: String,
+    #[serde(default)]
+    pub diagnostics: Vec<MetadataDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -355,7 +395,10 @@ pub fn render_script_metadata_for_style(
     style: ScriptMetaCommentStyle,
 ) -> ScriptMetaKitResult<String> {
     let block = render_script_metadata_block(draft)?;
-    Ok(wrap_metadata_block(&block, style))
+    Ok(wrap_metadata_block(
+        &comment_safe_metadata_text(&block, style),
+        style,
+    ))
 }
 
 pub fn append_script_metadata_to_text(
@@ -431,20 +474,45 @@ pub fn read_script_metadata_draft_from_text(
     })?;
     let line_ending = detected_line_ending(source).to_string();
     let existing_block = first_scriptmeta_tagged_block(source, style);
-    let (draft, existing_lines, unknown_lines, existing_block_text) =
+    let (draft, existing_lines, unknown_lines, existing_block_text, diagnostics) =
         if let Some(block) = existing_block {
-            let elements = parse_block_elements(&block.content);
+            let sections = metadata_sections(&block.content);
+            let elements = parse_block_elements(&sections.legacy_body);
+            let mut draft = draft_from_block_elements(&elements);
+            let (_, _, _, presentation) = sections.project(
+                draft.name.as_deref(),
+                draft.author.as_deref(),
+                draft.description.as_deref(),
+                &LanguagePreferences::default(),
+            );
+            let (name, author, extensions) =
+                sections.editing_extensions(draft.name.as_deref(), draft.author.as_deref());
+            draft.name = name;
+            draft.author = author;
+            draft.extensions = extensions;
+            if sections.raw_description.is_some() {
+                draft.description = sections.raw_description.clone();
+            }
+            let mut unknown = unknown_content_lines(&elements);
+            unknown.extend(sections.opaque_blocks);
             (
-                draft_from_block_elements(&elements),
+                draft,
                 normalized_newlines(&block.content)
                     .split('\n')
                     .map(str::to_string)
                     .collect(),
-                unknown_content_lines(&elements),
+                unknown,
                 Some(block.content),
+                presentation.diagnostics,
             )
         } else {
-            (ScriptMetadataDraft::default(), Vec::new(), Vec::new(), None)
+            (
+                ScriptMetadataDraft::default(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+            )
         };
 
     Ok(ScriptMetadataEditReadResult {
@@ -457,6 +525,7 @@ pub fn read_script_metadata_draft_from_text(
         unknown_lines,
         existing_block_text,
         source_fingerprint: file_content_fingerprint(source.as_bytes()),
+        diagnostics,
     })
 }
 
@@ -526,9 +595,9 @@ pub fn read_script_metadata_edit_preview_from_file(
             message: error.to_string(),
         })?;
 
-    let preview_text = decode_script_text(&bytes);
     let preview_byte_count = bytes.len();
     let is_truncated = file_size > u64::try_from(preview_byte_count).unwrap_or(u64::MAX);
+    let preview_text = decode_script_text_prefix(&bytes, !is_truncated);
     Ok(script_metadata_edit_preview_result(
         path,
         preview_text,
@@ -1158,6 +1227,33 @@ pub fn reset_scriptmeta_backups_with_current_as_initial(
 
 fn validate_script_metadata_draft(draft: &ScriptMetadataDraft) -> ScriptMetaKitResult<()> {
     validate_required_field("Script-ID", draft.script_id.as_str())?;
+    for (field, value) in [
+        ("Script-ID", Some(draft.script_id.as_str())),
+        ("Name", draft.name.as_deref()),
+        ("Author", draft.author.as_deref()),
+        ("Target-App", draft.target_app.as_deref()),
+        ("Release-Date", draft.release_date.as_deref()),
+        ("Meta-URL", draft.meta_url.as_ref().map(Url::as_str)),
+    ] {
+        if let Some(value) = value {
+            validate_scalar_field(field, value, SCRIPT_END)?;
+            if draft.extensions.is_none() || !matches!(field, "Name" | "Author") {
+                validate_no_inline_fields(field, value, false)?;
+            }
+        }
+    }
+    if let Some(body) = &draft.description {
+        validate_no_end_marker("Description", body, SCRIPT_END)?;
+        if description_needs_block(body, draft.extensions.is_some())
+            && body
+                .split(['\r', '\n'])
+                .any(|line| line.trim() == DESCRIPTION_END)
+        {
+            return Err(ScriptMetaKitError::InvalidConfig(
+                "Description body contains its ending marker".into(),
+            ));
+        }
+    }
     validate_optional_version("Version", draft.version.as_deref())?;
     validate_optional_version("Min-Target-Version", draft.min_target_version.as_deref())?;
     if let Some(edit_password_sha256) = draft
@@ -1175,6 +1271,26 @@ fn validate_script_metadata_draft(draft: &ScriptMetadataDraft) -> ScriptMetaKitR
             "Author is required when Edit-Password-SHA256 is present".to_string(),
         ));
     }
+    if let Some(extensions) = &draft.extensions {
+        validate_required_field("Name", draft.name.as_deref().unwrap_or_default())?;
+        let default = extensions
+            .default_language
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ScriptMetaKitError::InvalidConfig(
+                    "Meta-Default-language is required for localized metadata or Tags".into(),
+                )
+            })?;
+        normalize_language_tag(default)?;
+        for (field, values) in [("Name", &extensions.names), ("Author", &extensions.authors)] {
+            for (language, value) in values {
+                normalize_language_tag(language)?;
+                validate_scalar_field(&format!("{field}[{language}]"), value, SCRIPT_END)?;
+            }
+        }
+        normalize_metadata_tags(&extensions.tags)?;
+    }
     Ok(())
 }
 
@@ -1183,12 +1299,43 @@ fn render_script_metadata_block_with_existing(
     existing_content: Option<&str>,
     line_ending: &str,
 ) -> ScriptMetaKitResult<String> {
+    let sections = existing_content.map(metadata_sections);
+    if sections
+        .as_ref()
+        .is_some_and(|sections| !sections.is_structurally_complete())
+    {
+        return Err(ScriptMetaKitError::InvalidConfig(
+            "repair the unclosed or repeated Description block before editing metadata".into(),
+        ));
+    }
+    let old_extensions = sections.as_ref().and_then(|sections| {
+        let old = draft_from_block_elements(&parse_block_elements(&sections.legacy_body));
+        sections
+            .editing_extensions(old.name.as_deref(), old.author.as_deref())
+            .2
+    });
+    let mut effective = draft.clone();
+    if effective.extensions.is_none() {
+        effective.extensions = old_extensions.clone();
+    }
+    if effective.extensions.is_none()
+        && effective
+            .description
+            .as_deref()
+            .is_some_and(description_starts_with_language_label)
+    {
+        effective.extensions = Some(MetadataEditExtensions::default());
+    }
+    let draft = &effective;
     validate_script_metadata_draft(draft)?;
 
-    let existing_unknown_lines = existing_content
-        .map(parse_block_elements)
-        .map(|elements| unknown_content_lines(&elements))
+    let mut existing_unknown_lines = sections
+        .as_ref()
+        .map(|sections| unknown_content_lines(&parse_block_elements(&sections.legacy_body)))
         .unwrap_or_default();
+    if let Some(sections) = &sections {
+        existing_unknown_lines.extend(sections.opaque_blocks.clone());
+    }
     let mut lines = Vec::with_capacity(16 + existing_unknown_lines.len());
     append_field_line(&mut lines, "Script-ID", Some(draft.script_id.as_str()));
     append_normalized_version_field_line(&mut lines, "Version", draft.version.as_deref());
@@ -1211,8 +1358,49 @@ fn render_script_metadata_block_with_existing(
         "Edit-Password-SHA256",
         draft.edit_password_sha256.as_deref(),
     );
+    if let Some(extensions) = &draft.extensions {
+        let default_language = extensions
+            .default_language
+            .as_deref()
+            .map(normalize_language_tag)
+            .transpose()?;
+        append_field_line(
+            &mut lines,
+            "Meta-Default-language",
+            default_language.as_deref(),
+        );
+        for (field, values) in [("Name", &extensions.names), ("Author", &extensions.authors)] {
+            let mut canonical = BTreeMap::<String, String>::new();
+            for (language, value) in values {
+                let language = normalize_language_tag(language)?;
+                crate::core::append_value(
+                    canonical.entry(language).or_default(),
+                    value.trim(),
+                    " ",
+                );
+            }
+            for (language, value) in canonical {
+                append_field_line(&mut lines, &format!("{field}[{language}]"), Some(&value));
+            }
+        }
+        let tags = normalize_metadata_tags(&extensions.tags)?;
+        let preserve_tag_lines = old_extensions
+            .as_ref()
+            .is_some_and(|old| old.tags == extensions.tags);
+        if preserve_tag_lines {
+            if let Some(sections) = &sections {
+                lines.extend(sections.tag_lines.clone());
+            }
+        } else if !tags.is_empty() {
+            append_field_line(&mut lines, "Tags", Some(&tags.join(",")));
+        }
+    }
     lines.extend(existing_unknown_lines);
-    append_description_lines(&mut lines, draft.description.as_deref());
+    append_description_lines(
+        &mut lines,
+        draft.description.as_deref(),
+        draft.extensions.is_some(),
+    );
     trim_outer_blank_lines(&mut lines);
 
     let mut output = String::with_capacity(256);
@@ -1241,17 +1429,21 @@ fn append_normalized_version_field_line(lines: &mut Vec<String>, key: &str, valu
     lines.push(format!("{key}={value}"));
 }
 
-fn append_description_lines(lines: &mut Vec<String>, value: Option<&str>) {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+fn append_description_lines(lines: &mut Vec<String>, value: Option<&str>, force_block: bool) {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
         return;
     };
-    if value.contains('\n') || value.contains('\r') {
+    if description_needs_block(value, force_block) {
         lines.push(DESCRIPTION_BEGIN.to_string());
         lines.extend(normalized_newlines(value).split('\n').map(str::to_string));
         lines.push(DESCRIPTION_END.to_string());
     } else {
         append_field_line(lines, "Description", Some(value));
     }
+}
+
+fn description_needs_block(value: &str, force_block: bool) -> bool {
+    force_block || value.contains(['\r', '\n']) || value.trim() != value
 }
 
 fn unknown_content_lines(elements: &[ScriptMetaBlockElement]) -> Vec<String> {
@@ -1643,12 +1835,21 @@ fn wrapped_tagged_block_insertion(
     }
 }
 
-fn comment_safe_metadata_text(value: &str, style: ScriptMetaCommentStyle) -> String {
+fn comment_safe_metadata_text(value: &str, style: ScriptMetaCommentStyle) -> Cow<'_, str> {
     let closing = style.closing_delimiter();
     if closing.is_empty() {
-        return value.to_string();
+        return Cow::Borrowed(value);
     }
-    value.replace(closing, style.escaped_closing_delimiter())
+    let mut text = if value.contains(closing) {
+        Cow::Owned(value.replace(closing, style.escaped_closing_delimiter()))
+    } else {
+        Cow::Borrowed(value)
+    };
+    // AppleScript block comments nest, so an unmatched opening also breaks source.
+    if style == ScriptMetaCommentStyle::AppleScriptBlock && text.contains("(*") {
+        text = Cow::Owned(text.replace("(*", "( *"));
+    }
+    text
 }
 
 fn detected_line_ending(text: &str) -> &str {
@@ -1659,10 +1860,6 @@ fn detected_line_ending(text: &str) -> &str {
     } else {
         "\n"
     }
-}
-
-fn normalized_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn load_backup_index(
@@ -2308,6 +2505,19 @@ fn validate_distribution_metadata_draft(
     draft: &DistributionMetadataDraft,
 ) -> ScriptMetaKitResult<()> {
     validate_required_field("Script-ID", draft.script_id.as_str())?;
+    for (field, value) in [
+        ("Script-ID", Some(draft.script_id.as_str())),
+        ("Latest-URL", draft.latest_url.as_ref().map(Url::as_str)),
+        (
+            "Latest-Page-URL",
+            draft.latest_page_url.as_ref().map(Url::as_str),
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_scalar_field(field, value, DIST_END)?;
+            validate_no_inline_fields(field, value, true)?;
+        }
+    }
     validate_optional_version("Version", draft.version.as_deref())?;
     if !has_value(draft.version.as_deref()) && draft.latest_url.is_none() {
         return Err(ScriptMetaKitError::InvalidConfig(
@@ -2332,6 +2542,37 @@ fn validate_required_field(name: &str, value: &str) -> ScriptMetaKitResult<()> {
     if value.trim().is_empty() {
         return Err(ScriptMetaKitError::InvalidConfig(format!(
             "{name} is required"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_scalar_field(name: &str, value: &str, end_marker: &str) -> ScriptMetaKitResult<()> {
+    if value.contains(['\r', '\n']) {
+        return Err(ScriptMetaKitError::InvalidConfig(format!(
+            "{name} must be a single line"
+        )));
+    }
+    validate_no_end_marker(name, value, end_marker)
+}
+
+fn validate_no_inline_fields(
+    name: &str,
+    value: &str,
+    distribution: bool,
+) -> ScriptMetaKitResult<()> {
+    if crate::core::contains_inline_metadata_field(value, distribution) {
+        return Err(ScriptMetaKitError::InvalidConfig(format!(
+            "{name} contains ambiguous inline metadata field syntax"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_no_end_marker(name: &str, value: &str, end_marker: &str) -> ScriptMetaKitResult<()> {
+    if find_ascii_case_insensitive(value, end_marker).is_some() {
+        return Err(ScriptMetaKitError::InvalidConfig(format!(
+            "{name} contains the outer {end_marker} marker"
         )));
     }
     Ok(())
@@ -2489,6 +2730,7 @@ mod tests {
             author: Some("Example Author".to_string()),
             release_date: Some("2026-05-30".to_string()),
             edit_password_sha256: None,
+            extensions: None,
         };
 
         let rendered =

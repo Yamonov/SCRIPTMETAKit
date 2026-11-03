@@ -3,6 +3,7 @@
 
 import argparse
 from pathlib import Path
+import re
 import struct
 import subprocess
 import tempfile
@@ -31,6 +32,8 @@ def validate_string_pools(library):
             raise ValueError(f"{architecture}: expected a matching 64-bit dylib")
         position = start + 32
         found_symtab = False
+        found_install_name = False
+        found_deployment = False
         for _ in range(command_count):
             command, length = struct.unpack_from("<II", data, position)
             if length < 8 or position + length > start + size:
@@ -43,9 +46,33 @@ def validate_string_pools(library):
                     )
                 found_symtab = True
                 print(f"{architecture}: LINKEDIT string pool aligned at {string_offset:#x}", flush=True)
+            elif command in (0x0C, 0x0D, 0x80000018, 0x8000001F):
+                name_offset = struct.unpack_from("<I", data, position + 8)[0]
+                name_end = data.find(b"\0", position + name_offset, position + length)
+                if name_offset < 24 or name_end < 0:
+                    raise ValueError(f"{architecture}: invalid dylib name")
+                name = data[position + name_offset:name_end].decode()
+                if command == 0x0D:
+                    if name != "@rpath/libscriptmetakit_ffi.dylib":
+                        raise ValueError(f"{architecture}: unexpected install name {name}")
+                    found_install_name = True
+                elif not name.startswith(("/usr/lib/", "/System/Library/")):
+                    raise ValueError(f"{architecture}: non-system runtime dependency {name}")
+            elif command in (0x32, 0x24):
+                if command == 0x32:
+                    platform, minimum = struct.unpack_from("<II", data, position + 8)
+                    if platform != 1:
+                        raise ValueError(f"{architecture}: expected the macOS platform")
+                else:
+                    minimum = struct.unpack_from("<I", data, position + 8)[0]
+                if minimum > (13 << 16):
+                    raise ValueError(f"{architecture}: deployment target exceeds macOS 13")
+                found_deployment = True
             position += length
         if not found_symtab:
             raise ValueError(f"{architecture}: missing LC_SYMTAB")
+        if not found_install_name or not found_deployment:
+            raise ValueError(f"{architecture}: missing install name or deployment target")
         found.add(architecture)
     if found != set(ARCHITECTURES.values()) or count != 2:
         raise ValueError("expected exactly arm64 and x86_64")
@@ -54,12 +81,22 @@ def validate_string_pools(library):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library", type=Path)
+    parser.add_argument("--expected-version", default=None)
     arguments = parser.parse_args()
     library = arguments.library.resolve(strict=True)
     root = Path(__file__).resolve().parent.parent
+    version = arguments.expected_version or re.search(r'^version = "([^"]+)"', (root / "Cargo.toml").read_text(), re.M).group(1)
+    header = (root / "scriptmetakit_ffi/include/scriptmetakit_ffi.h").read_text()
+    expected_symbols = set(re.findall(r"\b(smk_\w+)\s*\(", header))
     validate_string_pools(library)
     with tempfile.TemporaryDirectory(prefix="scriptmetakit-native-link-") as temporary:
         for architecture in ARCHITECTURES.values():
+            exported = subprocess.check_output(["nm", "-arch", architecture, "-gU", str(library)], text=True)
+            symbols = set(re.findall(r"\b_(smk_\w+)\b", exported))
+            missing = expected_symbols - symbols
+            if missing:
+                raise ValueError(f"{architecture}: missing public functions: {', '.join(sorted(missing))}")
+            print(f"{architecture}: all {len(expected_symbols)} public C functions exported", flush=True)
             executable = Path(temporary) / f"probe-{architecture}"
             subprocess.run(
                 [
@@ -76,8 +113,9 @@ def main():
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             ).returncode == 0
             if available:
-                subprocess.run(["/usr/bin/arch", f"-{architecture}", str(executable)], check=True)
-                print(f"{architecture}: engine create/free passed", flush=True)
+                native_arch = "aarch64" if architecture == "arm64" else architecture
+                subprocess.run(["/usr/bin/arch", f"-{architecture}", str(executable), version, native_arch], check=True)
+                print(f"{architecture}: runtime version, capabilities and lifecycle passed", flush=True)
             else:
                 print(f"{architecture}: execution unavailable on this host; link checked", flush=True)
 

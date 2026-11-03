@@ -1,0 +1,56 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		000000000000000000000004 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitIntegrationProbe.swift; sourceTree = "<group>"; };
+		000000000000000000000005 = { isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KitIntegration.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000006 = { isa = PBXBuildFile; fileRef = 000000000000000000000004; };
+		000000000000000000000007 = { isa = PBXBuildFile; productRef = 00000000000000000000000D; };
+		000000000000000000000002 = { isa = PBXGroup; children = (000000000000000000000004, 000000000000000000000003); sourceTree = "<group>"; };
+		000000000000000000000003 = { isa = PBXGroup; children = (000000000000000000000005); name = Products; sourceTree = "<group>"; };
+		000000000000000000000008 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000006); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000009 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000007); runOnlyForDeploymentPostprocessing = 0; };
+		00000000000000000000000A = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		00000000000000000000000C = { isa = XCLocalSwiftPackageReference; relativePath = "../.."; };
+		00000000000000000000000D = { isa = XCSwiftPackageProductDependency; package = 00000000000000000000000C; productName = ScriptMetaKit; };
+		00000000000000000000000B = { isa = PBXNativeTarget; buildConfigurationList = 00000000000000000000000F;
+            buildPhases = (000000000000000000000008, 000000000000000000000009, 00000000000000000000000A); buildRules = (); dependencies = ();
+            name = KitIntegration; packageProductDependencies = (00000000000000000000000D); productName = KitIntegration;
+            productReference = 000000000000000000000005; productType = "com.apple.product-type.application"; };
+		000000000000000000000001 = { isa = PBXProject; attributes = { BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 1630; };
+            buildConfigurationList = 00000000000000000000000E; compatibilityVersion = "Xcode 14.0"; developmentRegion = en;
+            knownRegions = (en, Base); mainGroup = 000000000000000000000002; packageReferences = (00000000000000000000000C);
+            productRefGroup = 000000000000000000000003; projectDirPath = ""; projectRoot = ""; targets = (00000000000000000000000B); };
+		000000000000000000000010 = { isa = XCBuildConfiguration; name = Debug; buildSettings = {
+                ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; SDKROOT = macosx;
+                MACOSX_DEPLOYMENT_TARGET = 13.0; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete;
+                SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_COMPILATION_MODE = wholemodule;
+                COPY_PHASE_STRIP = NO; DEAD_CODE_STRIPPING = YES; }; };
+		000000000000000000000011 = { isa = XCBuildConfiguration; name = Release; buildSettings = {
+                ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; SDKROOT = macosx;
+                MACOSX_DEPLOYMENT_TARGET = 13.0; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete;
+                SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_COMPILATION_MODE = wholemodule;
+                COPY_PHASE_STRIP = NO; DEAD_CODE_STRIPPING = YES; }; };
+		000000000000000000000012 = { isa = XCBuildConfiguration; name = Debug; buildSettings = {
+                CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_ENTITLEMENTS = KitIntegration.entitlements;
+                GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_LSBackgroundOnly = YES;
+                LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+                PRODUCT_NAME = KitIntegration; PRODUCT_BUNDLE_IDENTIFIER = com.example.ScriptMetaKitIntegration;
+                MARKETING_VERSION = 2.0.0; CURRENT_PROJECT_VERSION = 1;
+                SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+            }; };
+		000000000000000000000013 = { isa = XCBuildConfiguration; name = Release; buildSettings = {
+                CODE_SIGN_STYLE = Manual; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_ENTITLEMENTS = KitIntegration.entitlements;
+                GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_LSBackgroundOnly = YES;
+                LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+                PRODUCT_NAME = KitIntegration; PRODUCT_BUNDLE_IDENTIFIER = com.example.ScriptMetaKitIntegration;
+                MARKETING_VERSION = 2.0.0; CURRENT_PROJECT_VERSION = 1;
+                SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+            }; };
+		00000000000000000000000E = { isa = XCConfigurationList; buildConfigurations = (000000000000000000000010, 000000000000000000000011); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		00000000000000000000000F = { isa = XCConfigurationList; buildConfigurations = (000000000000000000000012, 000000000000000000000013); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+	};
+	rootObject = 000000000000000000000001;
+}

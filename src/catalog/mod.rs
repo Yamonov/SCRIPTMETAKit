@@ -3,7 +3,9 @@ mod event;
 mod root;
 mod snapshot;
 
-pub use config::{CacheOptions, ScriptMetaKitConfig, UpdateCheckOptions, WatcherOptions};
+pub use config::{
+    CacheOptions, MetadataReadContext, ScriptMetaKitConfig, UpdateCheckOptions, WatcherOptions,
+};
 pub use event::{
     ProgressUpdate, ScriptMetaKitEvent, UpdateCheckProgress, UpdateCheckProgressPhase,
 };

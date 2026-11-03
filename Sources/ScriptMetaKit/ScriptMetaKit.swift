@@ -2,8 +2,13 @@ import Foundation
 
 public enum ScriptMetaKitRuntime {
     public static let apiVersion = 1
-    public static let packageVersion = "1.3.3"
+    public static let packageVersion = (try? linkedRuntimeInfo().packageVersion) ?? "unknown"
     public static let usesLocalBinaryArtifact = true
+
+    /// Reports the loaded native binary, including enabled capabilities.
+    public nonisolated static func linkedRuntimeInfo() throws -> ScriptMetaKitRuntimeInfo {
+        try ScriptMetaService.decode { smk_runtime_info_json($0) }
+    }
 
     /// A concise component index suitable for an application's About screen.
     public static let acknowledgementsSummaryText = bundledTextResource(

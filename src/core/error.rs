@@ -10,6 +10,7 @@ pub enum ScriptMetaKitError {
     Io { path: PathBuf, message: String },
     Timeout(String),
     Cache(String),
+    CacheIncompatible(String),
     Conflict(String),
     NotImplemented(String),
 }
@@ -23,6 +24,7 @@ impl fmt::Display for ScriptMetaKitError {
             Self::Io { path, message } => write!(formatter, "{}: {message}", path.display()),
             Self::Timeout(message) => write!(formatter, "timeout: {message}"),
             Self::Cache(message) => write!(formatter, "cache error: {message}"),
+            Self::CacheIncompatible(message) => write!(formatter, "incompatible cache: {message}"),
             Self::Conflict(message) => write!(formatter, "conflict: {message}"),
             Self::NotImplemented(message) => write!(formatter, "not implemented: {message}"),
         }
@@ -39,6 +41,7 @@ impl ScriptMetaKitError {
             Self::Io { .. } => "io_error",
             Self::Timeout(_) => "timeout",
             Self::Cache(_) => "cache_error",
+            Self::CacheIncompatible(_) => "cache_incompatible",
             Self::Conflict(_) => "conflict",
             Self::NotImplemented(_) => "not_implemented",
         }

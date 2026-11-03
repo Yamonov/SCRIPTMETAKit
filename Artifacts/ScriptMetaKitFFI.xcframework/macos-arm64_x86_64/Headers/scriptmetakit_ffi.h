@@ -16,6 +16,8 @@ typedef enum SmkStatus {
     SMK_STATUS_ENGINE_ERROR = 4,
     SMK_STATUS_PANIC = 5,
     SMK_STATUS_CONFLICT = 6,
+    /* Expected version/language/read-context mismatch; reload source files. */
+    SMK_STATUS_CACHE_INCOMPATIBLE = 7,
 } SmkStatus;
 
 typedef enum SmkWatchReconciliationDelivery {
@@ -599,8 +601,111 @@ typedef struct SmkScriptMetaBackupGenerationSlice {
     size_t len;
 } SmkScriptMetaBackupGenerationSlice;
 
+/* Additive metadata API. Existing public struct layouts are unchanged. */
+typedef struct SmkMetadataPresentation {
+    SmkUtf8Slice default_language;
+    SmkUtf8Slice name_language;
+    SmkUtf8Slice author_language;
+    SmkUtf8Slice description_language;
+    size_t first_tag_index;
+    size_t tag_count;
+    size_t first_diagnostic_index;
+    size_t diagnostic_count;
+} SmkMetadataPresentation;
+
+typedef struct SmkMetadataPresentationSlice {
+    const SmkMetadataPresentation *ptr;
+    size_t len;
+} SmkMetadataPresentationSlice;
+
+typedef struct SmkMetadataDiagnostic {
+    SmkUtf8Slice code;
+    SmkUtf8Slice field;
+    SmkUtf8Slice language;
+    size_t line;
+    uint8_t has_line;
+} SmkMetadataDiagnostic;
+
+typedef struct SmkMetadataDiagnosticSlice {
+    const SmkMetadataDiagnostic *ptr;
+    size_t len;
+} SmkMetadataDiagnosticSlice;
+
+typedef struct SmkLocalizedText {
+    SmkUtf8Slice language;
+    SmkUtf8Slice value;
+} SmkLocalizedText;
+
+typedef struct SmkLocalizedTextSlice {
+    const SmkLocalizedText *ptr;
+    size_t len;
+} SmkLocalizedTextSlice;
+
+typedef struct SmkMetadataEditExtensions {
+    uint8_t has_extensions;
+    SmkUtf8Slice default_language;
+    SmkLocalizedTextSlice names;
+    SmkLocalizedTextSlice authors;
+    SmkUtf8SliceSlice tags;
+} SmkMetadataEditExtensions;
+
+typedef enum SmkMetadataCollection {
+    SMK_METADATA_ITEMS = 0,
+    SMK_METADATA_FILE_ITEMS = 1,
+    SMK_METADATA_FILE_ENTRIES = 2,
+    SMK_METADATA_CANDIDATES = 3,
+} SmkMetadataCollection;
+
+/* Consumer-supplied priority order; zero entries selects metadata defaults.
+ * The Kit never obtains OS/UI languages. Changing preferences invalidates cached projections. */
+SmkStatus smk_engine_set_preferred_languages(SmkEngine *engine, const SmkUtf8Slice *languages, size_t count, uint8_t *out_changed);
+
+/* All returned slices borrow result until smk_scan_result_free. Presentation
+ * arrays are parallel to their corresponding legacy collection. Index ranges
+ * reference metadata_tags/metadata_diagnostics from the same result. */
+SmkStatus smk_scan_result_preferred_languages(const SmkScanResult *result, SmkUtf8SliceSlice *out_values);
+SmkStatus smk_scan_result_metadata_presentations(const SmkScanResult *result, uint32_t collection, SmkMetadataPresentationSlice *out_values);
+SmkStatus smk_scan_result_metadata_tags(const SmkScanResult *result, SmkUtf8SliceSlice *out_values);
+SmkStatus smk_scan_result_metadata_diagnostics(const SmkScanResult *result, SmkMetadataDiagnosticSlice *out_values);
+
+/* Full edit-session extensions; nested slices borrow result until smk_edit_result_free. */
+SmkStatus smk_edit_result_metadata_extensions(const SmkEditResult *result, SmkMetadataEditExtensions *out_extensions);
+SmkStatus smk_edit_result_metadata_diagnostics(const SmkEditResult *result, SmkMetadataDiagnosticSlice *out_values);
+/* A null extensions pointer (or has_extensions=0) preserves source extensions. */
+SmkStatus smk_engine_write_script_metadata_file_if_unchanged_v2(
+    SmkEngine *engine,
+    const SmkScriptMetadataWriteRequest *request,
+    const SmkMetadataEditExtensions *extensions,
+    SmkUtf8Slice expected_source_fingerprint,
+    SmkEditResult **out_result
+);
+
 SmkStatus smk_engine_create_default(SmkEngine **out_engine);
 void smk_engine_free(SmkEngine *engine);
+
+/* Application services. UTF-8 JSON is used only for configuration/text tools,
+ * not scan results. Every non-null SmkEditResult, including an error response,
+ * must be freed. smk_edit_result_text returns its payload or diagnostic message. */
+SmkStatus smk_configuration_default_json(SmkEditResult **out_result);
+SmkStatus smk_engine_configuration_json(SmkEngine *engine, SmkEditResult **out_result);
+/* Lightweight cache bookkeeping only; it does not assert source freshness. */
+SmkStatus smk_engine_cache_revisions_json(SmkEngine *engine, const SmkUtf8Slice *root_ids, size_t count, uint32_t mode, SmkEditResult **out_result);
+SmkStatus smk_engine_apply_configuration_json(SmkEngine *engine, SmkUtf8Slice configuration_json, SmkEditResult **out_result);
+SmkStatus smk_metadata_parse_text(SmkUtf8Slice source, const SmkUtf8Slice *languages, size_t language_count, uint8_t require_closed_block, SmkEditResult **out_result);
+SmkStatus smk_metadata_read_draft_text(SmkUtf8Slice source, SmkUtf8Slice file_name, SmkEditResult **out_result);
+/* Comment style: 0=plain text, 1=JavaScript block, 2=AppleScript block. */
+SmkStatus smk_metadata_render_text(SmkUtf8Slice draft_json, uint32_t style, SmkEditResult **out_result);
+SmkStatus smk_metadata_write_text(SmkUtf8Slice source, SmkUtf8Slice file_name, SmkUtf8Slice draft_json, uint32_t write_mode, SmkEditResult **out_result);
+SmkStatus smk_distribution_parse_text(SmkUtf8Slice source, SmkUtf8Slice script_id, SmkEditResult **out_result);
+SmkStatus smk_normalize_language_tag(SmkUtf8Slice value, SmkEditResult **out_result);
+SmkStatus smk_normalize_metadata_tags(const SmkUtf8Slice *values, size_t count, SmkEditResult **out_result);
+SmkStatus smk_parse_metadata_tag_list(SmkUtf8Slice value, SmkEditResult **out_result);
+SmkStatus smk_validate_metadata_tag(SmkUtf8Slice value, SmkEditResult **out_result);
+SmkStatus smk_normalize_metadata_url(SmkUtf8Slice value, SmkEditResult **out_result);
+SmkStatus smk_runtime_info_json(SmkEditResult **out_result);
+SmkStatus smk_engine_invalidate_cache(SmkEngine *engine, uint32_t scope, SmkEditResult **out_result);
+SmkStatus smk_engine_notify_changed_paths(SmkEngine *engine, const SmkUtf8Slice *paths, size_t count, uint8_t overflowed, SmkEditResult **out_result);
+SmkStatus smk_engine_refresh_dirty_roots(SmkEngine *engine, uint32_t scan_mode, SmkScanResult **out_result);
 
 SmkStatus smk_supported_script_extensions(SmkUtf8Slice *out_extensions);
 
@@ -920,6 +1025,16 @@ SmkStatus smk_engine_start_watching_with_callback_v2(
     uint32_t reconciliation_delivery
 );
 SmkStatus smk_engine_stop_watching(SmkEngine *engine);
+
+/* Root-scoped, idempotent suspension. IDs must be registered and count nonzero.
+   Explicit scans remain available. resume rereads file lists and metadata before
+   returning, bypasses unchanged-record reuse, and performs no network requests.
+   Incomplete/cancelled roots leave the entire requested batch paused.
+   Returned scan results use smk_scan_result_free. Existing streams remain open. */
+SmkStatus smk_engine_pause_root_watching(SmkEngine *engine, const SmkUtf8Slice *root_ids, size_t count);
+SmkStatus smk_engine_resume_root_watching(SmkEngine *engine, const SmkUtf8Slice *root_ids, size_t count, SmkScanResult **out_result);
+/* Unknown IDs return false. */
+SmkStatus smk_engine_is_root_watching_paused(SmkEngine *engine, SmkUtf8Slice root_id, uint8_t *out_paused);
 
 SmkStatus smk_engine_watcher_requires_restart(
     SmkEngine *engine,
