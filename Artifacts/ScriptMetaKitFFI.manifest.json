@@ -1,12 +1,12 @@
 {
-  "packageVersion": "2.1.0",
-  "gitRevision": "2a0222890ff1ab569f79687f618b36706ad9838d",
+  "packageVersion": "2.1.1",
+  "gitRevision": "68f22603b418279a36a5c0e0b90e7641b463bc5e",
   "sourceState": "clean",
-  "sourceTreeSHA256": "f214aece594bd6b14b1d422f885efb3ad650bc8b77cc16abe129c882e775472c",
+  "sourceTreeSHA256": "87d3c58b5aa1db15d0de92fca3cc527e1bb6a9c02310460c8b19c4d98322c4b3",
   "sourceHashFormatVersion": 2,
   "sourceHashScope": "build inputs, source, tests and fixtures, resources and CI; excludes documentation",
   "features": "blocking-http,native-watch",
   "architectures": "x86_64 arm64",
   "signatureKind": "identity",
-  "dylibSHA256": "b3ac28d15c0a0568394e101822a5fa8d009e9d077b064d6c701596a26492cf37"
+  "dylibSHA256": "a1cdbf8baee6ed4f69a8de756b4bbf4792b6853474d7b320b3710c1a51568c3c"
 }

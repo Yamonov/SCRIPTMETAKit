@@ -1,4 +1,5 @@
 import Foundation
+import ScriptMetaKitFFI
 
 public nonisolated enum MetadataLocalizedField: String, Codable, Sendable {
     case name, author, description
@@ -119,10 +120,3 @@ public extension ScriptMetaKitMetadata {
         }
     }
 }
-
-@_silgen_name("smk_metadata_localization_read")
-private nonisolated func smk_metadata_localization_read(_ draft: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
-@_silgen_name("smk_metadata_localization_edit")
-private nonisolated func smk_metadata_localization_edit(_ editor: SmkUtf8Slice, _ operation: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
-@_silgen_name("smk_metadata_localization_apply")
-private nonisolated func smk_metadata_localization_apply(_ editor: SmkUtf8Slice, _ draft: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32

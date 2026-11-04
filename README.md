@@ -1,4 +1,4 @@
-# SCRIPTMETAKit 2.1.0
+# SCRIPTMETAKit 2.1.1
 
 SCRIPTMETAKit is a Rust library and Swift package for parsing, editing, scanning, caching, and watching SCRIPTMETA-enabled script files.
 
@@ -9,7 +9,10 @@ For script authors and AI assistants, start with the [metadata authoring guide](
 
 Registered macOS aliases, Windows Shell links (`.lnk`), and symbolic links can be inspected through the shared Rust, C FFI, and Swift path-resolution API. OS-specific resolution and native notifications are compiled only on their corresponding platforms.
 
-## 2.1.0 macOS and Windows package
+## 2.1.1 macOS and Windows package
+
+Version 2.1.1 fixes Swift-to-C calling conventions on x86_64 by importing the native
+C module and types. See [Swift ABI regression validation](docs/Release2.1.1Validation.md).
 
 Version 2.1.0 adds selected author-defined custom metadata fields, shared validation
 and key-scoped editing through Rust, C and Swift. It provides the macOS Swift package
@@ -21,9 +24,9 @@ The Swift package requires Swift 6.1 / Xcode 16.3 or later and targets macOS 13 
 later. Swift 5 and Swift 6 language modes are supported. The macOS binary contains
 arm64 and x86_64 slices. The Windows DLL uses the same C ABI and shared Rust core.
 
-Use `https://github.com/Yamonov/SCRIPTMETAKit.git` and version **2.1.0** in Xcode.
+Use `https://github.com/Yamonov/SCRIPTMETAKit.git` and version **2.1.1** in Xcode.
 An existing dependency rule starting at 1.3.3 and allowing updates up to the next
-major version excludes 2.0.0; change its minimum version to 2.1.0 when upgrading.
+major version excludes 2.0.0; change its minimum version to 2.1.1 when upgrading.
 
 - Consumers supply priorities, such as `ja`, `en`, `fr`. The Kit never obtains OS/UI languages.
 - Normal results retain selected Name, Author and Description only, plus Tags and selection diagnostics.
@@ -66,10 +69,17 @@ package with its matching Universal artifact. Rebuild it with
 
 ## Package Version
 
-- Rust crate: `scriptmetakit` `2.1.0`
-- Rust FFI crate: `scriptmetakit_ffi` `2.1.0`
+- Rust crate: `scriptmetakit` `2.1.1`
+- Rust FFI crate: `scriptmetakit_ffi` `2.1.1`
 - Swift package product: `ScriptMetaKit`
 - C ABI generation: `1` (existing layouts/calls retained; additions are additive)
+
+## 2.1.1
+
+- Imports all Swift FFI functions and data structures from the C module.
+- Fixes x86_64 metadata-save crashes caused by using the Swift ABI for C calls.
+- Preserves the public Swift API, C ABI generation 1 and metadata format.
+- Tests public Swift save APIs on arm64 and x86_64 in Debug and Release.
 
 ## 2.1.0
 

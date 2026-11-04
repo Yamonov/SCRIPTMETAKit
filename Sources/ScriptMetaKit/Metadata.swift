@@ -1,4 +1,5 @@
 import Foundation
+import ScriptMetaKitFFI
 
 /// The selected language only. Use readDraft when editing all translations.
 public nonisolated struct ScriptMetadata: Codable, Sendable, Equatable {

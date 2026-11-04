@@ -1,4 +1,5 @@
 import Foundation
+import ScriptMetaKitFFI
 
 public enum ScriptMetaKitRuntime {
     public static let apiVersion = 1
