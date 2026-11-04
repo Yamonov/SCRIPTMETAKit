@@ -12,7 +12,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "SwiftAPIRegression",
-            dependencies: [.product(name: "ScriptMetaKit", package: "SCRIPTMETAKit")]
+            dependencies: [.product(name: "ScriptMetaKit", package: "SCRIPTMETAKit")],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@loader_path"])]
         )
     ],
     swiftLanguageModes: [languageMode]

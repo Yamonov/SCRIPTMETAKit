@@ -38,6 +38,8 @@ Swift公式の [Underscored Attributes](https://github.com/swiftlang/swift/blob/
 
 回帰テストはGitHub Actionsにも追加しました。Rust／CだけのテストではSwiftの呼び出し規約の不一致を検出できないため、両CPUからSwift公開APIを実行する検証を独立して行います。
 
+旧版SwiftPMのUniversal CLIビルドでは、バイナリ依存のdylibが実行ファイルの検索先へ配置されない場合があります。検証スクリプトは、解決されたKit依存の成果物をmanifestのハッシュと照合し、テスト実行ファイルの隣へ配置します。テスト専用の `@loader_path` によりそのdylibを読み込み、実行結果にも使用したハッシュを記録します。公開SDKや利用アプリの読み込み方法を変更するものではありません。
+
 ```sh
 python3 script/validate_swift_api.py
 ```

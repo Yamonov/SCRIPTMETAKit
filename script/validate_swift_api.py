@@ -2,14 +2,46 @@
 """Run public Swift save APIs across CPU, optimization and language modes."""
 from pathlib import Path
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "tests/SwiftAPIRegression"
+
+
+def install_native_library(binary, environment):
+    # Older SwiftPM Universal CLI builds do not embed binary-target dylibs.
+    # Resolve the actual dependency so remote-tag probes use its own artifact.
+    graph = json.loads(subprocess.check_output(
+        ["swift", "package", "--package-path", str(PACKAGE), "show-dependencies", "--format", "json"],
+        cwd=ROOT, env=environment,
+    ))
+    dependency = next(item for item in graph["dependencies"]
+                      if item.get("identity") == "scriptmetakit" or item["name"] == "ScriptMetaKit")
+    artifacts = Path(dependency["path"]) / "Artifacts"
+    manifest = json.loads((artifacts / "ScriptMetaKitFFI.manifest.json").read_text())
+    source = artifacts / "ScriptMetaKitFFI.xcframework/macos-arm64_x86_64/libscriptmetakit_ffi.dylib"
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if digest != manifest["dylibSHA256"]:
+        raise RuntimeError("The dependency's native artifact does not match its manifest")
+    destination = binary.parent / source.name
+    if not destination.exists() or hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+        # Replace only this test product; never follow a build-product symlink.
+        descriptor, temporary = tempfile.mkstemp(prefix=".smk-runtime-", dir=binary.parent)
+        os.close(descriptor)
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return digest
 
 
 def main():
@@ -46,6 +78,7 @@ def main():
             architectures = subprocess.check_output(["lipo", "-archs", str(binary)], text=True).split()
             if not {"arm64", "x86_64"}.issubset(architectures):
                 raise RuntimeError(f"The regression executable is not Universal: {architectures}")
+            native_digest = install_native_library(binary, environment)
             for architecture in ["arm64", "x86_64"]:
                 run = subprocess.run(["/usr/bin/arch", "-" + architecture, str(binary), version],
                                      cwd=ROOT, env=environment, capture_output=True, timeout=60)
@@ -59,7 +92,7 @@ def main():
                     architecture, language, version, "passed"
                 ):
                     raise RuntimeError(f"Unexpected regression report: {report}")
-                results.append(dict(report, configuration=configuration))
+                results.append(dict(report, configuration=configuration, nativeLibrarySHA256=native_digest))
                 output.write_text(json.dumps({"version": version, "results": results}, indent=2) + "\n")
                 print(f"Swift {language} / {configuration} / {architecture}: passed", flush=True)
     print(f"Public Swift API regression matrix passed: {len(results)} cases", flush=True)
