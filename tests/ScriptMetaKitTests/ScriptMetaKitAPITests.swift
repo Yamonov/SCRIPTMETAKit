@@ -1385,14 +1385,27 @@ final class ScriptMetaKitAPITests: XCTestCase {
         alert("test");
         """.write(to: addedScript, atomically: true, encoding: .utf8)
 
-        let result = try await waitForWatchChange(workspace: workspace, dirtyOnly: true)
+        let result = try await waitForWatchChange(workspace: workspace, dirtyOnly: true) { result in
+            result.fileListSnapshots.first { $0.root.rootID == "first" }?
+                .children?.contains { $0.name == "added.jsx" } == true
+        }
         await workspace.stopWatching()
 
-        XCTAssertEqual(result.fileListSnapshots.map(\.root.rootID), ["first"])
-        XCTAssertEqual(result.roots.map(\.rootID), ["first"])
+        // FSEvents may deliver delayed startup notifications for another root.
+        // Dirty-only results must match the delivered batch, not its timing.
+        let batch = try XCTUnwrap(result.watchChangeBatch)
+        let affectedRootIDs = if result.watchDelivery?.isReconciliation == true {
+            Set(roots.map(\.rootID))
+        } else {
+            Set(batch.rescanTargets.map(\.rootID) + batch.events.map(\.rootID))
+        }
+        XCTAssertTrue(affectedRootIDs.contains("first"))
+        XCTAssertEqual(Set(result.fileListSnapshots.map(\.root.rootID)), affectedRootIDs, "\(batch)")
+        XCTAssertEqual(Set(result.roots.map(\.rootID)), affectedRootIDs, "\(batch)")
         XCTAssertNil(result.catalogSnapshot)
         XCTAssertNil(result.updateCheckResult)
-        XCTAssertTrue(result.fileListSnapshots.first?.children?.contains { $0.name == "added.jsx" } ?? false)
+        XCTAssertTrue(result.fileListSnapshots.first { $0.root.rootID == "first" }?
+            .children?.contains { $0.name == "added.jsx" } ?? false)
     }
 
     func testWatchSequenceDeliversInitialReconcileAndFileChange() async throws {
@@ -2108,21 +2121,40 @@ final class ScriptMetaKitAPITests: XCTestCase {
             encoding: .utf8
         )
 
-        let result = try await waitForWatchChange(workspace: workspace, dirtyOnly: true)
+        // Separate native batches may report the two writes independently.
+        var snapshots: [String: FileListSnapshot] = [:]
+        var reportedRootIDs: Set<String> = []
+        for _ in 0..<40 {
+            if let result = try await workspace.pollWatchChanges(dirtyOnly: true) {
+                XCTAssertNil(result.catalogSnapshot)
+                reportedRootIDs.formUnion(result.roots.map(\.rootID))
+                for snapshot in result.fileListSnapshots {
+                    snapshots[snapshot.root.rootID] = snapshot
+                }
+                if snapshots["first"]?.children?.contains(where: { $0.name == "first-added.jsx" }) == true,
+                   snapshots["second"]?.children?.contains(where: { $0.name == "second-added.jsx" }) == true {
+                    break
+                }
+            }
+            try await Task.sleep(for: .milliseconds(150))
+        }
         await workspace.stopWatching()
 
-        XCTAssertEqual(Set(result.fileListSnapshots.map(\.root.rootID)), Set(["first", "second"]))
-        XCTAssertEqual(Set(result.roots.map(\.rootID)), Set(["first", "second"]))
-        XCTAssertNil(result.catalogSnapshot)
+        XCTAssertEqual(Set(snapshots.keys), Set(["first", "second"]))
+        XCTAssertEqual(reportedRootIDs, Set(["first", "second"]))
+        XCTAssertTrue(snapshots["first"]?.children?.contains { $0.name == "first-added.jsx" } ?? false)
+        XCTAssertTrue(snapshots["second"]?.children?.contains { $0.name == "second-added.jsx" } ?? false)
     }
 
     private func waitForWatchChange(
         workspace: ScriptMetaKitWorkspace,
         dirtyOnly: Bool,
-        attempts: Int = 40
+        attempts: Int = 40,
+        matching predicate: @Sendable (ScriptMetaScanResult) -> Bool = { _ in true }
     ) async throws -> ScriptMetaScanResult {
         for _ in 0..<attempts {
-            if let result = try await workspace.pollWatchChanges(dirtyOnly: dirtyOnly) {
+            if let result = try await workspace.pollWatchChanges(dirtyOnly: dirtyOnly),
+               predicate(result) {
                 return result
             }
             try await Task.sleep(nanoseconds: 150_000_000)

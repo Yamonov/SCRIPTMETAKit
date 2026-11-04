@@ -19,6 +19,8 @@ WindowsのACLについては、公開版2.0.1のDLLをWindows実機から呼び�
 
 Windows実機で参照ファイルのテストを反復した際、テスト用ショートカットを作成する `IShellLinkW::SetPath` の呼び出し中に異常終了しました。ダンプでは、テストの作成関数から呼び出した `Windows.FileExplorer.Common.dll` 内のC++例外と終了処理を確認しました。Kitの読み取りAPIは `SetPath` を使用しません。二つのテスト群で作成用ヘルパーを共有し、その作成処理だけを直列化しました。Kitの並行した読み取りと監視の検証は継続します。
 
+macOSの監視テストは、追加したファイルの反映を待ってから、返却されたフォルダと通知バッチが報告する対象を照合します。通知が遅れて届いたり、複数の通知がまとめられたりする場合も、固定した通知数を前提にしません。[AppleのFSEventsガイド](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)が説明する非同期通知の性質に対応します。
+
 ## 検証する範囲
 
 - macOSのarm64／x86_64とWindows x64のReleaseビルド。
