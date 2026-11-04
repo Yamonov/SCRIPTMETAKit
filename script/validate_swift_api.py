@@ -52,6 +52,7 @@ def main():
                 run_log = output.parent / f"run-swift{language}-{configuration}-{architecture}.log"
                 run_log.write_bytes(run.stdout + run.stderr)
                 if run.returncode:
+                    print((run.stdout + run.stderr).decode("utf-8", errors="replace"), file=sys.stderr)
                     raise RuntimeError(f"Swift {language} {configuration} {architecture} failed ({run.returncode}); see {run_log}")
                 report = json.loads(run.stdout)
                 if (report["architecture"], report["swiftLanguageMode"], report["version"], report["status"]) != (
