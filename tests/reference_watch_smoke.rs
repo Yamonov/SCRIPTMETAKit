@@ -30,36 +30,10 @@ fn create_reference(target: &Path, source: &Path) {
 }
 
 #[cfg(windows)]
-fn create_reference(target: &Path, source: &Path) {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::{
-        Win32::{
-            System::Com::{
-                CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-                CoUninitialize, IPersistFile,
-            },
-            UI::Shell::{IShellLinkW, ShellLink},
-        },
-        core::{Interface, PCWSTR},
-    };
-    struct Apartment;
-    impl Drop for Apartment {
-        fn drop(&mut self) {
-            unsafe { CoUninitialize() };
-        }
-    }
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-        .ok()
-        .expect("COM");
-    let _apartment = Apartment;
-    let link: IShellLinkW =
-        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.expect("Shell link");
-    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    unsafe { link.SetPath(PCWSTR(target.as_ptr())) }.expect("link target");
-    let file: IPersistFile = link.cast().expect("persist interface");
-    unsafe { file.Save(PCWSTR(source.as_ptr()), true) }.expect("save link");
-}
+#[path = "support/windows_shortcut_fixture.rs"]
+mod shortcut_fixture;
+#[cfg(windows)]
+use shortcut_fixture::create_reference;
 
 fn reference_name() -> &'static str {
     if cfg!(windows) {

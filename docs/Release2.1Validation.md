@@ -9,8 +9,15 @@ Rust共通処理、C ABI、macOS固有I/O、Windows固有処理、Swift API、�
 - シンボリックリンク経由のテキストとコンパイル済みAppleScriptの保存は、リンクを保って実体を更新します。バックアップの参照と復元にも対応します。
 - 名前付きパイプ等の非通常ファイルは、同期的な編集用読み取り・保存の前に拒否します。書き手の接続待ちでAPIが停止することを防ぎます。
 - Windowsのファイル置き換えでは、DACLと継承の保護設定を新しいファイルへコピーします。ACLを保持するファイルシステムかを確認し、対応するボリュームで適用します。
+- Windowsの監視用バッファは、`ReadDirectoryChangesW` が要求する4バイト境界への配置を型で保証します。
 
 WindowsのACLについては、公開版2.0.1のDLLをWindows実機から呼び出し、保護された個別ACLが保存後に継承状態へ変わることを一時ファイルで再現しました。2.1.0の回帰テストは継承あり・なしを確認します。Windows APIの取り扱いは [GetNamedSecurityInfo](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getnamedsecurityinfow)、[SetNamedSecurityInfo](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setnamedsecurityinfow)、[ボリュームのACL対応フラグ](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationbyhandlew) に従います。
+
+## テスト環境への対応
+
+記述ガイドの例は、LF・CRLFのどちらでチェックアウトされても同じ内容を検証します。Windows PowerShellを起動するACLテストでは、PowerShell 7から引き継いだモジュール検索設定を子プロセスから除外します。
+
+Windows実機で参照ファイルのテストを反復した際、テスト用ショートカットを作成する `IShellLinkW::SetPath` の呼び出し中に異常終了しました。ダンプでは、テストの作成関数から呼び出した `Windows.FileExplorer.Common.dll` 内のC++例外と終了処理を確認しました。Kitの読み取りAPIは `SetPath` を使用しません。二つのテスト群で作成用ヘルパーを共有し、その作成処理だけを直列化しました。Kitの並行した読み取りと監視の検証は継続します。
 
 ## 検証する範囲
 

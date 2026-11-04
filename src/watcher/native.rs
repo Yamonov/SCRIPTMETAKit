@@ -939,6 +939,10 @@ mod platform {
     const BUFFER_SIZE: usize = 64 * 1024;
     const RETRY_OPEN_DELAY_MILLIS: u32 = 1_000;
 
+    // ReadDirectoryChangesW requires DWORD-aligned storage.
+    #[repr(C, align(4))]
+    struct ChangeBuffer([u8; BUFFER_SIZE]);
+
     pub struct PlatformWatcher {
         stop_events: Vec<isize>,
         workers: Vec<JoinHandle<()>>,
@@ -1088,7 +1092,7 @@ mod platform {
             }
         }
         while let Some(directory_handle) = directory {
-            let mut buffer = [0u8; BUFFER_SIZE];
+            let mut buffer = ChangeBuffer([0u8; BUFFER_SIZE]);
             let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
             let read_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
             if read_event.is_null() || read_event == INVALID_HANDLE_VALUE {
@@ -1101,8 +1105,8 @@ mod platform {
             let read_started = unsafe {
                 ReadDirectoryChangesW(
                     directory_handle,
-                    buffer.as_mut_ptr() as *mut c_void,
-                    buffer.len() as u32,
+                    buffer.0.as_mut_ptr() as *mut c_void,
+                    buffer.0.len() as u32,
                     TRUE,
                     FILE_NOTIFY_CHANGE_FILE_NAME
                         | FILE_NOTIFY_CHANGE_DIR_NAME
@@ -1177,7 +1181,7 @@ mod platform {
                 continue;
             }
 
-            parse_change_buffer(&root, &buffer[..transferred as usize], &sender);
+            parse_change_buffer(&root, &buffer.0[..transferred as usize], &sender);
         }
 
         if let Some(directory) = directory {
