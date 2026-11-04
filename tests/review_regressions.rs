@@ -238,6 +238,9 @@ $ProgressPreference = 'SilentlyContinue'
 "#
         };
         let output = std::process::Command::new("powershell.exe")
+            // PowerShell 7 CI passes its module paths through Cargo. Let
+            // Windows PowerShell construct paths for its own module versions.
+            .env_remove("PSModulePath")
             .args([
                 "-NoLogo",
                 "-NoProfile",
