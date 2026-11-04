@@ -35,6 +35,7 @@ major version excludes 2.0.0; change its minimum version to 2.1.0 when upgrading
 See [multilingual editing APIs](docs/LocalizationEditingAPI.md) and
 [field requirements and relationships](docs/MetadataFieldRules.md).
 See [Tags and localization](docs/TagsLocalization.md) for syntax and APIs.
+See [2.1.0 review and validation](docs/Release2.1Validation.md) for release verification.
 See [Swift application API](docs/SwiftApplicationAPI.md) for configuration, text
 parsing/editing, validation, cache invalidation and external change notifications.
 See [macOS package integration](docs/MacOSIntegration-2.0.md) and
