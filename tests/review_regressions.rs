@@ -15,6 +15,164 @@ fn draft() -> ScriptMetadataDraft {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn named_pipe_metadata_operations_fail_without_opening_the_pipe() {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    const CHILD_PATH: &str = "SMK_NAMED_PIPE_METADATA_TEST";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let path = std::path::PathBuf::from(path);
+        let inspection = scriptmetakit::inspect_script_file(&path);
+        assert!(!inspection.can_edit_scriptmeta && !inspection.can_append_scriptmeta);
+        assert!(scriptmetakit::read_script_metadata_draft_from_file(&path).is_err());
+        assert!(scriptmetakit::read_script_metadata_edit_preview_from_file(&path, 128).is_err());
+        assert!(
+            scriptmetakit::write_script_metadata_to_file(
+                &path,
+                &draft(),
+                ScriptMetaWriteMode::InsertOrReplace,
+                None
+            )
+            .is_err()
+        );
+        println!("NAMED_PIPE_METADATA_GUARD_OK");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pipe.jsx");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "named_pipe_metadata_operations_fail_without_opening_the_pipe",
+            "--nocapture",
+        ])
+        .env(CHILD_PATH, &path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("metadata operations blocked on a named pipe");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NAMED_PIPE_METADATA_GUARD_OK"));
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_edits_and_backup_restore_preserve_symbolic_links() {
+    use scriptmetakit::{
+        ScriptMetaBackupOptions, read_script_metadata_draft_from_file, restore_scriptmeta_backup,
+        scriptmeta_backup_generations, write_script_metadata_to_file_if_unchanged,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target.jsx");
+    let link = directory.path().join("link.jsx");
+    let source =
+        "/*\nSCRIPTMETA-BEGIN\nScript-ID=review.symlink\nName=Original\nSCRIPTMETA-END\n*/\n";
+    fs::write(&target, source).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let read = read_script_metadata_draft_from_file(&link).unwrap();
+    let mut metadata = read.draft;
+    metadata.name = Some("Updated".into());
+    let backups = ScriptMetaBackupOptions {
+        root_directory: directory.path().join("backups"),
+    };
+    write_script_metadata_to_file_if_unchanged(
+        &link,
+        &metadata,
+        ScriptMetaWriteMode::ReplaceOnly,
+        Some(&backups),
+        Some(&read.source_fingerprint),
+    )
+    .unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("Name=Updated")
+    );
+    let generations = scriptmeta_backup_generations(&link, &backups)
+        .unwrap()
+        .into_iter()
+        .filter(|generation| !generation.is_current_file)
+        .collect::<Vec<_>>();
+    assert_eq!(generations.len(), 1);
+    restore_scriptmeta_backup(&link, &backups, &generations[0].id).unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), source);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn compiled_applescript_metadata_edits_preserve_symbolic_links() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.applescript");
+    let target = directory.path().join("target.scpt");
+    let link = directory.path().join("link.scpt");
+    fs::write(&source, "(*\nSCRIPTMETA-BEGIN\nScript-ID=review.compiled-link\nName=Original\nSCRIPTMETA-END\n*)\nreturn 1\n").unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/osacompile")
+            .arg("-o")
+            .arg(&target)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let read = scriptmetakit::read_script_metadata_draft_from_file(&link).unwrap();
+    let mut metadata = read.draft;
+    metadata.name = Some("Updated".into());
+    scriptmetakit::write_script_metadata_to_file_if_unchanged(
+        &link,
+        &metadata,
+        ScriptMetaWriteMode::ReplaceOnly,
+        None,
+        Some(&read.source_fingerprint),
+    )
+    .unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let after = scriptmetakit::read_script_metadata_draft_from_file(&target).unwrap();
+    assert_eq!(after.draft.name.as_deref(), Some("Updated"));
+}
+
 #[test]
 fn render_and_write_protect_comment_delimiters_consistently() {
     let mut metadata = draft();
@@ -49,6 +207,82 @@ fn render_and_write_protect_comment_delimiters_consistently() {
     let plain =
         render_script_metadata_for_style(&metadata, ScriptMetaCommentStyle::PlainText).unwrap();
     assert!(plain.contains(metadata.description.as_deref().unwrap()));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_metadata_saves_preserve_custom_dacl_and_inheritance() {
+    fn acl(path: &Path, setup: bool, protected: bool) -> String {
+        let script = if setup {
+            r#"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$kitPath = $env:SMK_ACL_TEST_PATH
+$kitAcl = Get-Acl -LiteralPath $kitPath
+$kitAcl.SetAccessRuleProtection([bool]::Parse($env:SMK_ACL_TEST_PROTECTED), $true)
+$kitSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+$kitRule = New-Object Security.AccessControl.FileSystemAccessRule(
+    $kitSid,
+    [Security.AccessControl.FileSystemRights]::Read,
+    [Security.AccessControl.AccessControlType]::Allow
+)
+$kitAcl.AddAccessRule($kitRule)
+Set-Acl -LiteralPath $kitPath -AclObject $kitAcl
+(Get-Acl -LiteralPath $kitPath).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+"#
+        } else {
+            r#"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+(Get-Acl -LiteralPath $env:SMK_ACL_TEST_PATH).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+"#
+        };
+        let output = std::process::Command::new("powershell.exe")
+            // PowerShell 7 CI passes its module paths through Cargo. Let
+            // Windows PowerShell construct paths for its own module versions.
+            .env_remove("PSModulePath")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .env("SMK_ACL_TEST_PATH", path)
+            .env("SMK_ACL_TEST_PROTECTED", protected.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+    let directory = tempfile::tempdir().unwrap();
+    for protected in [false, true] {
+        let path = directory.path().join(format!("acl-{protected}.jsx"));
+        fs::write(
+            &path,
+            "/*\nSCRIPTMETA-BEGIN\nScript-ID=windows.acl\nName=Original\nSCRIPTMETA-END\n*/\n",
+        )
+        .unwrap();
+        let before = acl(&path, true, protected);
+        let metadata = ScriptMetadataDraft {
+            script_id: "windows.acl".into(),
+            name: Some("Updated".into()),
+            ..Default::default()
+        };
+        scriptmetakit::write_script_metadata_to_file(
+            &path,
+            &metadata,
+            ScriptMetaWriteMode::ReplaceOnly,
+            None,
+        )
+        .unwrap();
+        assert_eq!(acl(&path, false, protected), before);
+        assert!(fs::read_to_string(&path).unwrap().contains("Name=Updated"));
+    }
 }
 
 #[test]

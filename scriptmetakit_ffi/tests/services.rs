@@ -8,6 +8,50 @@ fn input(value: &str) -> ffi::SmkUtf8Slice {
     }
 }
 
+#[test]
+fn custom_metadata_text_services_share_selection_and_validation() {
+    let source = "SCRIPTMETA-BEGIN\nScript-ID=custom.ffi\nName=Original\nX-org.iwashi-Order=0020\nX-org.iwashi-Empty=\nSCRIPTMETA-END";
+    let keys = [input("X-")];
+    // SAFETY: all input slices and arrays remain live until each call returns.
+    unsafe {
+        let (status, text) = response(|out| {
+            ffi::smk_metadata_parse_text_v2(
+                input(source),
+                ptr::null(),
+                0,
+                1,
+                keys.as_ptr(),
+                keys.len(),
+                out,
+            )
+        });
+        assert_eq!(status, ffi::SmkStatus::Ok);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["presentation"]["custom_fields"]["X-org.iwashi-order"],
+            serde_json::json!(["0020"])
+        );
+        assert_eq!(
+            value["presentation"]["custom_fields"]["X-org.iwashi-empty"],
+            serde_json::json!([""])
+        );
+        let (status, text) = response(|out| {
+            ffi::smk_validate_custom_metadata_field(
+                input("X-org.iwashi-Note"),
+                input("Note Name=Injected"),
+                out,
+            )
+        });
+        assert_eq!(status, ffi::SmkStatus::Ok);
+        let issues: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(issues[0]["code"], "custom_metadata_legacy_field");
+        let (status, _) = response(|out| {
+            ffi::smk_normalize_custom_metadata_key(input("X-org..iwashi-Note"), out)
+        });
+        assert_eq!(status, ffi::SmkStatus::InvalidArgument);
+    }
+}
+
 fn response(
     call: impl FnOnce(*mut *mut ffi::SmkEditResult) -> ffi::SmkStatus,
 ) -> (ffi::SmkStatus, String) {

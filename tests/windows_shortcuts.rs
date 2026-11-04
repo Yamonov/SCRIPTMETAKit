@@ -10,41 +10,13 @@ use scriptmetakit::{
 };
 use std::{
     fs,
-    os::windows::ffi::OsStrExt,
     path::Path,
     thread,
     time::{Duration, Instant},
 };
-use windows::{
-    Win32::{
-        System::Com::{
-            CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-            CoUninitialize, IPersistFile,
-        },
-        UI::Shell::{IShellLinkW, ShellLink},
-    },
-    core::{Interface, PCWSTR},
-};
-
-fn link(target: &Path, path: &Path) {
-    struct Apartment;
-    impl Drop for Apartment {
-        fn drop(&mut self) {
-            unsafe { CoUninitialize() };
-        }
-    }
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-        .ok()
-        .expect("COM");
-    let _apartment = Apartment;
-    let shell: IShellLinkW =
-        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.expect("ShellLink");
-    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    unsafe { shell.SetPath(PCWSTR(target.as_ptr())) }.expect("target");
-    let persist: IPersistFile = shell.cast().expect("IPersistFile");
-    unsafe { persist.Save(PCWSTR(path.as_ptr()), true) }.expect("save link");
-}
+#[path = "support/windows_shortcut_fixture.rs"]
+mod shortcut_fixture;
+use shortcut_fixture::create_reference as link;
 fn find<'a>(entries: &'a [FileSystemEntry], display: &Path) -> Option<&'a FileSystemEntry> {
     entries.iter().find_map(|entry| {
         if entry.display_path == display {

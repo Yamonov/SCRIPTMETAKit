@@ -988,6 +988,14 @@ public nonisolated struct MetadataDiagnostic: Codable, Equatable, Sendable {
 }
 
 public nonisolated struct MetadataPresentation: Codable, Equatable, Sendable {
+    public var customFields: [String: [String]]
+
+    public func customValues(for key: String) -> [String]? {
+        guard key.hasPrefix("X-") || key.hasPrefix("x-") else { return nil }
+        let canonical = "X-" + key.dropFirst(2).lowercased()
+        if let values = customFields[canonical] { return values }
+        return customFields.first { $0.key.caseInsensitiveCompare(canonical) == .orderedSame }?.value
+    }
     public var defaultLanguage: String?
     public var nameLanguage: String?
     public var authorLanguage: String?
@@ -998,12 +1006,13 @@ public nonisolated struct MetadataPresentation: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case defaultLanguage = "default_language", nameLanguage = "name_language"
         case authorLanguage = "author_language", descriptionLanguage = "description_language"
-        case tags, diagnostics
+        case tags, diagnostics, customFields = "custom_fields"
     }
 
     public init(defaultLanguage: String? = nil, nameLanguage: String? = nil,
                 authorLanguage: String? = nil, descriptionLanguage: String? = nil,
-                tags: [String] = [], diagnostics: [MetadataDiagnostic] = []) {
+                tags: [String] = [], diagnostics: [MetadataDiagnostic] = [], customFields: [String: [String]] = [:]) {
+        self.customFields = customFields
         self.defaultLanguage = defaultLanguage; self.nameLanguage = nameLanguage
         self.authorLanguage = authorLanguage; self.descriptionLanguage = descriptionLanguage
         self.tags = tags; self.diagnostics = diagnostics
@@ -1016,7 +1025,8 @@ public nonisolated struct MetadataPresentation: Codable, Equatable, Sendable {
                   authorLanguage: try values.decodeIfPresent(String.self, forKey: .authorLanguage),
                   descriptionLanguage: try values.decodeIfPresent(String.self, forKey: .descriptionLanguage),
                   tags: try values.decodeIfPresent([String].self, forKey: .tags) ?? [],
-                  diagnostics: try values.decodeIfPresent([MetadataDiagnostic].self, forKey: .diagnostics) ?? [])
+                  diagnostics: try values.decodeIfPresent([MetadataDiagnostic].self, forKey: .diagnostics) ?? [],
+                  customFields: try values.decodeIfPresent([String: [String]].self, forKey: .customFields) ?? [:])
     }
 }
 
@@ -1043,6 +1053,8 @@ public nonisolated struct MetadataEditExtensions: Codable, Equatable, Sendable {
 }
 
 public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
+    public var customFields: [String: [String]] { presentation.customFields }
+    public func customValues(for key: String) -> [String]? { presentation.customValues(for: key) }
     public var rootID: String
     public var filePath: String
     public var identityPath: String
@@ -1378,6 +1390,8 @@ public nonisolated struct DistributionResolution: Codable, Sendable {
 }
 
 public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
+    /// Key-scoped updates. Omitted keys preserve existing values, empty arrays remove a key.
+    public var customFields: [String: [String]]
     public var scriptID: String
     public var version: String?
     public var itemDescription: String?
@@ -1402,6 +1416,7 @@ public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
         case releaseDate = "release_date"
         case editPasswordSHA256 = "edit_password_sha256"
         case extensions
+        case customFields = "custom_fields"
     }
 
     public init(
@@ -1415,7 +1430,8 @@ public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
         author: String? = nil,
         releaseDate: String? = nil,
         editPasswordSHA256: String? = nil,
-        extensions: MetadataEditExtensions? = nil
+        extensions: MetadataEditExtensions? = nil,
+        customFields: [String: [String]] = [:]
     ) {
         self.scriptID = scriptID
         self.version = version
@@ -1428,6 +1444,32 @@ public nonisolated struct ScriptMetadataDraft: Codable, Sendable {
         self.releaseDate = releaseDate
         self.editPasswordSHA256 = editPasswordSHA256
         self.extensions = extensions
+        self.customFields = customFields
+    }
+
+    public mutating func setCustomValues(_ values: [String], for key: String) throws {
+        let canonical = try ScriptMetaKitMetadata.normalizeCustomMetadataKey(key)
+        let aliases = customFields.keys.filter {
+            $0 != canonical && $0.caseInsensitiveCompare(canonical) == .orderedSame
+        }
+        for alias in aliases { customFields.removeValue(forKey: alias) }
+        customFields[canonical] = values
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(scriptID: try values.decode(String.self, forKey: .scriptID),
+                  version: try values.decodeIfPresent(String.self, forKey: .version),
+                  itemDescription: try values.decodeIfPresent(String.self, forKey: .itemDescription),
+                  targetApp: try values.decodeIfPresent(String.self, forKey: .targetApp),
+                  minTargetVersion: try values.decodeIfPresent(String.self, forKey: .minTargetVersion),
+                  metaURL: try values.decodeIfPresent(String.self, forKey: .metaURL),
+                  name: try values.decodeIfPresent(String.self, forKey: .name),
+                  author: try values.decodeIfPresent(String.self, forKey: .author),
+                  releaseDate: try values.decodeIfPresent(String.self, forKey: .releaseDate),
+                  editPasswordSHA256: try values.decodeIfPresent(String.self, forKey: .editPasswordSHA256),
+                  extensions: try values.decodeIfPresent(MetadataEditExtensions.self, forKey: .extensions),
+                  customFields: try values.decodeIfPresent([String: [String]].self, forKey: .customFields) ?? [:])
     }
 }
 

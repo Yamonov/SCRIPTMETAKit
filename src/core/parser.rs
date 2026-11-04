@@ -49,18 +49,20 @@ pub fn parse_script_metadata_with_options(
 ) -> ScriptMetaKitResult<ScriptMetadata> {
     let body = script_metadata_body(text, options.require_closed_block)
         .ok_or_else(|| ScriptMetaKitError::Parse("missing SCRIPTMETA block".to_string()))?;
-    let sections = metadata_sections(body);
+    let mut sections =
+        super::metadata_sections_with_custom_fields(body, &options.custom_metadata_keys);
     let fields = parse_script_metadata_fields(&sections.legacy_body);
     let script_id = fields.script_id.ok_or_else(|| {
         ScriptMetaKitError::Parse("missing required SCRIPTMETA field `script-id`".to_string())
     })?;
 
-    let (name, author, description, presentation) = sections.project(
+    let (name, author, description, mut presentation) = sections.project(
         fields.name.as_deref(),
         fields.author.as_deref(),
         fields.description.as_deref(),
         &options.preferred_languages,
     );
+    presentation.custom_fields = std::mem::take(&mut sections.custom_fields);
     Ok(ScriptMetadata {
         script_id,
         version: optional_version_value(fields.version)?,
@@ -213,10 +215,20 @@ fn script_metadata_body(text: &str, require_closed_block: bool) -> Option<&str> 
     let after_begin = begin_index + SCRIPT_BEGIN.len();
     let rest = &text[after_begin..];
     match find_ascii_case_insensitive(rest, SCRIPT_END) {
-        Some(end_index) => Some(&rest[..end_index]),
+        Some(end_index) if !custom_metadata_boundary_is_embedded(text, after_begin + end_index) => {
+            Some(&rest[..end_index])
+        }
+        Some(_) => None,
         None if !require_closed_block => Some(rest),
         None => None,
     }
+}
+
+pub(crate) fn custom_metadata_boundary_is_embedded(text: &str, index: usize) -> bool {
+    let start = text[..index]
+        .rfind(['\r', '\n'])
+        .map_or(0, |position| position + 1);
+    super::has_custom_metadata_prefix(clean_metadata_line(&text[start..index]))
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -467,7 +479,10 @@ fn find_metadata_field_boundaries(line: &str, known_keys: &[&str]) -> Vec<Metada
 /// A scalar renderer puts the first value byte directly after '='. Later
 /// whitespace-delimited keys would be interpreted as additional legacy fields.
 pub(crate) fn contains_inline_metadata_field(value: &str, distribution: bool) -> bool {
-    let value = value.trim();
+    contains_inline_metadata_field_raw(value.trim(), distribution)
+}
+
+pub(crate) fn contains_inline_metadata_field_raw(value: &str, distribution: bool) -> bool {
     let keys = if distribution {
         DISTRIBUTION_METADATA_KEYS
     } else {
@@ -905,6 +920,7 @@ scriptmeta-end
         let metadata = parse_script_metadata_with_options(
             text,
             &ParserOptions {
+                custom_metadata_keys: Default::default(),
                 preferred_languages: Default::default(),
                 max_prefix_bytes: 1024,
                 require_closed_block: false,

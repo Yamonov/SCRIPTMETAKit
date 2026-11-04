@@ -1,6 +1,6 @@
 # Swift application API
 
-Version: 2.0.0, macOS Swift package.
+Version 2.1.0, macOS Swift package.
 
 Requires Swift 6.1 / Xcode 16.3 or later; deployment target is macOS 13 or later.
 
@@ -15,7 +15,9 @@ OS language acquisition, UI selection and the timing of refreshes.
 | Coordinated roots, disk cache and watch streams | `ScriptMetaKitWorkspace` |
 | Direct scan, update, edit, backup and watch operations | `ScriptMetaKitEngine` |
 | Complete engine configuration | `ScriptMetaKitConfiguration.defaults()`, Engine `configuration()` / Workspace `engineConfiguration()`, `applyConfiguration(_:)` |
-| Parse selected metadata from source text | `ScriptMetaKitMetadata.parse(_:preferredLanguages:requireClosedBlock:)` |
+| Parse selected metadata from source text | `ScriptMetaKitMetadata.parse(_:preferredLanguages:requireClosedBlock:customMetadataKeys:)` |
+| Select custom metadata | Engine `setCustomMetadataKeys(_:)` or `configuration.parser.customMetadataKeys`; use `["X-"]` for all |
+| Validate and edit custom metadata | `validateCustomMetadataField(key:value:)`, `normalizeCustomMetadataKey(_:)`, draft `setCustomValues(_:for:)` |
 | Read all translations for editing | `ScriptMetaKitMetadata.readDraft(from:fileName:)` or Engine `readScriptMetadataDraft(fileURL:)` |
 | Render metadata or replace it in source text | `ScriptMetaKitMetadata.render(_:style:)`, `write(_:into:fileName:mode:)` |
 | Parse distribution records / select a script | `ScriptMetaKitMetadata.parseDistribution(_:scriptID:)` |

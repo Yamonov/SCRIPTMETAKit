@@ -1,6 +1,8 @@
 # Tags and metadata localization
 
-SCRIPTMETAKit 2.0.1.
+For complete validated authoring examples, see [metadata authoring](MetadataAuthoring.md).
+
+SCRIPTMETAKit 2.1.0.
 See [field requirements and relationships](MetadataFieldRules.md) for required and optional items.
 See [release validation](Release2.0Validation.md) for the current macOS Universal
 package and verified architectures.
@@ -105,7 +107,7 @@ The consumer owns OS preference acquisition and change detection. The Kit does
 not read OS languages, application localizations or environment locale values.
 After changing priorities, request a new scan; old language projections are not
 reused. Cache schema 4 includes the canonical language order and projection
-version and metadata-read settings. Projection version 5 also makes Description
+version and metadata-read settings. Projection version 6 also records custom-field selection. Projection version 5 makes Description
 without a valid default language ordinary text. Projection version 4 included the parser,
 file-filter and inspection settings, in addition to correct partial-file decoding
 and recognition of an implicit default Description section.

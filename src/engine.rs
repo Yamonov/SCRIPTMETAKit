@@ -101,6 +101,19 @@ impl Clone for ScriptMetaKitEngine {
 }
 
 impl ScriptMetaKitEngine {
+    pub fn set_custom_metadata_keys<I, S>(
+        &mut self,
+        keys: I,
+    ) -> ScriptMetaKitResult<EngineConfigurationChange>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut config = self.config.clone();
+        config.parser.custom_metadata_keys = crate::CustomMetadataSelection::new(keys)?;
+        self.apply_configuration(config)
+    }
+
     /// Preferences are explicit consumer input; the Kit never queries OS languages.
     #[must_use]
     pub fn preferred_languages(&self) -> &crate::LanguagePreferences {

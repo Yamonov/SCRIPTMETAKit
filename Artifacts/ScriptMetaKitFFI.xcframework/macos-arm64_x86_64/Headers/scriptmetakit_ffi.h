@@ -618,6 +618,26 @@ typedef struct SmkMetadataPresentationSlice {
     size_t len;
 } SmkMetadataPresentationSlice;
 
+typedef struct SmkCustomMetadataValue {
+    SmkUtf8Slice key;
+    SmkUtf8Slice value;
+} SmkCustomMetadataValue;
+
+typedef struct SmkCustomMetadataValueSlice {
+    const SmkCustomMetadataValue *ptr;
+    size_t len;
+} SmkCustomMetadataValueSlice;
+
+typedef struct SmkCustomMetadataRange {
+    size_t first_value_index;
+    size_t value_count;
+} SmkCustomMetadataRange;
+
+typedef struct SmkCustomMetadataRangeSlice {
+    const SmkCustomMetadataRange *ptr;
+    size_t len;
+} SmkCustomMetadataRangeSlice;
+
 typedef struct SmkMetadataDiagnostic {
     SmkUtf8Slice code;
     SmkUtf8Slice field;
@@ -666,6 +686,17 @@ SmkStatus smk_engine_set_preferred_languages(SmkEngine *engine, const SmkUtf8Sli
 SmkStatus smk_scan_result_preferred_languages(const SmkScanResult *result, SmkUtf8SliceSlice *out_values);
 SmkStatus smk_scan_result_metadata_presentations(const SmkScanResult *result, uint32_t collection, SmkMetadataPresentationSlice *out_values);
 SmkStatus smk_scan_result_metadata_tags(const SmkScanResult *result, SmkUtf8SliceSlice *out_values);
+/* Custom values/ranges borrow result. Collection IDs match metadata presentations.
+ * An empty ranges slice means every entry in that collection has no custom fields. */
+SmkStatus smk_scan_result_custom_metadata_values(const SmkScanResult *result, SmkCustomMetadataValueSlice *output);
+SmkStatus smk_scan_result_custom_metadata_ranges(const SmkScanResult *result, uint32_t collection, SmkCustomMetadataRangeSlice *output);
+SmkStatus smk_engine_set_custom_metadata_keys(SmkEngine *engine, const SmkUtf8Slice *keys, size_t count, uint8_t *changed);
+SmkStatus smk_edit_result_custom_metadata_fields(const SmkEditResult *result, SmkUtf8Slice *output);
+/* JSON patches affect only supplied keys. Empty arrays remove a key's occurrences. */
+SmkStatus smk_engine_write_script_metadata_file_if_unchanged_v3(SmkEngine *engine, const SmkScriptMetadataWriteRequest *request, const SmkMetadataEditExtensions *extensions, SmkUtf8Slice custom_fields, SmkUtf8Slice expected_source_fingerprint, SmkEditResult **out_result);
+SmkStatus smk_metadata_parse_text_v2(SmkUtf8Slice source, const SmkUtf8Slice *languages, size_t language_count, uint8_t require_closed_block, const SmkUtf8Slice *custom_keys, size_t custom_key_count, SmkEditResult **output);
+SmkStatus smk_validate_custom_metadata_field(SmkUtf8Slice key, SmkUtf8Slice value, SmkEditResult **output);
+SmkStatus smk_normalize_custom_metadata_key(SmkUtf8Slice key, SmkEditResult **output);
 SmkStatus smk_scan_result_metadata_diagnostics(const SmkScanResult *result, SmkMetadataDiagnosticSlice *out_values);
 
 /* Full edit-session extensions; nested slices borrow result until smk_edit_result_free. */

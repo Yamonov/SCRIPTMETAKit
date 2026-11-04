@@ -2,6 +2,8 @@ import Foundation
 
 /// The selected language only. Use readDraft when editing all translations.
 public nonisolated struct ScriptMetadata: Codable, Sendable, Equatable {
+    public var customFields: [String: [String]] { presentation.customFields }
+    public func customValues(for key: String) -> [String]? { presentation.customValues(for: key) }
     public var scriptID: String
     public var version: String?
     public var itemDescription: String?
@@ -44,10 +46,12 @@ public nonisolated enum ScriptMetaCommentStyle: UInt32, Sendable {
 /// Pure text operations; no engine, OS locale lookup, or file writes.
 /// Calls are synchronous. For large source text, call from the application's worker task.
 public nonisolated enum ScriptMetaKitMetadata {
-    public static func parse(_ source: String, preferredLanguages: [String] = [], requireClosedBlock: Bool = true) throws -> ScriptMetadata {
+    public static func parse(_ source: String, preferredLanguages: [String] = [], requireClosedBlock: Bool = true, customMetadataKeys: [String] = []) throws -> ScriptMetadata {
         try ScriptMetaService.withUTF8(source) { text in
             try ScriptMetaService.withStrings(preferredLanguages) { languages, count in
-                try ScriptMetaService.decode { smk_metadata_parse_text(text, languages, count, requireClosedBlock ? 1 : 0, $0) }
+                try ScriptMetaService.withStrings(customMetadataKeys) { keys, keyCount in
+                    try ScriptMetaService.decode { smk_metadata_parse_text_v2(text, languages, count, requireClosedBlock ? 1 : 0, keys, keyCount, $0) }
+                }
             }
         }
     }
@@ -89,6 +93,20 @@ public nonisolated enum ScriptMetaKitMetadata {
     public static func normalizeLanguageTag(_ value: String) throws -> String {
         try ScriptMetaService.withUTF8(value) { input in
             try ScriptMetaService.text { smk_normalize_language_tag(input, $0) }
+        }
+    }
+
+    public static func normalizeCustomMetadataKey(_ key: String) throws -> String {
+        try ScriptMetaService.withUTF8(key) { input in
+            try ScriptMetaService.text { smk_normalize_custom_metadata_key(input, $0) }
+        }
+    }
+
+    public static func validateCustomMetadataField(key: String, value: String) throws -> [MetadataDiagnostic] {
+        try ScriptMetaService.withUTF8(key) { key in
+            try ScriptMetaService.withUTF8(value) { value in
+                try ScriptMetaService.decode { smk_validate_custom_metadata_field(key, value, $0) }
+            }
         }
     }
 

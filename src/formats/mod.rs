@@ -215,7 +215,10 @@ pub fn inspect_script_file(path: &Path) -> ScriptFileInspection {
     let capability = scriptmeta_edit_capability_from_file_list_probe(path, prefix_bytes);
     let supports_inline_scriptmeta_editing = format
         .is_some_and(|spec| spec.supports_scriptmeta_write)
-        && capability.scriptmeta_edit_state != ScriptMetaEditState::Obfuscated;
+        && !matches!(
+            capability.scriptmeta_edit_state,
+            ScriptMetaEditState::Obfuscated | ScriptMetaEditState::Unsupported
+        );
 
     ScriptFileInspection {
         is_supported_script_path: format.is_some(),
@@ -311,7 +314,7 @@ fn scriptmeta_edit_capability(
     let file_state = file_write_state(path);
     let state = if is_jsxbin_obfuscated_script(path, prefix_bytes) {
         ScriptMetaEditState::Obfuscated
-    } else if !supports_scriptmeta_write(path) {
+    } else if !supports_scriptmeta_write(path) || file_state.is_special_file {
         ScriptMetaEditState::Unsupported
     } else if !metadata_state_known {
         ScriptMetaEditState::Unknown
@@ -349,6 +352,9 @@ fn is_jsxbin_obfuscated_script(path: &Path, prefix_bytes: Option<&[u8]>) -> bool
 fn read_script_header_probe(path: &Path) -> Option<Vec<u8>> {
     let byte_limit = script_header_probe_byte_limit(path);
     if byte_limit == 0 {
+        return None;
+    }
+    if !fs::metadata(path).ok()?.is_file() {
         return None;
     }
 
@@ -428,6 +434,7 @@ fn extension_matches_any(extension: &str, candidates: &[&str]) -> bool {
 struct FileWriteState {
     is_file_locked: bool,
     is_read_only: bool,
+    is_special_file: bool,
 }
 
 fn file_write_state(path: &Path) -> FileWriteState {
@@ -435,6 +442,7 @@ fn file_write_state(path: &Path) -> FileWriteState {
         return FileWriteState {
             is_file_locked: false,
             is_read_only: true,
+            is_special_file: false,
         };
     };
     #[cfg(target_os = "macos")]
@@ -446,6 +454,7 @@ fn file_write_state(path: &Path) -> FileWriteState {
     FileWriteState {
         is_file_locked,
         is_read_only,
+        is_special_file: !metadata.is_file(),
     }
 }
 

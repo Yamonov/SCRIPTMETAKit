@@ -10,11 +10,11 @@
 		</data>
 		<key>macos-arm64_x86_64/Headers/scriptmetakit_ffi.h</key>
 		<data>
-		ngQEQnkGJS0wbrRSvj6TV2Jn830=
+		qEkuhzNPb1fJDpeI/LqSAZuJ5Dg=
 		</data>
 		<key>macos-arm64_x86_64/libscriptmetakit_ffi.dylib</key>
 		<data>
-		8ERIECEVb4ausEmNlbwgpxhwE04=
+		/Bnfw3utSx6tV4yUrykcbSOm8cI=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -30,14 +30,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			UvJUsZzsnzEh8x4u0u3yXouOi7Q4jmiXU2zFfOmHcGM=
+			EzL9xPScHUesAvna+gNAOtmlwcgEbDfizqbYin8nfdc=
 			</data>
 		</dict>
 		<key>macos-arm64_x86_64/libscriptmetakit_ffi.dylib</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			ugd0iox6vIkx22fnE6hDN0KAva1VFGi57vpfayN09mo=
+			dEFCEtxMWxLj0ECnMwJsm0OutHOCnsLgzbjp/VcRk84=
 			</data>
 		</dict>
 	</dict>

@@ -169,9 +169,38 @@ pub unsafe extern "C" fn smk_metadata_parse_text(
     require_closed_block: u8,
     output: *mut *mut SmkEditResult,
 ) -> SmkStatus {
+    unsafe {
+        smk_metadata_parse_text_v2(
+            source,
+            languages,
+            language_count,
+            require_closed_block,
+            ptr::null(),
+            0,
+            output,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// Source and each array element are readable UTF-8 for the call. Output owns JSON.
+pub unsafe extern "C" fn smk_metadata_parse_text_v2(
+    source: SmkUtf8Slice,
+    languages: *const SmkUtf8Slice,
+    language_count: usize,
+    require_closed_block: u8,
+    custom_keys: *const SmkUtf8Slice,
+    custom_key_count: usize,
+    output: *mut *mut SmkEditResult,
+) -> SmkStatus {
     service_text(output, || {
         let languages = utf8_strings_from_raw(languages, language_count)?;
         let options = scriptmetakit::ParserOptions {
+            custom_metadata_keys: scriptmetakit::CustomMetadataSelection::new(
+                utf8_strings_from_raw(custom_keys, custom_key_count)?,
+            )
+            .map_err(service_error)?,
             require_closed_block: require_closed_block != 0,
             preferred_languages: scriptmetakit::LanguagePreferences::new(languages)
                 .map_err(service_error)?,
@@ -181,6 +210,34 @@ pub unsafe extern "C" fn smk_metadata_parse_text(
             &scriptmetakit::parse_script_metadata_with_options(utf8_slice(source)?, &options)
                 .map_err(service_error)?,
         )
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// Key/value are readable UTF-8. Output owns a JSON array of validation diagnostics.
+pub unsafe extern "C" fn smk_validate_custom_metadata_field(
+    key: SmkUtf8Slice,
+    value: SmkUtf8Slice,
+    output: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    service_text(output, || {
+        json(&scriptmetakit::validate_custom_metadata_field(
+            utf8_slice(key)?,
+            utf8_slice(value)?,
+        ))
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// Key is readable UTF-8. Output owns the canonical key or an error message.
+pub unsafe extern "C" fn smk_normalize_custom_metadata_key(
+    key: SmkUtf8Slice,
+    output: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    service_text(output, || {
+        scriptmetakit::normalize_custom_metadata_key(utf8_slice(key)?).map_err(service_error)
     })
 }
 

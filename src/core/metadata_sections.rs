@@ -17,6 +17,7 @@ struct ScalarValue {
 
 #[derive(Default)]
 pub(crate) struct MetadataSections {
+    pub custom_fields: super::CustomMetadataFields,
     pub legacy_body: String,
     pub raw_description: Option<String>,
     pub tag_lines: Vec<String>,
@@ -75,6 +76,25 @@ fn description_end_marker(line: &str) -> Option<String> {
 }
 
 pub(crate) fn metadata_sections(body: &str) -> MetadataSections {
+    metadata_sections_inner(body, &super::CustomMetadataSelection::default(), false)
+}
+
+pub(crate) fn metadata_sections_with_custom_fields(
+    body: &str,
+    keys: &super::CustomMetadataSelection,
+) -> MetadataSections {
+    metadata_sections_inner(body, keys, false)
+}
+
+pub(crate) fn metadata_sections_for_editing(body: &str) -> MetadataSections {
+    metadata_sections_inner(body, &super::CustomMetadataSelection::default(), true)
+}
+
+fn metadata_sections_inner(
+    body: &str,
+    keys: &super::CustomMetadataSelection,
+    editing: bool,
+) -> MetadataSections {
     let normalized = normalized_newlines(body);
     let prefix = infer_metadata_line_prefix(&normalized);
     let mut result = MetadataSections::default();
@@ -111,6 +131,49 @@ pub(crate) fn metadata_sections(body: &str) -> MetadataSections {
                 description_end = None;
             } else {
                 description_lines.push(raw);
+            }
+            continue;
+        }
+        let custom_line =
+            super::has_custom_metadata_prefix(line) && (!in_tags || line.contains(['=', ':']));
+        if custom_line {
+            in_tags = false;
+            let diagnostic_key = line
+                .split(|ch: char| ch.is_whitespace() || matches!(ch, '=' | ':'))
+                .next()
+                .unwrap_or("X-");
+            if editing {
+                legacy.push((raw, false));
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                diagnostic(
+                    &mut result.diagnostics,
+                    "invalid_custom_metadata_field",
+                    diagnostic_key,
+                    None,
+                    Some(index + 1),
+                );
+                continue;
+            };
+            let key = key.trim();
+            let issue = super::custom_metadata_issue(key, value);
+            if let Some(code) = issue {
+                diagnostic(
+                    &mut result.diagnostics,
+                    code,
+                    diagnostic_key,
+                    None,
+                    Some(index + 1),
+                );
+            }
+            if (editing || (issue.is_none() && keys.contains(key)))
+                && let Ok(key) = super::normalize_custom_metadata_key(key)
+            {
+                result
+                    .custom_fields
+                    .entry(key)
+                    .or_default()
+                    .push(value.trim().to_owned());
             }
             continue;
         }

@@ -81,7 +81,7 @@ private enum KitIntegrationProbe {
         }
 
         let info = try ScriptMetaKitRuntime.linkedRuntimeInfo()
-        precondition(info.packageVersion == "2.0.1" && info.apiVersion == 1)
+        precondition(info.packageVersion == "2.1.0" && info.apiVersion == 1)
         precondition(info.nativeWatch && info.httpUpdates)
         precondition(!ScriptMetaKitRuntime.acknowledgementsText.isEmpty)
         precondition(!ScriptMetaKitRuntime.acknowledgementsSummaryText.isEmpty)
@@ -90,6 +90,9 @@ private enum KitIntegrationProbe {
         let store = ScriptMetaKitPersistentCacheStore(directoryURL: base.appendingPathComponent("cache"))
         let workspace = ScriptMetaKitWorkspace(configuration: .init(cacheStore: store,
             diagnosticHandler: { events.diagnostic($0) }, preferredLanguages: ["ja", "en", "fr"]))
+        var configuration = try await workspace.engineConfiguration()
+        configuration.parser.customMetadataKeys = ["X-"]
+        try await workspace.applyConfiguration(configuration)
         let root = ScriptMetaKitRoot(rootID: "root", url: scripts, watchPolicy: .allRegistered)
         var report: [String: Any] = ["version": info.packageVersion, "architecture": info.architecture, "scripts": count]
         var start = ProcessInfo.processInfo.systemUptime
@@ -185,6 +188,7 @@ private enum KitIntegrationProbe {
         Author=Autor
         Tags=image,画像,export,
         common,
+        X-org.example-Order=\(index)
         Description-BEGIN
         [de]DE_BODY_\(index)_\(payload)
         [ja]JA_BODY_\(index)_\(payload)
@@ -202,6 +206,7 @@ private enum KitIntegrationProbe {
         precondition(result.fileItems.count == count)
         precondition(result.fileItems.allSatisfy { $0.presentation.descriptionLanguage == language })
         precondition(result.fileItems.allSatisfy { !($0.itemDescription?.contains("DE_BODY_") ?? true) })
+        precondition(result.fileItems.allSatisfy { $0.customValues(for: "X-org.example-Order")?.count == 1 })
     }
 
     private static func restore(_ workspace: ScriptMetaKitWorkspace, root: ScriptMetaKitRoot, count: Int) async throws {

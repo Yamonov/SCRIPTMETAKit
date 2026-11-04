@@ -19,8 +19,8 @@ use crate::{
         LanguagePreferences, MetadataDiagnostic, MetadataEditExtensions, ScriptMetaKitError,
         ScriptMetaKitResult, ScriptRuntimeKind, clean_metadata_line, decode_script_text_prefix,
         decode_script_text_with_encoding, encode_script_text, has_script_metadata_block,
-        metadata_sections, normalize_language_tag, normalize_metadata_tags, normalize_metadata_url,
-        normalize_version_string, normalized_newlines,
+        metadata_sections_for_editing, normalize_language_tag, normalize_metadata_tags,
+        normalize_metadata_url, normalize_version_string, normalized_newlines,
     },
     formats::{self, CommentSyntax, compiled_osa},
 };
@@ -65,6 +65,9 @@ pub struct ScriptIdUniquenessItem {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScriptMetadataDraft {
+    /// Key-scoped updates. Missing keys preserve existing fields, empty arrays remove them.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub custom_fields: crate::CustomMetadataFields,
     pub script_id: String,
     #[serde(default, deserialize_with = "deserialize_optional_version")]
     pub version: Option<String>,
@@ -393,6 +396,7 @@ pub fn render_script_metadata_for_style(
     draft: &ScriptMetadataDraft,
     style: ScriptMetaCommentStyle,
 ) -> ScriptMetaKitResult<String> {
+    validate_custom_metadata_comment_safety(draft, style)?;
     let block = render_script_metadata_block(draft)?;
     Ok(wrap_metadata_block(
         &comment_safe_metadata_text(&block, style),
@@ -424,7 +428,8 @@ pub fn write_script_metadata_to_text(
         ))
     })?;
     let line_ending = detected_line_ending(source);
-    let existing_block = first_scriptmeta_tagged_block(source, style);
+    validate_custom_metadata_comment_safety(draft, style)?;
+    let existing_block = checked_scriptmeta_tagged_block(source, style)?;
 
     if existing_block.is_some() && mode == ScriptMetaWriteMode::InsertOnly {
         return Err(ScriptMetaKitError::InvalidConfig(
@@ -472,10 +477,10 @@ pub fn read_script_metadata_draft_from_text(
         ))
     })?;
     let line_ending = detected_line_ending(source).to_string();
-    let existing_block = first_scriptmeta_tagged_block(source, style);
+    let existing_block = checked_scriptmeta_tagged_block(source, style)?;
     let (draft, existing_lines, unknown_lines, existing_block_text, diagnostics) =
         if let Some(block) = existing_block {
-            let sections = metadata_sections(&block.content);
+            let sections = metadata_sections_for_editing(&block.content);
             let elements = parse_block_elements(&sections.legacy_body);
             let mut draft = draft_from_block_elements(&elements);
             let (_, _, _, presentation) = sections.project(
@@ -489,6 +494,7 @@ pub fn read_script_metadata_draft_from_text(
             draft.name = name;
             draft.author = author;
             draft.extensions = extensions;
+            draft.custom_fields = sections.custom_fields;
             if sections.raw_description.is_some() {
                 draft.description = sections.raw_description.clone();
             }
@@ -542,10 +548,7 @@ pub fn read_script_metadata_edit_preview_from_file(
             "metadata preview byte limit must not exceed {MAX_SCRIPT_METADATA_PREVIEW_BYTES}"
         )));
     }
-    let metadata = fs::metadata(path).map_err(|error| ScriptMetaKitError::Io {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
+    let metadata = script_file_metadata(path)?;
     let file_size = metadata.len();
     let file_state_fingerprint = file_state_fingerprint(&metadata);
 
@@ -649,6 +652,7 @@ pub fn read_script_metadata_draft_from_file(
     path: &Path,
 ) -> ScriptMetaKitResult<ScriptMetadataEditReadResult> {
     if compiled_osa::is_compiled_osa_path(path) {
+        script_file_metadata(path)?;
         let source = match compiled_osa::decompile_compiled_osa_source(path, None) {
             Ok(source) => source.source,
             Err(error) if compiled_osa_error_allows_text_fallback(error.kind) => {
@@ -799,7 +803,7 @@ fn write_script_metadata_to_compiled_osa_file(
         &file_content_fingerprint(source.source.as_bytes()),
     )?;
     let updated = write_script_metadata_to_text(&source.source, path, draft, mode)?;
-    let temp_path = compiled_osa_temp_path(path);
+    let temp_path = compiled_osa_temp_path(path)?;
     let mut temp_guard = TemporaryEditFile::new(temp_path.clone());
     let language_hint = source
         .language_hint
@@ -834,7 +838,11 @@ fn write_compiled_osa_temp_result(
     backup_options: Option<&ScriptMetaBackupOptions>,
     initial_file_fingerprint: &str,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
-    if let Err(error) = copy_replacement_metadata(path, temp_path) {
+    let destination = replacement_target_path(path).map_err(|error| ScriptMetaKitError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if let Err(error) = copy_replacement_metadata(&destination, temp_path) {
         let _ = fs::remove_file(temp_path);
         return Err(ScriptMetaKitError::Io {
             path: path.to_path_buf(),
@@ -859,7 +867,7 @@ fn write_compiled_osa_temp_result(
         return Err(error);
     }
 
-    if let Err(error) = replace_file(temp_path, path) {
+    if let Err(error) = replace_file(temp_path, &destination) {
         let _ = fs::remove_file(temp_path);
         if !error.is_committed()
             && let (Some(options), Some(record)) = (backup_options, backup.as_ref())
@@ -1311,7 +1319,7 @@ fn render_script_metadata_block_with_existing(
     existing_content: Option<&str>,
     line_ending: &str,
 ) -> ScriptMetaKitResult<String> {
-    let sections = existing_content.map(metadata_sections);
+    let sections = existing_content.map(metadata_sections_for_editing);
     if sections
         .as_ref()
         .is_some_and(|sections| !sections.is_structurally_complete())
@@ -1368,6 +1376,7 @@ fn render_script_metadata_block_with_existing(
         "Edit-Password-SHA256",
         draft.edit_password_sha256.as_deref(),
     );
+    let mut has_preserved_tags = false;
     if let Some(extensions) = &draft.extensions {
         let default_language = extensions
             .default_language
@@ -1399,13 +1408,30 @@ fn render_script_metadata_block_with_existing(
             .is_some_and(|old| old.tags == extensions.tags);
         if preserve_tag_lines {
             if let Some(sections) = &sections {
+                has_preserved_tags = !sections.tag_lines.is_empty();
                 lines.extend(sections.tag_lines.clone());
             }
         } else if !tags.is_empty() {
             append_field_line(&mut lines, "Tags", Some(&tags.join(",")));
         }
     }
-    lines.extend(existing_unknown_lines);
+    let unknown_lines = render_custom_metadata_lines(
+        &draft.custom_fields,
+        sections.as_ref().map(|value| &value.custom_fields),
+        &existing_unknown_lines,
+    )?;
+    if has_preserved_tags
+        && let Some(next) = unknown_lines.iter().find(|line| !line.trim().is_empty())
+        && crate::core::item_separator(next.trim()).is_none()
+        && !crate::core::is_block_marker(next.trim())
+        && let Some(last) = lines.iter_mut().rev().find(|line| !line.trim().is_empty())
+        && last.trim_end().ends_with(',')
+    {
+        // A removed custom field may have been the boundary ending Tags.
+        let comma = last.trim_end().len() - 1;
+        last.remove(comma);
+    }
+    lines.extend(unknown_lines);
     append_description_lines(
         &mut lines,
         draft.description.as_deref(),
@@ -1423,6 +1449,57 @@ fn render_script_metadata_block_with_existing(
     output.push_str(SCRIPT_END);
     output.push_str(line_ending);
     Ok(output)
+}
+
+fn render_custom_metadata_lines(
+    updates: &crate::CustomMetadataFields,
+    original: Option<&crate::CustomMetadataFields>,
+    original_lines: &[String],
+) -> ScriptMetaKitResult<Vec<String>> {
+    let mut changed = BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, values) in updates {
+        let key = crate::normalize_custom_metadata_key(key)?;
+        if !seen.insert(key.clone()) {
+            return Err(ScriptMetaKitError::InvalidConfig(format!(
+                "duplicate custom metadata update `{key}`"
+            )));
+        }
+        if values.iter().any(|value| value.contains(['\r', '\n'])) {
+            return Err(ScriptMetaKitError::InvalidConfig(format!(
+                "{key} must be a single line"
+            )));
+        }
+        let values: Vec<String> = values.iter().map(|value| value.trim().to_owned()).collect();
+        if original.and_then(|fields| fields.get(&key)) == Some(&values) {
+            continue;
+        }
+        for value in &values {
+            if let Some(issue) = crate::validate_custom_metadata_field(&key, value).first() {
+                return Err(ScriptMetaKitError::InvalidConfig(format!(
+                    "{} in {key}",
+                    issue.code
+                )));
+            }
+        }
+        changed.insert(key, values);
+    }
+    let mut lines = Vec::new();
+    for line in original_lines {
+        let replaced = line
+            .split_once('=')
+            .and_then(|(key, _)| crate::normalize_custom_metadata_key(key.trim()).ok())
+            .is_some_and(|key| changed.contains_key(&key));
+        if !replaced {
+            lines.push(line.clone());
+        }
+    }
+    for (key, values) in changed {
+        for value in values {
+            lines.push(format!("{key}={value}"));
+        }
+    }
+    Ok(lines)
 }
 
 fn append_field_line(lines: &mut Vec<String>, key: &str, value: Option<&str>) {
@@ -1504,7 +1581,9 @@ fn parse_block_elements(content: &str) -> Vec<ScriptMetaBlockElement> {
             continue;
         }
 
-        if let Some(separator_index) = script_metadata_separator_index(line) {
+        if crate::core::has_custom_metadata_prefix(trimmed) {
+            elements.push(ScriptMetaBlockElement::Raw(line.to_string()));
+        } else if let Some(separator_index) = script_metadata_separator_index(line) {
             let key = line[..separator_index].trim();
             let value = line[separator_index + 1..].trim();
             elements.push(ScriptMetaBlockElement::Key {
@@ -1664,6 +1743,24 @@ fn first_scriptmeta_tagged_block(
         search_start = begin_end;
     }
     None
+}
+
+fn checked_scriptmeta_tagged_block(
+    text: &str,
+    style: ScriptMetaCommentStyle,
+) -> ScriptMetaKitResult<Option<ScriptMetaTaggedBlock>> {
+    let block = first_scriptmeta_tagged_block(text, style);
+    if let Some(block) = &block
+        && crate::core::custom_metadata_boundary_is_embedded(
+            text,
+            block.tagged_range.end - SCRIPT_END.len(),
+        )
+    {
+        return Err(ScriptMetaKitError::InvalidConfig(
+            "custom metadata contains the outer ending marker".into(),
+        ));
+    }
+    Ok(block)
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -1843,6 +1940,27 @@ fn wrapped_tagged_block_insertion(
     } else {
         insertion
     }
+}
+
+fn validate_custom_metadata_comment_safety(
+    draft: &ScriptMetadataDraft,
+    style: ScriptMetaCommentStyle,
+) -> ScriptMetaKitResult<()> {
+    let closing = style.closing_delimiter();
+    if closing.is_empty() {
+        return Ok(());
+    }
+    for (key, values) in &draft.custom_fields {
+        if values.iter().any(|value| {
+            value.contains(closing)
+                || (style == ScriptMetaCommentStyle::AppleScriptBlock && value.contains("(*"))
+        }) {
+            return Err(ScriptMetaKitError::InvalidConfig(format!(
+                "custom_metadata_comment_delimiter in {key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn comment_safe_metadata_text(value: &str, style: ScriptMetaCommentStyle) -> Cow<'_, str> {
@@ -2199,7 +2317,21 @@ fn file_state_fingerprint(metadata: &fs::Metadata) -> String {
     format!("size:{}:modified:{modified}", metadata.len())
 }
 
+fn script_file_metadata(path: &Path) -> ScriptMetaKitResult<fs::Metadata> {
+    let metadata = fs::metadata(path).map_err(|error| ScriptMetaKitError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if !metadata.is_file() {
+        return Err(ScriptMetaKitError::InvalidConfig(
+            "metadata editing requires a regular file".into(),
+        ));
+    }
+    Ok(metadata)
+}
+
 fn read_script_bytes_file(path: &Path) -> ScriptMetaKitResult<Vec<u8>> {
+    script_file_metadata(path)?;
     fs::read(path).map_err(|error| ScriptMetaKitError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
@@ -2207,7 +2339,11 @@ fn read_script_bytes_file(path: &Path) -> ScriptMetaKitResult<Vec<u8>> {
 }
 
 fn ensure_script_file_writable(path: &Path) -> ScriptMetaKitResult<()> {
-    let inspection = formats::inspect_script_file(path);
+    let destination = replacement_target_path(path).map_err(|error| ScriptMetaKitError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let inspection = formats::inspect_script_file(&destination);
     if inspection.is_file_locked {
         return Err(ScriptMetaKitError::Io {
             path: path.to_path_buf(),
@@ -2223,15 +2359,19 @@ fn ensure_script_file_writable(path: &Path) -> ScriptMetaKitResult<()> {
     Ok(())
 }
 
-fn compiled_osa_temp_path(path: &Path) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!(
+fn compiled_osa_temp_path(path: &Path) -> ScriptMetaKitResult<PathBuf> {
+    let destination = replacement_target_path(path).map_err(|error| ScriptMetaKitError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(format!(
         ".{}.{}.compiled.tmp.scpt",
         path.file_name()
             .map(|name| name.to_string_lossy())
             .unwrap_or_default(),
         Uuid::new_v4()
-    ))
+    )))
 }
 
 #[derive(Debug)]
@@ -2273,7 +2413,18 @@ impl From<std::io::Error> for AtomicWriteError {
     }
 }
 
+fn replacement_target_path(path: &Path) -> std::io::Result<Cow<'_, Path>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path).map(Cow::Owned),
+        Ok(_) => Ok(Cow::Borrowed(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Cow::Borrowed(path)),
+        Err(error) => Err(error),
+    }
+}
+
 fn write_bytes_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
+    let destination = replacement_target_path(path)?;
+    let path = destination.as_ref();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let temp_path = parent.join(format!(
@@ -2330,7 +2481,112 @@ fn copy_replacement_metadata(source_path: &Path, target_path: &Path) -> std::io:
     fs::set_permissions(target_path, fs::metadata(source_path)?.permissions())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn copy_replacement_metadata(source_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW},
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+            PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            UNPROTECTED_DACL_SECURITY_INFORMATION,
+        },
+        Storage::FileSystem::GetVolumeInformationByHandleW,
+        System::SystemServices::FILE_PERSISTENT_ACLS,
+    };
+
+    let source_file = fs::File::open(source_path)?;
+    fs::set_permissions(target_path, source_file.metadata()?.permissions())?;
+    let mut volume_flags = 0;
+    // SAFETY: source_file owns a live handle and volume_flags is writable.
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            source_file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut volume_flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if volume_flags & FILE_PERSISTENT_ACLS == 0 {
+        return Ok(());
+    }
+
+    struct Descriptor(*mut std::ffi::c_void);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: GetNamedSecurityInfoW allocates this descriptor with LocalAlloc.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+    let source = source_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target = target_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = Descriptor(std::ptr::null_mut());
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: paths and outputs remain live. The descriptor guard owns the returned allocation.
+    let error = unsafe {
+        GetNamedSecurityInfoW(
+            source.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor.0,
+        )
+    };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error as i32));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: descriptor is the live self-relative security descriptor returned by Windows.
+    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let protection = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: dacl borrows descriptor, which outlives this synchronous call.
+    let error = unsafe {
+        SetNamedSecurityInfoW(
+            target.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error as i32));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn copy_replacement_metadata(source_path: &Path, target_path: &Path) -> std::io::Result<()> {
     fs::set_permissions(target_path, fs::metadata(source_path)?.permissions())
 }
@@ -2730,6 +2986,7 @@ mod tests {
     #[test]
     fn renders_and_parses_javascript_script_metadata() {
         let draft = ScriptMetadataDraft {
+            custom_fields: Default::default(),
             script_id: "com.example.tool".to_string(),
             version: Some("v1. 2 .3".to_string()),
             description: Some("Line 1\nLine 2".to_string()),
