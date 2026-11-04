@@ -1,22 +1,7 @@
 import Foundation
+import ScriptMetaKitFFI
 
-private nonisolated let smkWorkspaceStatusOK: Int32 = 0
-
-private nonisolated struct SmkWorkspaceUtf8Slice {
-    var ptr: UnsafePointer<UInt8>?
-    var len: Int
-
-    init(ptr: UnsafePointer<UInt8>? = nil, len: Int = 0) {
-        self.ptr = ptr
-        self.len = len
-    }
-}
-
-@_silgen_name("smk_can_read_directory_contents")
-private nonisolated func smk_can_read_directory_contents(
-    _ path: SmkWorkspaceUtf8Slice,
-    _ outCanRead: UnsafeMutablePointer<UInt8>
-) -> Int32
+private nonisolated let smkWorkspaceStatusOK = SMK_STATUS_OK
 
 public nonisolated enum ScriptMetaKitDiagnosticSeverity: String, Codable, Sendable {
     case information
@@ -1612,11 +1597,11 @@ public extension ScriptMetaKitWorkspace {
 
 private nonisolated func withWorkspaceUTF8Slice<Result>(
     _ value: String,
-    _ body: (SmkWorkspaceUtf8Slice) -> Result
+    _ body: (SmkUtf8Slice) -> Result
 ) -> Result {
     var mutableValue = value
     return mutableValue.withUTF8 { buffer in
-        body(SmkWorkspaceUtf8Slice(ptr: buffer.baseAddress, len: buffer.count))
+        body(SmkUtf8Slice(ptr: buffer.baseAddress, len: buffer.count))
     }
 }
 

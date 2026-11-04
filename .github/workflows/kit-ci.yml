@@ -41,6 +41,12 @@ jobs:
         run: swift test -Xswiftc -swift-version -Xswiftc 5
       - name: Swift 6 strict concurrency
         run: swift test -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -strict-concurrency=complete
+      - name: Swift public save APIs on both CPUs and optimization modes
+        run: |
+          if [ "$(uname -m)" = arm64 ] && ! /usr/bin/arch -x86_64 /usr/bin/true; then
+            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          python3 script/validate_swift_api.py
       - name: Xcode package embedding and headless application smoke
         run: |
           xcodebuild -workspace tests/integration/KitIntegration.xcworkspace \

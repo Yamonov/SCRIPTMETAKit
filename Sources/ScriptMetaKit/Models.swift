@@ -1,87 +1,7 @@
 import Foundation
+import ScriptMetaKitFFI
 
-private nonisolated let smkPolicyStatusOK: Int32 = 0
-
-private nonisolated struct SmkPolicyUtf8Slice {
-    var ptr: UnsafePointer<UInt8>?
-    var len: Int
-
-    init(ptr: UnsafePointer<UInt8>? = nil, len: Int = 0) {
-        self.ptr = ptr
-        self.len = len
-    }
-}
-
-private nonisolated struct SmkPolicyScriptFileInspection {
-    var isSupportedScriptPath: UInt8
-    var runtimeKind: SmkPolicyUtf8Slice
-    var shebang: SmkPolicyUtf8Slice
-    var commentSyntax: SmkPolicyUtf8Slice
-    var supportsInlineScriptMetaEditing: UInt8
-    var isFileLocked: UInt8
-    var isReadOnly: UInt8
-    var canEditScriptMeta: UInt8
-    var canAppendScriptMeta: UInt8
-    var scriptMetaEditState: SmkPolicyUtf8Slice
-
-    init(
-        isSupportedScriptPath: UInt8 = 0,
-        runtimeKind: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice(),
-        shebang: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice(),
-        commentSyntax: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice(),
-        supportsInlineScriptMetaEditing: UInt8 = 0,
-        isFileLocked: UInt8 = 0,
-        isReadOnly: UInt8 = 0,
-        canEditScriptMeta: UInt8 = 0,
-        canAppendScriptMeta: UInt8 = 0,
-        scriptMetaEditState: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice()
-    ) {
-        self.isSupportedScriptPath = isSupportedScriptPath
-        self.runtimeKind = runtimeKind
-        self.shebang = shebang
-        self.commentSyntax = commentSyntax
-        self.supportsInlineScriptMetaEditing = supportsInlineScriptMetaEditing
-        self.isFileLocked = isFileLocked
-        self.isReadOnly = isReadOnly
-        self.canEditScriptMeta = canEditScriptMeta
-        self.canAppendScriptMeta = canAppendScriptMeta
-        self.scriptMetaEditState = scriptMetaEditState
-    }
-}
-
-private nonisolated struct SmkPolicyPathResolution {
-    var displayPath = SmkPolicyUtf8Slice()
-    var sourcePath = SmkPolicyUtf8Slice()
-    var resolvedPath = SmkPolicyUtf8Slice()
-    var pathKind = SmkPolicyUtf8Slice()
-    var resolutionStatus = SmkPolicyUtf8Slice()
-    var resolutionMessage = SmkPolicyUtf8Slice()
-}
-
-@_silgen_name("smk_supported_script_extensions")
-private nonisolated func smk_supported_script_extensions(
-    _ outExtensions: UnsafeMutablePointer<SmkPolicyUtf8Slice>
-) -> Int32
-
-@_silgen_name("smk_inspect_script_file_path")
-private nonisolated func smk_inspect_script_file_path(
-    _ path: SmkPolicyUtf8Slice,
-    _ outInspection: UnsafeMutablePointer<SmkPolicyScriptFileInspection>
-) -> Int32
-
-@_silgen_name("smk_resolve_registered_path")
-private nonisolated func smk_resolve_registered_path(
-    _ path: SmkPolicyUtf8Slice,
-    _ followSymlinks: UInt8,
-    _ resolveMacOSAlias: UInt8,
-    _ outResolution: UnsafeMutablePointer<SmkPolicyPathResolution>
-) -> Int32
-
-@_silgen_name("smk_script_path_may_affect_metadata")
-private nonisolated func smk_script_path_may_affect_metadata(
-    _ path: SmkPolicyUtf8Slice,
-    _ outMayAffect: UnsafeMutablePointer<UInt8>
-) -> Int32
+private nonisolated let smkPolicyStatusOK = SMK_STATUS_OK
 
 public nonisolated struct ScriptMetaScriptFileInspection: Codable, Equatable, Sendable {
     public var isSupportedScriptPath: Bool
@@ -147,7 +67,7 @@ public nonisolated struct ScriptMetaPathResolution: Codable, Equatable, Sendable
 
 public nonisolated enum ScriptMetaScriptFilePolicy {
     public static let supportedPathExtensions: Set<String> = {
-        var extensions = SmkPolicyUtf8Slice()
+        var extensions = SmkUtf8Slice()
         guard smk_supported_script_extensions(&extensions) == smkPolicyStatusOK else {
             return []
         }
@@ -155,7 +75,7 @@ public nonisolated enum ScriptMetaScriptFilePolicy {
     }()
 
     public static func inspect(_ url: URL) -> ScriptMetaScriptFileInspection {
-        var inspection = SmkPolicyScriptFileInspection()
+        var inspection = SmkScriptFileInspection()
         let status = withUTF8Slice(url.standardizedFileURL.path) { pathSlice in
             smk_inspect_script_file_path(pathSlice, &inspection)
         }
@@ -163,16 +83,16 @@ public nonisolated enum ScriptMetaScriptFilePolicy {
             return ScriptMetaScriptFileInspection()
         }
         return ScriptMetaScriptFileInspection(
-            isSupportedScriptPath: inspection.isSupportedScriptPath != 0,
-            runtimeKind: optionalString(inspection.runtimeKind),
+            isSupportedScriptPath: inspection.is_supported_script_path != 0,
+            runtimeKind: optionalString(inspection.runtime_kind),
             shebang: optionalString(inspection.shebang),
-            commentSyntax: optionalString(inspection.commentSyntax),
-            supportsInlineScriptMetaEditing: inspection.supportsInlineScriptMetaEditing != 0,
-            isFileLocked: inspection.isFileLocked != 0,
-            isReadOnly: inspection.isReadOnly != 0,
-            canEditScriptMeta: inspection.canEditScriptMeta != 0,
-            canAppendScriptMeta: inspection.canAppendScriptMeta != 0,
-            scriptMetaEditState: optionalString(inspection.scriptMetaEditState) ?? "unknown"
+            commentSyntax: optionalString(inspection.comment_syntax),
+            supportsInlineScriptMetaEditing: inspection.supports_inline_scriptmeta_editing != 0,
+            isFileLocked: inspection.is_file_locked != 0,
+            isReadOnly: inspection.is_read_only != 0,
+            canEditScriptMeta: inspection.can_edit_scriptmeta != 0,
+            canAppendScriptMeta: inspection.can_append_scriptmeta != 0,
+            scriptMetaEditState: optionalString(inspection.scriptmeta_edit_state) ?? "unknown"
         )
     }
 
@@ -181,7 +101,7 @@ public nonisolated enum ScriptMetaScriptFilePolicy {
         followSymlinks: Bool = true,
         resolveMacOSAlias: Bool = true
     ) -> ScriptMetaPathResolution? {
-        var resolution = SmkPolicyPathResolution()
+        var resolution = SmkPathResolution()
         let status = withUTF8Slice(url.standardizedFileURL.path) { pathSlice in
             smk_resolve_registered_path(
                 pathSlice,
@@ -192,12 +112,12 @@ public nonisolated enum ScriptMetaScriptFilePolicy {
         }
         guard status == smkPolicyStatusOK else { return nil }
         return ScriptMetaPathResolution(
-            displayURL: URL(fileURLWithPath: string(resolution.displayPath)),
-            sourceURL: URL(fileURLWithPath: string(resolution.sourcePath)),
-            resolvedURL: URL(fileURLWithPath: string(resolution.resolvedPath)),
-            pathKind: string(resolution.pathKind),
-            resolutionStatus: string(resolution.resolutionStatus),
-            resolutionMessage: optionalString(resolution.resolutionMessage)
+            displayURL: URL(fileURLWithPath: string(resolution.display_path)),
+            sourceURL: URL(fileURLWithPath: string(resolution.source_path)),
+            resolvedURL: URL(fileURLWithPath: string(resolution.resolved_path)),
+            pathKind: string(resolution.path_kind),
+            resolutionStatus: string(resolution.resolution_status),
+            resolutionMessage: optionalString(resolution.resolution_message)
         )
     }
 
@@ -231,20 +151,20 @@ public nonisolated enum ScriptMetaScriptFilePolicy {
 
     private static func withUTF8Slice<Result>(
         _ value: String,
-        _ body: (SmkPolicyUtf8Slice) -> Result
+        _ body: (SmkUtf8Slice) -> Result
     ) -> Result {
         var mutableValue = value
         return mutableValue.withUTF8 { buffer in
-            body(SmkPolicyUtf8Slice(ptr: buffer.baseAddress, len: buffer.count))
+            body(SmkUtf8Slice(ptr: buffer.baseAddress, len: buffer.count))
         }
     }
 
-    private static func optionalString(_ slice: SmkPolicyUtf8Slice) -> String? {
+    private static func optionalString(_ slice: SmkUtf8Slice) -> String? {
         let value = string(slice)
         return value.isEmpty ? nil : value
     }
 
-    private static func string(_ slice: SmkPolicyUtf8Slice) -> String {
+    private static func string(_ slice: SmkUtf8Slice) -> String {
         guard let ptr = slice.ptr, slice.len > 0 else { return "" }
         return String(decoding: UnsafeBufferPointer(start: ptr, count: slice.len), as: UTF8.self)
     }
