@@ -27,12 +27,22 @@ public nonisolated struct ScriptMetaKitConfiguration: Codable, Sendable, Equatab
 }
 
 public nonisolated struct ScriptMetaParserConfiguration: Codable, Sendable, Equatable {
+    public var customMetadataKeys: [String] = []
     public var maxPrefixBytes: Int
     public var requireClosedBlock: Bool
     public var preferredLanguages: [String]
     enum CodingKeys: String, CodingKey {
         case maxPrefixBytes = "max_prefix_bytes", requireClosedBlock = "require_closed_block"
         case preferredLanguages = "preferred_languages"
+        case customMetadataKeys = "custom_metadata_keys"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        maxPrefixBytes = try values.decode(Int.self, forKey: .maxPrefixBytes)
+        requireClosedBlock = try values.decode(Bool.self, forKey: .requireClosedBlock)
+        preferredLanguages = try values.decodeIfPresent([String].self, forKey: .preferredLanguages) ?? []
+        customMetadataKeys = try values.decodeIfPresent([String].self, forKey: .customMetadataKeys) ?? []
     }
 }
 

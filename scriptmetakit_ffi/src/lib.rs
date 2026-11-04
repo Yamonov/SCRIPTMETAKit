@@ -599,6 +599,34 @@ pub struct SmkMetadataPresentationSlice {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SmkCustomMetadataValue {
+    pub key: SmkUtf8Slice,
+    pub value: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SmkCustomMetadataValueSlice {
+    pub ptr: *const SmkCustomMetadataValue,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SmkCustomMetadataRange {
+    pub first_value_index: usize,
+    pub value_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SmkCustomMetadataRangeSlice {
+    pub ptr: *const SmkCustomMetadataRange,
+    pub len: usize,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SmkMetadataDiagnostic {
     pub code: SmkUtf8Slice,
@@ -870,6 +898,8 @@ struct SmkEngineState {
 }
 
 pub struct SmkScanResult {
+    custom_metadata_values: Vec<SmkCustomMetadataValue>,
+    custom_metadata_ranges: [Vec<SmkCustomMetadataRange>; 4],
     string_storage: Vec<Box<str>>,
     string_index: BTreeMap<Box<str>, SmkUtf8Slice>,
     preferred_languages: Vec<SmkUtf8Slice>,
@@ -879,7 +909,7 @@ pub struct SmkScanResult {
     file_item_presentations: Vec<SmkMetadataPresentation>,
     file_entry_presentations: Vec<SmkMetadataPresentation>,
     candidate_presentations: Vec<SmkMetadataPresentation>,
-    presentation_index: BTreeMap<usize, SmkMetadataPresentation>,
+    presentation_index: BTreeMap<usize, (SmkMetadataPresentation, SmkCustomMetadataRange)>,
     catalog_info: SmkCatalogInfo,
     registered_root_signatures: Vec<SmkRegisteredRootSignature>,
     roots: Vec<SmkRootSnapshot>,
@@ -920,6 +950,7 @@ pub struct SmkScriptIdUniquenessResult {
 }
 
 pub struct SmkEditResult {
+    custom_metadata_json: SmkUtf8Slice,
     string_storage: Vec<u8>,
     string_overflow: Vec<Box<[u8]>>,
     text: SmkUtf8Slice,
@@ -1423,6 +1454,79 @@ pub unsafe extern "C" fn smk_scan_result_metadata_tags(
             ptr: result.metadata_tags.as_ptr(),
             len: result.metadata_tags.len(),
         };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// Result is live and output is writable. All slices borrow the result.
+pub unsafe extern "C" fn smk_scan_result_custom_metadata_values(
+    result: *const SmkScanResult,
+    output: *mut SmkCustomMetadataValueSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        *out_mut(output)? = SmkCustomMetadataValueSlice {
+            ptr: result.custom_metadata_values.as_ptr(),
+            len: result.custom_metadata_values.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// Result is live and output is writable. Collection uses the presentation collection IDs.
+/// An empty range slice means every entry in the collection has no custom fields.
+pub unsafe extern "C" fn smk_scan_result_custom_metadata_ranges(
+    result: *const SmkScanResult,
+    collection: u32,
+    output: *mut SmkCustomMetadataRangeSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let ranges = result
+            .custom_metadata_ranges
+            .get(collection as usize)
+            .ok_or_else(|| {
+                (
+                    SmkStatus::InvalidArgument,
+                    "invalid metadata collection".into(),
+                )
+            })?;
+        *out_mut(output)? = SmkCustomMetadataRangeSlice {
+            ptr: ranges.as_ptr(),
+            len: ranges.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// Engine is live, keys contains count readable UTF-8 slices, and changed is writable.
+pub unsafe extern "C" fn smk_engine_set_custom_metadata_keys(
+    engine: *mut SmkEngine,
+    keys: *const SmkUtf8Slice,
+    count: usize,
+    changed: *mut u8,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let mut state = engine_mut(engine)?;
+        *out_mut(changed)? = 0;
+        state.clear_error();
+        let values =
+            utf8_strings_from_raw(keys, count).inspect_err(|error| state.set_error(&error.1))?;
+        let change = state
+            .engine
+            .set_custom_metadata_keys(values)
+            .map_err(|error| {
+                let message = error.to_string();
+                state.set_error(&message);
+                (SmkStatus::InvalidArgument, message)
+            })?;
+        *out_mut(changed)? = bool_byte(change.changed);
         Ok(())
     })
 }
@@ -3623,6 +3727,7 @@ pub unsafe extern "C" fn smk_engine_write_script_metadata_file_if_unchanged(
         engine,
         request,
         ptr::null(),
+        SmkUtf8Slice::empty(),
         expected_source_fingerprint,
         out_result,
     )
@@ -3644,6 +3749,29 @@ pub unsafe extern "C" fn smk_engine_write_script_metadata_file_if_unchanged_v2(
         engine,
         request,
         extensions,
+        SmkUtf8Slice::empty(),
+        expected_source_fingerprint,
+        out_result,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// Request/extensions are readable for the call. Custom updates are a UTF-8 JSON
+/// object of key-to-string-array patches. Output must be writable and freed.
+pub unsafe extern "C" fn smk_engine_write_script_metadata_file_if_unchanged_v3(
+    engine: *mut SmkEngine,
+    request: *const SmkScriptMetadataWriteRequest,
+    extensions: *const SmkMetadataEditExtensions,
+    custom_fields: SmkUtf8Slice,
+    expected_source_fingerprint: SmkUtf8Slice,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    write_script_metadata_ffi(
+        engine,
+        request,
+        extensions,
+        custom_fields,
         expected_source_fingerprint,
         out_result,
     )
@@ -3653,6 +3781,7 @@ fn write_script_metadata_ffi(
     engine: *mut SmkEngine,
     request: *const SmkScriptMetadataWriteRequest,
     extensions: *const SmkMetadataEditExtensions,
+    custom_fields: SmkUtf8Slice,
     expected_source_fingerprint: SmkUtf8Slice,
     out_result: *mut *mut SmkEditResult,
 ) -> SmkStatus {
@@ -3681,6 +3810,15 @@ fn write_script_metadata_ffi(
             draft.extensions =
                 metadata_edit_extensions_from_ffi(input_ref(extensions, "metadata extensions")?)
                     .inspect_err(|error| engine.set_error(&error.1))?;
+        }
+        if let Some(value) = optional_str_from_slice(custom_fields)
+            .inspect_err(|error| engine.set_error(&error.1))?
+        {
+            draft.custom_fields = serde_json::from_str(value).map_err(|error| {
+                let message = format!("invalid custom metadata updates: {error}");
+                engine.set_error(&message);
+                (SmkStatus::InvalidArgument, message)
+            })?;
         }
         let mode = script_meta_write_mode(request.write_mode).inspect_err(|error| {
             engine.set_error(&error.1);
@@ -3736,6 +3874,19 @@ pub unsafe extern "C" fn smk_edit_result_metadata_extensions(
 
 #[unsafe(no_mangle)]
 /// # Safety
+/// Result is live and output is writable. Borrowed JSON is empty for no fields.
+pub unsafe extern "C" fn smk_edit_result_custom_metadata_fields(
+    result: *const SmkEditResult,
+    output: *mut SmkUtf8Slice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        *out_mut(output)? = edit_result_ref(result)?.custom_metadata_json;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
 /// result is live and out_values is writable. Returned slices borrow result.
 pub unsafe extern "C" fn smk_edit_result_metadata_diagnostics(
     result: *const SmkEditResult,
@@ -3771,8 +3922,10 @@ pub unsafe extern "C" fn smk_engine_read_script_metadata_draft_file(
         let file_path = path_from_slice(file_path)?;
         match read_script_metadata_draft_from_file(&file_path) {
             Ok(result) => {
-                *out_result =
-                    Box::into_raw(Box::new(SmkEditResult::from_edit_read_result(&result)));
+                *out_result = Box::into_raw(Box::new(
+                    SmkEditResult::from_edit_read_result(&result)
+                        .map_err(|error| (SmkStatus::EngineError, error.to_string()))?,
+                ));
                 Ok(())
             }
             Err(error) => {
@@ -4909,6 +5062,8 @@ impl SmkScanResult {
         let mut result = Self {
             string_storage: Vec::new(),
             string_index: BTreeMap::new(),
+            custom_metadata_values: Vec::new(),
+            custom_metadata_ranges: Default::default(),
             preferred_languages: Vec::new(),
             metadata_tags: Vec::new(),
             metadata_diagnostics: Vec::new(),
@@ -5016,6 +5171,15 @@ impl SmkScanResult {
                 let item_key = std::sync::Arc::as_ptr(item) as usize;
                 if let Some(item_index) = all_item_indices.get(&item_key) {
                     result.file_items.push(result.items[*item_index]);
+                    let custom_range = result.custom_metadata_ranges[0]
+                        .get(*item_index)
+                        .copied()
+                        .unwrap_or_default();
+                    result.push_custom_metadata_range(
+                        1,
+                        result.file_item_presentations.len(),
+                        custom_range,
+                    );
                     result
                         .file_item_presentations
                         .push(result.item_presentations[*item_index]);
@@ -5048,6 +5212,8 @@ impl SmkScanResult {
         let mut result = Self {
             string_storage: Vec::new(),
             string_index: BTreeMap::new(),
+            custom_metadata_values: Vec::new(),
+            custom_metadata_ranges: Default::default(),
             preferred_languages: Vec::new(),
             metadata_tags: Vec::new(),
             metadata_diagnostics: Vec::new(),
@@ -5268,7 +5434,8 @@ impl SmkScanResult {
                 .as_ref()
                 .map(|item| self.metadata_presentation(item))
                 .unwrap_or_default();
-            self.file_entry_presentations.push(presentation);
+            self.push_custom_metadata_range(2, self.file_entry_presentations.len(), presentation.1);
+            self.file_entry_presentations.push(presentation.0);
             self.file_entries.push(ffi_entry);
         }
 
@@ -5286,14 +5453,16 @@ impl SmkScanResult {
         let ffi_item = self.script_item(item);
         self.items.push(ffi_item);
         let presentation = self.metadata_presentation(item);
-        self.item_presentations.push(presentation);
+        self.push_custom_metadata_range(0, self.item_presentations.len(), presentation.1);
+        self.item_presentations.push(presentation.0);
     }
 
     fn push_file_script_item(&mut self, item: &ScriptMetaItem) {
         let ffi_item = self.script_item(item);
         self.file_items.push(ffi_item);
         let presentation = self.metadata_presentation(item);
-        self.file_item_presentations.push(presentation);
+        self.push_custom_metadata_range(1, self.file_item_presentations.len(), presentation.1);
+        self.file_item_presentations.push(presentation.0);
     }
 
     fn script_item(&mut self, item: &ScriptMetaItem) -> SmkScriptItem {
@@ -5325,12 +5494,41 @@ impl SmkScanResult {
         }
     }
 
-    fn metadata_presentation(&mut self, item: &ScriptMetaItem) -> SmkMetadataPresentation {
+    fn push_custom_metadata_range(
+        &mut self,
+        collection: usize,
+        index: usize,
+        range: SmkCustomMetadataRange,
+    ) {
+        let ranges = &mut self.custom_metadata_ranges[collection];
+        if range.value_count != 0 || !ranges.is_empty() {
+            ranges.resize(index, SmkCustomMetadataRange::default());
+            ranges.push(range);
+        }
+    }
+
+    fn metadata_presentation(
+        &mut self,
+        item: &ScriptMetaItem,
+    ) -> (SmkMetadataPresentation, SmkCustomMetadataRange) {
         let key = std::ptr::from_ref(item) as usize;
         if let Some(value) = self.presentation_index.get(&key) {
             return *value;
         }
         let value = &item.presentation;
+        let first_value_index = self.custom_metadata_values.len();
+        for (key, values) in &value.custom_fields {
+            let key = self.push_string(Some(key));
+            for value in values {
+                let value = self.push_string(Some(value));
+                self.custom_metadata_values
+                    .push(SmkCustomMetadataValue { key, value });
+            }
+        }
+        let custom_range = SmkCustomMetadataRange {
+            first_value_index,
+            value_count: self.custom_metadata_values.len() - first_value_index,
+        };
         let first_tag_index = self.metadata_tags.len();
         for tag in &value.tags {
             let tag = self.push_string(Some(tag));
@@ -5357,8 +5555,9 @@ impl SmkScanResult {
             first_diagnostic_index,
             diagnostic_count: self.metadata_diagnostics.len() - first_diagnostic_index,
         };
-        self.presentation_index.insert(key, presentation);
-        presentation
+        self.presentation_index
+            .insert(key, (presentation, custom_range));
+        (presentation, custom_range)
     }
 
     fn push_candidate_record(&mut self, record: &CandidateRecord) {
@@ -5369,7 +5568,8 @@ impl SmkScanResult {
             .as_ref()
             .map(|item| self.metadata_presentation(item))
             .unwrap_or_default();
-        self.candidate_presentations.push(presentation);
+        self.push_custom_metadata_range(3, self.candidate_presentations.len(), presentation.1);
+        self.candidate_presentations.push(presentation.0);
     }
 
     fn candidate_record(&mut self, record: &CandidateRecord) -> SmkCandidateRecord {
@@ -5732,6 +5932,7 @@ impl SmkEditResult {
         Self {
             string_storage: Vec::with_capacity(string_capacity),
             string_overflow: Vec::new(),
+            custom_metadata_json: SmkUtf8Slice::empty(),
             text: SmkUtf8Slice::empty(),
             file_write_result: SmkScriptMetadataFileWriteResult::default(),
             edit_read_result: SmkScriptMetadataEditReadResult::default(),
@@ -5769,10 +5970,16 @@ impl SmkEditResult {
         result
     }
 
-    fn from_edit_read_result(value: &KitScriptMetadataEditReadResult) -> Self {
+    fn from_edit_read_result(
+        value: &KitScriptMetadataEditReadResult,
+    ) -> Result<Self, serde_json::Error> {
         let capacity = edit_read_result_string_bytes(value);
         let mut result = Self::empty(capacity, 0);
         result.edit_read_result = result.edit_read_result(value);
+        if !value.draft.custom_fields.is_empty() {
+            let json = serde_json::to_string(&value.draft.custom_fields)?;
+            result.custom_metadata_json = result.push_string(Some(&json));
+        }
         for line in &value.existing_lines {
             let line = result.push_string(Some(line.as_str()));
             result.existing_lines.push(line);
@@ -5828,7 +6035,7 @@ impl SmkEditResult {
             };
             result.metadata_diagnostics.push(diagnostic);
         }
-        result
+        Ok(result)
     }
 
     fn from_edit_preview_result(value: &KitScriptMetadataEditPreviewResult) -> Self {
@@ -6497,6 +6704,7 @@ fn script_metadata_draft_from_ffi(
     draft: &SmkScriptMetadataDraft,
 ) -> Result<KitScriptMetadataDraft, (SmkStatus, String)> {
     Ok(KitScriptMetadataDraft {
+        custom_fields: Default::default(),
         extensions: None,
         script_id: required_str_from_slice(draft.script_id, "Script-ID")?.to_string(),
         version: optional_version_from_slice(draft.version, "Version")?,

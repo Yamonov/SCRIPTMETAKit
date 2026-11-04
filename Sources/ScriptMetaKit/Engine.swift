@@ -212,6 +212,14 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         }
     }
 
+    /// Select complete custom keys, or ["X-"] for all. Empty input retains none.
+    @discardableResult
+    public func setCustomMetadataKeys(_ keys: [String]) async throws -> Bool {
+        try await runOperation { engineBox in
+            try engineBox.setCustomMetadataKeys(keys)
+        }
+    }
+
     /// Explicit consumer priorities, for example ["ja", "en", "fr"].
     /// Empty input uses metadata defaults. No OS language settings are read.
     @discardableResult
@@ -1136,6 +1144,32 @@ private nonisolated struct SmkMetadataPresentationSlice {
     var ptr: UnsafePointer<SmkMetadataPresentation>?
     var len = 0
 }
+private nonisolated struct SmkCustomMetadataValue {
+    var key = SmkUtf8Slice()
+    var value = SmkUtf8Slice()
+}
+private nonisolated struct SmkCustomMetadataValueSlice {
+    var ptr: UnsafePointer<SmkCustomMetadataValue>?
+    var len = 0
+}
+private nonisolated struct SmkCustomMetadataRange {
+    var firstValueIndex = 0
+    var valueCount = 0
+}
+private nonisolated struct SmkCustomMetadataRangeSlice {
+    var ptr: UnsafePointer<SmkCustomMetadataRange>?
+    var len = 0
+}
+@_silgen_name("smk_scan_result_custom_metadata_values")
+private nonisolated func smk_scan_result_custom_metadata_values(_ result: OpaquePointer?, _ output: UnsafeMutablePointer<SmkCustomMetadataValueSlice>) -> Int32
+@_silgen_name("smk_scan_result_custom_metadata_ranges")
+private nonisolated func smk_scan_result_custom_metadata_ranges(_ result: OpaquePointer?, _ collection: UInt32, _ output: UnsafeMutablePointer<SmkCustomMetadataRangeSlice>) -> Int32
+@_silgen_name("smk_engine_set_custom_metadata_keys")
+private nonisolated func smk_engine_set_custom_metadata_keys(_ engine: OpaquePointer?, _ keys: UnsafePointer<SmkUtf8Slice>?, _ count: Int, _ changed: UnsafeMutablePointer<UInt8>) -> Int32
+@_silgen_name("smk_edit_result_custom_metadata_fields")
+private nonisolated func smk_edit_result_custom_metadata_fields(_ result: OpaquePointer?, _ output: UnsafeMutablePointer<SmkUtf8Slice>) -> Int32
+@_silgen_name("smk_engine_write_script_metadata_file_if_unchanged_v3")
+private nonisolated func smk_engine_write_script_metadata_file_if_unchanged_v3(_ engine: OpaquePointer?, _ request: UnsafePointer<SmkScriptMetadataWriteRequest>, _ extensions: UnsafePointer<SmkMetadataEditExtensions>?, _ customFields: SmkUtf8Slice, _ fingerprint: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
 private nonisolated struct SmkMetadataDiagnostic {
     var code = SmkUtf8Slice()
     var field = SmkUtf8Slice()
@@ -2116,6 +2150,15 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         return engine
     }
 
+    public func setCustomMetadataKeys(_ keys: [String]) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let engine = try ensureEngineLocked()
+        let changed = try engine.setCustomMetadataKeys(keys)
+        storedConfiguration = try engine.configuration()
+        return changed
+    }
+
     public func setPreferredLanguages(_ languages: [String]) throws -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -2731,6 +2774,19 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         return paused != 0
     }
 
+    public func setCustomMetadataKeys(_ keys: [String]) throws -> Bool {
+        let arena = SmkInputStringArena()
+        let values = keys.map { arena.slice($0) }
+        var changed: UInt8 = 0
+        let status = withExtendedLifetime(arena) {
+            values.withUnsafeBufferPointer { smk_engine_set_custom_metadata_keys(handle, $0.baseAddress, $0.count, &changed) }
+        }
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+        return changed != 0
+    }
+
     public func setPreferredLanguages(_ languages: [String]) throws -> Bool {
         let arena = SmkInputStringArena()
         let values = languages.map { arena.slice($0) }
@@ -3208,13 +3264,15 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
             draft: smkScriptMetadataDraft(from: draft, arena: arena)
         )
         var result: OpaquePointer?
-        let status = withExtendedLifetime(arena) {
-            withMetadataEditExtensions(draft.extensions, arena: arena) { extensions in
-                withUnsafePointer(to: &request) { requestPointer in
-                    smk_engine_write_script_metadata_file_if_unchanged_v2(
-                        handle, requestPointer, extensions,
-                        arena.slice(expectedSourceFingerprint), &result
-                    )
+        let status = try ScriptMetaService.withJSON(draft.customFields) { customFields in
+            withExtendedLifetime(arena) {
+                withMetadataEditExtensions(draft.extensions, arena: arena) { extensions in
+                    withUnsafePointer(to: &request) { requestPointer in
+                        smk_engine_write_script_metadata_file_if_unchanged_v3(
+                            handle, requestPointer, extensions, customFields,
+                            arena.slice(expectedSourceFingerprint), &result
+                        )
+                    }
                 }
             }
         }
@@ -3259,6 +3317,11 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
             existingLines: array(from: existingLineSlice).map(string),
             unknownLines: array(from: unknownLineSlice).map(string)
         )
+        var customFields = SmkUtf8Slice()
+        try check(smk_edit_result_custom_metadata_fields(result, &customFields))
+        if customFields.len > 0 {
+            decoded.draft.customFields = try JSONDecoder().decode([String: [String]].self, from: Data(buffer: buffer(ptr: customFields.ptr, len: customFields.len)))
+        }
         var extensions = SmkMetadataEditExtensions()
         try check(smk_edit_result_metadata_extensions(result, &extensions))
         if extensions.hasExtensions != 0 {
@@ -3545,6 +3608,18 @@ private nonisolated struct SmkStringStorageKey: Hashable {
 /// Lives only while one C result is decoded. Returned values own their storage;
 /// C addresses are never cached across result lifetimes or language changes.
 private nonisolated final class SmkResultDecoder {
+    private var customFieldMaps: [Range<Int>: [String: [String]]] = [:]
+
+    func customFields(in range: Range<Int>, from values: [(String, String)]) -> [String: [String]] {
+        guard !range.isEmpty else { return [:] }
+        if let value = customFieldMaps[range] { return value }
+        var fields: [String: [String]] = [:]
+        for (key, value) in values[range] {
+            fields[key, default: []].append(value)
+        }
+        customFieldMaps[range] = fields
+        return fields
+    }
     private var strings: [SmkStringStorageKey: String] = [:]
     private var tagArrays: [Range<Int>: [String]] = [:]
     private var diagnosticArrays: [Range<Int>: [MetadataDiagnostic]] = [:]
@@ -3582,6 +3657,9 @@ private nonisolated final class SmkResultDecoder {
 
 private nonisolated func makeResult(from result: OpaquePointer) throws -> ScriptMetaScanResult {
     let decoder = SmkResultDecoder()
+    var customSlice = SmkCustomMetadataValueSlice()
+    try check(smk_scan_result_custom_metadata_values(result, &customSlice))
+    let customMetadataValues = buffer(ptr: customSlice.ptr, len: customSlice.len).map { (decoder.string($0.key), decoder.string($0.value)) }
     var languageSlice = SmkUtf8SliceSlice()
     try check(smk_scan_result_preferred_languages(result, &languageSlice))
     let preferredLanguages = buffer(ptr: languageSlice.ptr, len: languageSlice.len).map(decoder.string)
@@ -3591,10 +3669,10 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
     var diagnosticSlice = SmkMetadataDiagnosticSlice()
     try check(smk_scan_result_metadata_diagnostics(result, &diagnosticSlice))
     let metadataDiagnostics = buffer(ptr: diagnosticSlice.ptr, len: diagnosticSlice.len).map { metadataDiagnostic(from: $0, decoder: decoder) }
-    let itemPresentations = try metadataPresentations(from: result, collection: 0, tags: metadataTags, diagnostics: metadataDiagnostics, decoder: decoder)
-    let fileItemPresentations = try metadataPresentations(from: result, collection: 1, tags: metadataTags, diagnostics: metadataDiagnostics, decoder: decoder)
-    let fileEntryPresentations = try metadataPresentations(from: result, collection: 2, tags: metadataTags, diagnostics: metadataDiagnostics, decoder: decoder)
-    let candidatePresentations = try metadataPresentations(from: result, collection: 3, tags: metadataTags, diagnostics: metadataDiagnostics, decoder: decoder)
+    let itemPresentations = try metadataPresentations(from: result, collection: 0, tags: metadataTags, diagnostics: metadataDiagnostics, customValues: customMetadataValues, decoder: decoder)
+    let fileItemPresentations = try metadataPresentations(from: result, collection: 1, tags: metadataTags, diagnostics: metadataDiagnostics, customValues: customMetadataValues, decoder: decoder)
+    let fileEntryPresentations = try metadataPresentations(from: result, collection: 2, tags: metadataTags, diagnostics: metadataDiagnostics, customValues: customMetadataValues, decoder: decoder)
+    let candidatePresentations = try metadataPresentations(from: result, collection: 3, tags: metadataTags, diagnostics: metadataDiagnostics, customValues: customMetadataValues, decoder: decoder)
     var rootSlice = SmkRootSnapshotSlice()
     try check(smk_scan_result_roots(result, &rootSlice))
     var rootRevisionSlice = SmkRootSnapshotRevisionSlice()
@@ -3757,10 +3835,22 @@ private nonisolated func metadataDiagnostic(from value: SmkMetadataDiagnostic, d
 }
 
 private nonisolated func metadataPresentations(from result: OpaquePointer, collection: UInt32,
-                                             tags: [String], diagnostics: [MetadataDiagnostic], decoder: SmkResultDecoder) throws -> [MetadataPresentation] {
+                                             tags: [String], diagnostics: [MetadataDiagnostic], customValues: [(String, String)], decoder: SmkResultDecoder) throws -> [MetadataPresentation] {
     var values = SmkMetadataPresentationSlice()
     try check(smk_scan_result_metadata_presentations(result, collection, &values))
-    return try buffer(ptr: values.ptr, len: values.len).map { value in
+    var customSlice = SmkCustomMetadataRangeSlice()
+    if !customValues.isEmpty {
+        try check(smk_scan_result_custom_metadata_ranges(result, collection, &customSlice))
+    }
+    let customRanges = buffer(ptr: customSlice.ptr, len: customSlice.len)
+    guard customRanges.isEmpty || customRanges.count == values.len else {
+        throw ScriptMetaKitError.operationFailed(4, "invalid custom metadata range count")
+    }
+    return try buffer(ptr: values.ptr, len: values.len).enumerated().map { index, value in
+        let custom = customRanges.isEmpty ? SmkCustomMetadataRange() : customRanges[index]
+        guard let customRange = safeRange(start: custom.firstValueIndex, count: custom.valueCount, upperBound: customValues.count) else {
+            throw ScriptMetaKitError.operationFailed(4, "invalid custom metadata range")
+        }
         guard let tagRange = safeRange(start: value.firstTagIndex, count: value.tagCount, upperBound: tags.count),
               let diagnosticRange = safeRange(start: value.firstDiagnosticIndex, count: value.diagnosticCount, upperBound: diagnostics.count) else {
             throw ScriptMetaKitError.operationFailed(4, "invalid metadata presentation range")
@@ -3770,7 +3860,8 @@ private nonisolated func metadataPresentations(from result: OpaquePointer, colle
                                     authorLanguage: decoder.optionalString(value.authorLanguage),
                                     descriptionLanguage: decoder.optionalString(value.descriptionLanguage),
                                     tags: decoder.tags(in: tagRange, from: tags),
-                                    diagnostics: decoder.diagnostics(in: diagnosticRange, from: diagnostics))
+                                    diagnostics: decoder.diagnostics(in: diagnosticRange, from: diagnostics),
+                                    customFields: decoder.customFields(in: customRange, from: customValues))
     }
 }
 

@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use super::{LanguagePreferences, MetadataPresentation};
+use super::{CustomMetadataSelection, LanguagePreferences, MetadataPresentation};
 use crate::RootId;
 
 pub type ScriptMetaItemRef = Arc<ScriptMetaItem>;
@@ -14,6 +14,8 @@ pub struct ParserOptions {
     pub require_closed_block: bool,
     #[serde(default)]
     pub preferred_languages: LanguagePreferences,
+    #[serde(default)]
+    pub custom_metadata_keys: CustomMetadataSelection,
 }
 
 impl Default for ParserOptions {
@@ -22,6 +24,7 @@ impl Default for ParserOptions {
             max_prefix_bytes: 128 * 1024,
             require_closed_block: true,
             preferred_languages: LanguagePreferences::default(),
+            custom_metadata_keys: CustomMetadataSelection::default(),
         }
     }
 }

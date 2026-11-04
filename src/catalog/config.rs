@@ -146,6 +146,7 @@ impl ScriptMetaKitConfig {
         MetadataReadContext {
             max_prefix_bytes: self.parser.max_prefix_bytes,
             require_closed_block: self.parser.require_closed_block,
+            custom_metadata_keys: self.parser.custom_metadata_keys.clone(),
             skip_hidden: self.scanner.skip_hidden,
             skip_packages: self.scanner.skip_packages,
             follow_symlinks: self.scanner.follow_symlinks,
@@ -173,6 +174,8 @@ impl ScriptMetaKitConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MetadataReadContext {
+    #[serde(default)]
+    pub custom_metadata_keys: crate::CustomMetadataSelection,
     pub max_prefix_bytes: usize,
     pub require_closed_block: bool,
     pub skip_hidden: bool,

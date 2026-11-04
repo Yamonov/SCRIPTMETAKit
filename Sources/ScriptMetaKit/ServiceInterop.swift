@@ -14,6 +14,12 @@ nonisolated func smk_engine_cache_revisions_json(_ engine: OpaquePointer?, _ roo
 nonisolated func smk_engine_apply_configuration_json(_ engine: OpaquePointer?, _ configuration: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
 @_silgen_name("smk_metadata_parse_text")
 nonisolated func smk_metadata_parse_text(_ source: SmkUtf8Slice, _ languages: UnsafePointer<SmkUtf8Slice>?, _ count: Int, _ requireClosed: UInt8, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
+@_silgen_name("smk_metadata_parse_text_v2")
+nonisolated func smk_metadata_parse_text_v2(_ source: SmkUtf8Slice, _ languages: UnsafePointer<SmkUtf8Slice>?, _ count: Int, _ requireClosed: UInt8, _ keys: UnsafePointer<SmkUtf8Slice>?, _ keyCount: Int, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
+@_silgen_name("smk_normalize_custom_metadata_key")
+nonisolated func smk_normalize_custom_metadata_key(_ key: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
+@_silgen_name("smk_validate_custom_metadata_field")
+nonisolated func smk_validate_custom_metadata_field(_ key: SmkUtf8Slice, _ value: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
 @_silgen_name("smk_metadata_read_draft_text")
 nonisolated func smk_metadata_read_draft_text(_ source: SmkUtf8Slice, _ fileName: SmkUtf8Slice, _ output: UnsafeMutablePointer<OpaquePointer?>) -> Int32
 @_silgen_name("smk_metadata_render_text")

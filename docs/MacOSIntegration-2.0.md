@@ -1,6 +1,6 @@
-# SCRIPTMETAKit 2.0 — macOS application integration
+# SCRIPTMETAKit 2.1 — macOS application integration
 
-Package version: **2.0.0**. C ABI generation remains **1**; existing C layouts and
+Package version **2.1.0**. C ABI generation remains **1**; existing C layouts and
 Swift entry points are retained. The SDK is distributed as Swift source plus a
 matching Universal native XCFramework.
 

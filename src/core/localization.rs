@@ -75,6 +75,8 @@ pub struct MetadataDiagnostic {
 /// Common metadata and selection provenance. Contains no unselected translation map.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MetadataPresentation {
+    #[serde(default, skip_serializing_if = "super::CustomMetadataFields::is_empty")]
+    pub custom_fields: super::CustomMetadataFields,
     pub default_language: Option<String>,
     pub name_language: Option<String>,
     pub author_language: Option<String>,
@@ -286,7 +288,11 @@ pub(crate) fn item_separator(value: &str) -> Option<usize> {
         return None;
     }
     let mut index = 1;
-    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'-') {
+    while index < bytes.len()
+        && (bytes[index].is_ascii_alphanumeric()
+            || bytes[index] == b'-'
+            || (bytes[index] == b'.' && super::has_custom_metadata_prefix(value)))
+    {
         index += 1;
     }
     if bytes.get(index) == Some(&b'[') {

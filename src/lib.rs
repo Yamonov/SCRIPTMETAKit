@@ -27,15 +27,17 @@ pub use catalog::{
     path_based_root_id,
 };
 pub use core::{
-    DistributionMetadata, DistributionResolution, FileIssue, LanguagePreferences,
-    MetadataDiagnostic, MetadataEditExtensions, MetadataPresentation, OperationCancellation,
-    OperationCancellationReservation, OperationStatus, OperationSummary, ParserOptions,
-    ScriptMetaEditCapability, ScriptMetaEditState, ScriptMetaItem, ScriptMetaItemRef,
-    ScriptMetaKitError, ScriptMetaKitResult, ScriptMetadata, ScriptRuntimeKind, VersionOrdering,
-    compare_versions, decode_script_text, decode_script_text_strict, is_valid_metadata_tag,
-    normalize_language_tag, normalize_metadata_tags, normalize_metadata_url,
-    normalize_version_string, parse_distribution_metadata, parse_distribution_metadata_for_script,
+    CustomMetadataFields, CustomMetadataSelection, DistributionMetadata, DistributionResolution,
+    FileIssue, LanguagePreferences, MetadataDiagnostic, MetadataEditExtensions,
+    MetadataPresentation, OperationCancellation, OperationCancellationReservation, OperationStatus,
+    OperationSummary, ParserOptions, ScriptMetaEditCapability, ScriptMetaEditState, ScriptMetaItem,
+    ScriptMetaItemRef, ScriptMetaKitError, ScriptMetaKitResult, ScriptMetadata, ScriptRuntimeKind,
+    VersionOrdering, compare_versions, decode_script_text, decode_script_text_strict,
+    is_valid_metadata_tag, normalize_custom_metadata_key, normalize_language_tag,
+    normalize_metadata_tags, normalize_metadata_url, normalize_version_string,
+    parse_distribution_metadata, parse_distribution_metadata_for_script,
     parse_distribution_metadata_records, parse_script_metadata, parse_script_metadata_with_options,
+    validate_custom_metadata_field,
 };
 pub use editkit::{
     DEFAULT_SCRIPT_METADATA_PREVIEW_BYTES, DistributionMetadataDraft,
@@ -111,6 +113,6 @@ mod tests {
     #[test]
     fn exposes_package_metadata() {
         assert_eq!(package_name(), "scriptmetakit");
-        assert_eq!(package_version(), "2.0.1");
+        assert_eq!(package_version(), "2.1.0");
     }
 }

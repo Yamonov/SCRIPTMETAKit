@@ -9,6 +9,90 @@ fn input(value: &str) -> ffi::SmkUtf8Slice {
         len: value.len(),
     }
 }
+
+#[test]
+fn custom_fields_use_shared_ranges_and_keep_empty_and_repeated_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = SOURCE.replace(
+        "Description-BEGIN",
+        "X-org.iwashi-Group=A\nX-org.iwashi-Group=A\nX-org.iwashi-Empty=\nDescription-BEGIN",
+    );
+    fs::write(temp.path().join("example.jsx"), source).unwrap();
+    let engine = Engine::new();
+    let keys = [input("X-")];
+    let folder = temp.path().to_str().unwrap();
+    // SAFETY: engine/results are owned by guards and every slice is read before its result is freed.
+    unsafe {
+        let mut changed = 0;
+        assert_eq!(
+            ffi::smk_engine_set_custom_metadata_keys(engine.0, keys.as_ptr(), 1, &mut changed),
+            ffi::SmkStatus::Ok
+        );
+        assert_eq!(changed, 1);
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ffi::smk_engine_scan_folder(engine.0, folder.as_ptr(), folder.len(), &mut result),
+            ffi::SmkStatus::Ok
+        );
+        let result = Scan(result);
+        let mut values = ffi::SmkCustomMetadataValueSlice::default();
+        assert_eq!(
+            ffi::smk_scan_result_custom_metadata_values(result.0, &mut values),
+            ffi::SmkStatus::Ok
+        );
+        assert_eq!(values.len, 3);
+        let values = slice::from_raw_parts(values.ptr, values.len);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| text(value.value))
+                .collect::<Vec<_>>(),
+            ["", "A", "A"]
+        );
+        let mut first_range = None;
+        for collection in 0..4 {
+            let mut ranges = ffi::SmkCustomMetadataRangeSlice::default();
+            assert_eq!(
+                ffi::smk_scan_result_custom_metadata_ranges(result.0, collection, &mut ranges),
+                ffi::SmkStatus::Ok
+            );
+            let mut presentations = ffi::SmkMetadataPresentationSlice::default();
+            assert_eq!(
+                ffi::smk_scan_result_metadata_presentations(
+                    result.0,
+                    collection,
+                    &mut presentations
+                ),
+                ffi::SmkStatus::Ok
+            );
+            assert_eq!(ranges.len, presentations.len, "collection {collection}");
+            if presentations.len == 0 {
+                continue;
+            }
+            let range = *ranges.ptr;
+            assert_eq!(range.value_count, 3);
+            let identity = (range.first_value_index, range.value_count);
+            assert_eq!(*first_range.get_or_insert(identity), identity);
+        }
+        assert_eq!(
+            ffi::smk_engine_set_custom_metadata_keys(engine.0, ptr::null(), 0, &mut changed),
+            ffi::SmkStatus::Ok
+        );
+        let mut next = ptr::null_mut();
+        assert_eq!(
+            ffi::smk_engine_scan_folder(engine.0, folder.as_ptr(), folder.len(), &mut next),
+            ffi::SmkStatus::Ok
+        );
+        let next = Scan(next);
+        let mut empty = ffi::SmkCustomMetadataValueSlice::default();
+        assert_eq!(
+            ffi::smk_scan_result_custom_metadata_values(next.0, &mut empty),
+            ffi::SmkStatus::Ok
+        );
+        assert_eq!(empty.len, 0);
+        assert_eq!(text(values[1].value), "A");
+    }
+}
 fn text(value: ffi::SmkUtf8Slice) -> String {
     if value.len == 0 {
         return String::new();
