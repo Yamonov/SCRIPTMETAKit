@@ -8,7 +8,7 @@ use scriptmetakit::{
 
 #[test]
 fn complete_authoring_examples_are_valid_and_roundtrip_in_every_sample_language() {
-    let guide = include_str!("../docs/MetadataAuthoring.md");
+    let guide = include_str!("../docs/MetadataAuthoring.md").replace("\r\n", "\n");
     let mut examples = 0;
     for (language, filename) in [
         ("jsx", "example.jsx"),
